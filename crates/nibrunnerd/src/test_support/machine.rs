@@ -240,14 +240,21 @@ impl RunningHost {
     /// The document, as whoever deploys writes it. Everything this host should hold, every time:
     /// an app left out of a call is an app the document no longer names.
     pub async fn deploy(&self, apps: &[Tenant]) {
-        let document = HostDesiredState {
+        self.write(&self.document(apps)).await;
+    }
+
+    pub fn document(&self, apps: &[Tenant]) -> HostDesiredState {
+        HostDesiredState {
             host_id: HostId::parse("host-1").expect("a host id"),
             volumes: apps.iter().map(|app| app.volume.clone()).collect(),
             instances: apps.iter().map(|app| app.instance.clone()).collect(),
             checkpoints: vec![],
             exports: vec![],
-        };
-        super::write_desired_state(&self.host.config.desired_state_file, &document);
+        }
+    }
+
+    pub async fn write(&self, document: &HostDesiredState) {
+        super::write_desired_state(&self.host.config.desired_state_file, document);
     }
 
     pub async fn report(&self) -> HostReportedState {
@@ -325,13 +332,20 @@ impl RunningHost {
         self.get_as(&tenant.hostname, path).await
     }
 
-    /// Every request has a deadline, because a proxy holding a connection open into a guest that
-    /// will never answer is one of the things being tested for, and a test that waited on it for
-    /// ever would hang the whole suite instead of failing.
     pub async fn get_as(&self, hostname: &str, path: &str) -> std::io::Result<Answer> {
+        self.get_at(self.proxy, hostname, path).await
+    }
+
+    /// The same request, at whatever address the caller names: the host port a report claims, or
+    /// the proxy.
+    ///
+    /// Every one has a deadline, because a proxy holding a connection open into a guest that will
+    /// never answer is one of the things being tested for, and a test that waited on it for ever
+    /// would hang the whole suite instead of failing.
+    pub async fn get_at(&self, address: SocketAddr, hostname: &str, path: &str) -> std::io::Result<Answer> {
         tokio::time::timeout(ANSWER_DEADLINE, async {
             let request = format!("GET {path} HTTP/1.1\r\nhost: {hostname}\r\nconnection: close\r\n\r\n");
-            let mut stream = tokio::net::TcpStream::connect(self.proxy).await?;
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
             stream.write_all(request.as_bytes()).await?;
             let mut held = Vec::new();
             stream.read_to_end(&mut held).await?;
@@ -344,6 +358,44 @@ impl RunningHost {
                 format!("nothing answered {hostname}{path} in {ANSWER_DEADLINE:?}"),
             ))
         })
+    }
+
+    /// Waits until the machine's ruleset names this app, which is when the host port the report
+    /// gives out starts carrying anything. The report says `running` as soon as the app is well,
+    /// and the pass that writes the ruleset comes after.
+    pub async fn until_routed(&self, tenant: &Tenant) {
+        let started = Instant::now();
+        loop {
+            if self
+                .host
+                .firewall
+                .traffic()
+                .await
+                .unwrap_or_default()
+                .contains_key(&tenant.app_id)
+            {
+                return;
+            }
+            assert!(
+                started.elapsed() < PATIENCE,
+                "waited {PATIENCE:?} for the ruleset to name {}; it holds {}",
+                tenant.app_id,
+                self.ruleset().await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// What the kernel is actually holding, for a test that has to say why it failed.
+    pub async fn ruleset(&self) -> String {
+        use crate::ports::CommandRunnerExt;
+        self.host
+            .commands
+            .stdout_of(crate::ports::CommandRequest::new(&[
+                "nft", "list", "table", "ip", "nibrun",
+            ]))
+            .await
+            .unwrap_or_else(|error| format!("the ruleset could not be read: {error}"))
     }
 
     pub fn proxy_address(&self) -> SocketAddr {
