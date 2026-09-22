@@ -16,6 +16,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
 #[cfg(target_os = "linux")]
+mod isolation;
+#[cfg(target_os = "linux")]
 mod lifecycle;
 #[cfg(target_os = "linux")]
 mod sleep;

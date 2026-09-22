@@ -279,9 +279,14 @@ fn reach(address: &str) -> String {
     let Some(resolved) = resolved.next() else {
         return "unresolved".to_string();
     };
-    match TcpStream::connect_timeout(&resolved, REACH_TIMEOUT) {
-        Ok(_) => "reached".to_string(),
-        Err(error) => format!("blocked: {error}"),
+    let asking = std::time::Instant::now();
+    let outcome = TcpStream::connect_timeout(&resolved, REACH_TIMEOUT);
+    // How long it took, because a rule that rejects answers at once and a route to nowhere does
+    // not: without the number, "blocked" would also be what an address nobody holds looks like.
+    let took = asking.elapsed().as_millis();
+    match outcome {
+        Ok(_) => format!("reached in {took}ms"),
+        Err(error) => format!("blocked in {took}ms: {error}"),
     }
 }
 
