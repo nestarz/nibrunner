@@ -179,6 +179,14 @@ impl Tenant {
         self
     }
 
+    /// The same app, deployed again: a new deployment id is what tells this host to replace the
+    /// release rather than leave the one it has running.
+    pub fn redeployed(mut self, marker: &str) -> Self {
+        self.instance.deployment_id =
+            DeploymentId::parse(format!("dep-{}-{marker}", self.app_id.as_str())).expect("a deployment id");
+        self
+    }
+
     pub fn edited(mut self, edit: impl FnOnce(&mut DesiredInstance)) -> Self {
         edit(&mut self.instance);
         self
