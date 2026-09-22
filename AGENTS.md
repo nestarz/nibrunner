@@ -30,6 +30,8 @@ Rust workspace (`crates/*`) with the docs site under `docs/`.
   domain to adapters and `controllers/` are the passes that run on a clock; `install/` lays a
   host out; `config.rs` is `config.toml`
 - `crates/init` — the guest's PID 1
+- `crates/test-tenant` — the tenant the guest tests boot: one static binary that answers, writes,
+  remembers and misbehaves on demand
 - `guest/` — the kernel, the image build script and the manifest of pins and digests
 - `deploy/` — the installer, the systemd unit, and the generated `config.example.toml` and
   `config.schema.json`
@@ -75,10 +77,13 @@ After finishing an implementation, always run:
 2. `just lint` — clippy with `-D warnings`, then the docs site's types and lint
 3. `just test` — everything that needs no kernel
 4. `just integration --no-run` — the kernel tests at least compile
+5. `just guest-tests --no-run` — the microVM tests at least compile
 
 `just integration` itself needs root, Linux, `nft`, `mke2fs` and `/dev/net/tun`, and is the only
-place a ruleset load, a real `mke2fs` or a tap is considered proven. CI runs it on every pull
-request; run it yourself on a Linux box when the change touches an adapter.
+place a ruleset load, a real `mke2fs` or a tap is considered proven. `just guest-tests` needs all
+of that plus `/dev/kvm` and a guest image from `just guest-image`, and is the only place a boot, a
+sleep, a wake or a route into a guest is considered proven. CI runs both on every pull request;
+run them yourself on a Linux box when the change touches an adapter or the guest.
 
 Some files in the tree are written from the code rather than by hand. After changing what they
 come from, regenerate and commit; CI's `just check-<recipe>` fails otherwise:
@@ -93,9 +98,10 @@ come from, regenerate and commit; CI's `just check-<recipe>` fails otherwise:
 
 Tests live beside the code in `#[cfg(test)] mod tests` (the `protocol` crate keeps its own in
 `src/tests.rs`); the daemon's kernel-needing ones are `crates/nibrunnerd/tests/integration.rs`,
-gated on `NIBRUNNER_INTEGRATION=1`. What more than one test needs — fixtures, `mockall` mocks, a
-host laid out the way `install` lays one — is in `crates/nibrunnerd/src/test_support/`, behind the
-`testing` feature. The unit lane is the planner, the health state machine, the backoff, the ruleset
+and the ones that boot a microVM are `crates/nibrunnerd/tests/guest/`, one file per family of
+invariant. Both are gated on `NIBRUNNER_INTEGRATION=1`. What more than one test needs — fixtures,
+`mockall` mocks, a host laid out the way `install` lays one, a host running on this machine — is in
+`crates/nibrunnerd/src/test_support/`, behind the `testing` feature. The unit lane is the planner, the health state machine, the backoff, the ruleset
 asserted as text, the codecs against byte fixtures taken from the C headers, and the reconcile pass
 driven against mocked collaborators.
 

@@ -95,10 +95,47 @@ jobs:
         # where rustup, cargo and mise live.
         run: sudo -E env "PATH=$PATH" just integration
 
+  # Beside `integration` rather than in it: both want the machine's nftables table and its taps,
+  # and a job of its own is also a guest image built while the other tests are already running.
+  guest:
+    runs-on: ubuntu-latest
+    # A guest that never answers is a test failure, not a job that runs until GitHub stops it.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/prepare
+        with:
+          cache: enabled
+          prepare-for-build: enabled
+
+      - name: Check the machine can host
+        run: ls -l /dev/net/tun /dev/kvm
+
+      - name: Install nftables
+        run: sudo apt-get install -y nftables
+
+      # Not checked in: rebuilt from the pins in guest/manifest.json, which is what the microVMs
+      # these tests boot have to come from.
+      - name: Build the guest image
+        run: just guest-image
+
+      - name: Check the guest image is the one its manifest describes
+        run: just verify-guest-image
+
+      - name: Build the tests
+        run: just guest-tests --no-run
+
+      - name: Run the tests
+        # sudo's secure_path drops the runner's PATH, so it is handed back; -E keeps HOME, which is
+        # where rustup, cargo and mise live.
+        run: sudo -E env "PATH=$PATH" just guest-tests
+
   checks-passed:
     if: always()
     name: checks:required
-    needs: [codestyle, lint, tests, generated, integration]
+    needs: [codestyle, lint, tests, generated, integration, guest]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs passed

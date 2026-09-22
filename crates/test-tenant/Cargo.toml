@@ -1,0 +1,17 @@
+[package]
+name = "nibrunner-test-tenant"
+description = "The tenant the guest tests boot: one static binary that answers, remembers, writes and misbehaves on demand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "test-tenant"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

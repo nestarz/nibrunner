@@ -6,6 +6,7 @@ members = [
   "crates/nft-render",
   "crates/nibrunnerd",
   "crates/init",
+  "crates/test-tenant",
 ]
 
 [workspace.package]

@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+pub mod machine;
 pub mod mocks;
 
 use std::ops::Deref;
