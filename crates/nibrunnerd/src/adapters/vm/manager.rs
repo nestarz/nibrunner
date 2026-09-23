@@ -13,6 +13,7 @@ use crate::adapters::vm::snapshot::{
     SleepSubject, SnapshotStamp, SnapshotsInFlight,
 };
 use crate::adapters::vm::status::VmStatus;
+use crate::adapters::vm::time_sync;
 use crate::adapters::volumes::VolumeBackend;
 use crate::json_store::{make_directory, write_json};
 use crate::ports::{BootRequest, LogSink, SuspendRequest, VmError, Vmm};
@@ -229,10 +230,31 @@ impl Vmm for VmManager {
             tracing::warn!(app_id = %request.app_id, error = %error.message(), "the volume backend would not flush");
         }
 
+        let control = self
+            .working_dir_for(&request.app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        if let Err(error) = time_sync::sleep(&control).await {
+            if let Err(recovery) = time_sync::wake(&control).await {
+                tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after sleep refusal");
+                self.processes.stop(&request.app_id).await;
+            }
+            return Err(error);
+        }
         let paused = std::time::Instant::now();
-        api.pause().await?;
+        if let Err(error) = api.pause().await {
+            let _ = api.resume().await;
+            if let Err(recovery) = time_sync::wake(&control).await {
+                tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after pause refusal");
+                self.processes.stop(&request.app_id).await;
+            }
+            return Err(error);
+        }
         if let Err(error) = api.create_snapshot(&paths.state_path, &paths.memory_path).await {
             let _ = api.resume().await;
+            if let Err(recovery) = time_sync::wake(&control).await {
+                tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after snapshot refusal");
+                self.processes.stop(&request.app_id).await;
+            }
             return Err(error);
         }
         self.processes.stop(&request.app_id).await;
@@ -277,15 +299,23 @@ impl Vmm for VmManager {
                     Err(error) => Err(error),
                     Ok(()) => match api.resume().await {
                         Err(error) => Err(error),
-                        Ok(()) => self
-                            .network
-                            .refresh_neighbour(&Neighbour {
-                                guest_ipv4: request.slot.guest_ipv4.clone(),
-                                guest_mac: request.slot.guest_mac.clone(),
-                                tap_name: request.slot.tap_name.clone(),
-                            })
-                            .await
-                            .map_err(|error| VmError::Host(error.message())),
+                        Ok(()) => {
+                            let control = working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+                            match time_sync::wake(&control).await {
+                                Err(error) => Err(VmError::SnapshotUnusable {
+                                    reason: error.message(),
+                                }),
+                                Ok(()) => self
+                                    .network
+                                    .refresh_neighbour(&Neighbour {
+                                        guest_ipv4: request.slot.guest_ipv4.clone(),
+                                        guest_mac: request.slot.guest_mac.clone(),
+                                        tap_name: request.slot.tap_name.clone(),
+                                    })
+                                    .await
+                                    .map_err(|error| VmError::Host(error.message())),
+                            }
+                        }
                     },
                 }
             }

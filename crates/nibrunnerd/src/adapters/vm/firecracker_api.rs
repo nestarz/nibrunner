@@ -148,7 +148,7 @@ impl FirecrackerApi {
                     backend_type: "File",
                     backend_path: &memory_path.display().to_string(),
                 },
-                clock_realtime: true,
+                clock_realtime: false,
             },
         )
         .await
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_is_created_full_and_loaded_through_mem_backend_with_the_clock_advanced() {
+    async fn a_snapshot_is_created_full_and_loaded_through_mem_backend_for_guest_clock_sync() {
         let directory = tempfile::tempdir().unwrap();
         let (socket_path, seen) =
             FakeVmm::listening(directory.path(), hyper::StatusCode::NO_CONTENT, "").await;
@@ -263,7 +263,7 @@ mod tests {
         assert!(!calls[1].2.contains("mem_file_path"));
         assert_eq!(
             calls[1].2,
-            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":true}"#
+            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":false}"#
         );
     }
 
