@@ -7,7 +7,6 @@ use tokio::net::UnixStream;
 use crate::ports::VmError;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CLOCK_ERROR: Duration = Duration::from_secs(1);
 
 fn failed(reason: impl std::fmt::Display) -> VmError {
     VmError::Host(format!("guest clock synchronization failed: {reason}"))
@@ -53,10 +52,13 @@ async fn connect(path: &Path) -> Result<BufReader<UnixStream>, VmError> {
     Ok(wire)
 }
 
-pub(super) async fn sleep(path: &Path) -> Result<(), VmError> {
+pub(super) async fn freeze_tenant(path: &Path) -> Result<(), VmError> {
     let mut wire = connect(path).await?;
-    wire.get_mut().write_all(b"SLEEP\n").await.map_err(failed)?;
-    if line(&mut wire).await? != "OK" {
+    wire.get_mut()
+        .write_all(format!("{}\n", guest_contract::control::TENANT_FREEZE_REQUEST).as_bytes())
+        .await
+        .map_err(failed)?;
+    if line(&mut wire).await? != guest_contract::control::TENANT_FREEZE_HELD {
         return Err(failed("the tenant cgroup would not freeze"));
     }
     Ok(())
@@ -66,26 +68,25 @@ pub(super) async fn wake(path: &Path) -> Result<(), VmError> {
     let mut wire = connect(path).await?;
     let sent = SystemTime::now().duration_since(UNIX_EPOCH).map_err(failed)?;
     wire.get_mut()
-        .write_all(format!("WAKE {}\n", sent.as_nanos()).as_bytes())
+        .write_all(
+            format!(
+                "{}{}\n",
+                guest_contract::control::TENANT_CLOCK_REQUEST,
+                sent.as_nanos()
+            )
+            .as_bytes(),
+        )
         .await
         .map_err(failed)?;
     let reply = line(&mut wire).await?;
-    let guest_nanos = reply
-        .strip_prefix("READY ")
-        .ok_or_else(|| failed(&reply))?
-        .parse::<u128>()
-        .map_err(failed)?;
-    let host_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(failed)?
-        .as_nanos();
-    if host_nanos.abs_diff(guest_nanos) > MAX_CLOCK_ERROR.as_nanos() {
-        return Err(failed(
-            "guest clock differs from the host by more than one second",
-        ));
+    if reply != guest_contract::control::TENANT_CLOCK_READY {
+        return Err(failed(&reply));
     }
-    wire.get_mut().write_all(b"GO\n").await.map_err(failed)?;
-    if line(&mut wire).await? != "OK" {
+    wire.get_mut()
+        .write_all(format!("{}\n", guest_contract::control::TENANT_CLOCK_RELEASE).as_bytes())
+        .await
+        .map_err(failed)?;
+    if line(&mut wire).await? != guest_contract::control::TENANT_CLOCK_RELEASED {
         return Err(failed("the tenant cgroup was not released"));
     }
     Ok(())
@@ -96,7 +97,7 @@ mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
-    async fn guest(listener: UnixListener, clock_lag: Duration) -> Option<String> {
+    async fn guest(listener: UnixListener, ready: bool) -> Option<String> {
         let (stream, _) = listener
             .accept()
             .await
@@ -105,13 +106,13 @@ mod tests {
         assert_eq!(line(&mut wire).await.unwrap(), "CONNECT 51001");
         wire.get_mut().write_all(b"OK 1234\n").await.unwrap();
         let request = line(&mut wire).await.unwrap();
-        let host_nanos = request
-            .strip_prefix("WAKE ")
+        request
+            .strip_prefix(guest_contract::control::TENANT_CLOCK_REQUEST)
             .expect("the host sends a clock value")
             .parse::<u128>()
             .unwrap();
         wire.get_mut()
-            .write_all(format!("READY {}\n", host_nanos - clock_lag.as_nanos()).as_bytes())
+            .write_all(if ready { b"READY\n" } else { b"REFUSED\n" })
             .await
             .unwrap();
         let mut reply = String::new();
@@ -125,11 +126,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_restored_guest_is_released_after_its_clock_is_checked() {
+    async fn a_restored_guest_is_released_after_its_clock_is_set() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("control.vsock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let answer = tokio::spawn(guest(listener, Duration::ZERO));
+        let answer = tokio::spawn(guest(listener, true));
 
         wake(&socket).await.unwrap();
 
@@ -137,15 +138,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_restored_guest_with_stale_time_is_not_released() {
+    async fn a_guest_that_cannot_set_its_clock_is_not_released() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("control.vsock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let answer = tokio::spawn(guest(listener, Duration::from_secs(60)));
+        let answer = tokio::spawn(guest(listener, false));
 
         let failure = wake(&socket).await.unwrap_err();
 
-        assert!(failure.message().contains("differs from the host"));
+        assert!(failure.message().contains("REFUSED"));
         assert_eq!(answer.await.unwrap(), None);
     }
 }

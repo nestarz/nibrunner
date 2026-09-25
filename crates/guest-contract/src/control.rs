@@ -1,5 +1,11 @@
 pub const FREEZE_REQUEST: &str = "FREEZE\n";
 pub const FREEZE_HELD: &str = "OK";
+pub const TENANT_FREEZE_REQUEST: &str = "SLEEP";
+pub const TENANT_FREEZE_HELD: &str = "OK";
+pub const TENANT_CLOCK_REQUEST: &str = "WAKE ";
+pub const TENANT_CLOCK_READY: &str = "READY";
+pub const TENANT_CLOCK_RELEASE: &str = "GO";
+pub const TENANT_CLOCK_RELEASED: &str = "OK";
 
 pub const GUEST_SHUTDOWN_GRACE_MS: u64 = 10_000;
 
