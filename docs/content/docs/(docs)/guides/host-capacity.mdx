@@ -35,6 +35,17 @@ Exceeding the memory limit is only reported. That is what [sleeping](/docs/guide
 is for. Exceeding the disk or port limit makes `start` print the value to set instead. Both are
 advice, not errors: an app with more resources counts for more, and the value is yours to set.
 
+### Unused guest pages
+
+The bundled guest reports unused pages through Firecracker's virtio balloon device. The host can
+reclaim their physical memory without reducing the guest's configured memory limit. The balloon
+target remains zero; no polling controller or forced inflation is used. The bundled kernel must
+enable `CONFIG_MEMORY_BALLOON`, `CONFIG_VIRTIO_BALLOON` and `CONFIG_PAGE_REPORTING`.
+
+This can reduce resident memory and improve snapshot compressibility. Full snapshots still read
+all guest memory, and guests may allocate their full limit again. Admission therefore continues
+to reserve the configured limit. Reporting is not a promise that more guests fit concurrently.
+
 ### The memory limit is enforced
 
 A reconcile pass boots an app only if its memory fits alongside every app that is up or starting,
