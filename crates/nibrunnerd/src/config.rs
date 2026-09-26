@@ -85,6 +85,18 @@ pub struct ZerofsSettings {
     pub checkpoint_cache_dir: PathBuf,
 }
 
+/// Optional limits on requests through the hostname router. Omission preserves unrestricted ingress.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HttpAdmission {
+    /// Requests across all routed apps, including those waiting for a wake or streaming a body.
+    pub host_concurrent: std::num::NonZeroU16,
+    /// Default per-app limit. Aliases of an app share this capacity.
+    pub app_concurrent: std::num::NonZeroU16,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub apps: std::collections::BTreeMap<protocol::AppId, std::num::NonZeroU16>,
+}
+
 /// Where the world reaches an app on this host.
 ///
 /// Every way in is a section under here, and each is absent or complete: there is no
@@ -179,6 +191,7 @@ pub const STARTER_STATE_DIR: &str = "/var/lib/nibrunner";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
+    pub http_admission: Option<HttpAdmission>,
     /// How many apps this host is laid out for. Everything that counts slots follows from it —
     /// the ring the allocator walks, the loopback ports reserved, the nbd minors the module is
     /// loaded with, the conntrack table's size, what the metrics page calls the total — and
@@ -276,6 +289,9 @@ mod file {
     #[serde(deny_unknown_fields)]
     #[schemars(rename = "HostConfig")]
     pub(super) struct ConfigFile {
+        /// Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) http_admission: Option<super::HttpAdmission>,
         /// How many apps this host is laid out for. Everything that counts slots follows from it:
         /// the slot ring, the loopback ports reserved from 21000, the nbd minors on a zerofs host,
         /// the kernel's conntrack table at 1024 entries an app, what the metrics page calls the
@@ -670,6 +686,7 @@ impl HostConfig {
         let logs = logs(document.logs.as_ref())?;
 
         Ok(Self {
+            http_admission: document.http_admission.clone(),
             max_apps,
             snapshot_dir: path_key("paths.snapshot_dir", &paths.snapshot_dir)?,
             guest_image_dir: path_key("paths.guest_image_dir", &paths.guest_image_dir)?,
@@ -764,6 +781,7 @@ impl HostConfig {
             proxy: ProxyConfig::default(),
             metrics: None,
             filesystem: None,
+            http_admission: None,
             logs: LogsConfig::default(),
             export_store_url: state_dir.join("export-store").display().to_string(),
             export_staging_dir: state_dir.join("exports"),
@@ -831,6 +849,11 @@ impl HostConfig {
             }),
             filesystem: Some(FilesystemConfig {
                 socket: PathBuf::from("/run/nibrunner/filesystem.sock"),
+            }),
+            http_admission: Some(HttpAdmission {
+                host_concurrent: std::num::NonZeroU16::new(128).expect("positive limit"),
+                app_concurrent: std::num::NonZeroU16::new(16).expect("positive limit"),
+                apps: Default::default(),
             }),
             logs: LogsConfig::default(),
             export_store_url: "s3://nibrunner-exports-eu-west-2-123456789012/exports".to_string(),
@@ -930,6 +953,7 @@ impl HostConfig {
             filesystem: self.filesystem.as_ref().map(|filesystem| file::Filesystem {
                 socket: text(&filesystem.socket),
             }),
+            http_admission: self.http_admission.clone(),
             logs: Some(file::Logs {
                 keep_mib_per_app: Some(self.logs.keep_bytes_per_app / BYTES_PER_MEBIBYTE),
             }),
@@ -1399,6 +1423,28 @@ denied_egress_addresses_v6 = []
 
     fn refused(text: &str) -> String {
         HostConfig::from_toml(text).unwrap_err().message()
+    }
+
+    #[test]
+    fn http_admission_is_opt_in_and_refuses_zero_unknown_and_invalid_app_limits() {
+        let original = HostConfig::starter(10).to_toml();
+        assert!(HostConfig::from_toml(&original).unwrap().http_admission.is_none());
+        let valid = format!("{original}\n[http_admission]\nhost_concurrent=8\napp_concurrent=2\n[http_admission.apps]\napp-one=3\n");
+        let enabled = HostConfig::from_toml(&valid).unwrap();
+        assert_eq!(
+            enabled.http_admission.as_ref().unwrap().apps[&protocol::AppId::parse("app-one").unwrap()].get(),
+            3
+        );
+        assert_eq!(HostConfig::from_toml(&enabled.to_toml()).unwrap(), enabled);
+        for invalid in [
+            valid.replace("host_concurrent=8", "host_concurrent=0"),
+            valid.replace("app_concurrent=2", "app_concurrent=65536"),
+            valid.replace("app-one=3", "app-one=0"),
+            valid.replace("app-one=3", "'../app'=3"),
+            valid.replace("app_concurrent=2", "unknown=2"),
+        ] {
+            assert!(HostConfig::from_toml(&invalid).is_err());
+        }
     }
 
     #[test]

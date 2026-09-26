@@ -107,11 +107,21 @@ pub struct Router {
     upstreams: Upstreams,
     metrics: Arc<HostMetrics>,
     access: Option<Arc<AccessLog>>,
+    admission: Option<super::admission::Admission>,
 }
 
 impl Router {
     pub fn new(metrics: Arc<HostMetrics>, access: Option<Arc<AccessLog>>) -> Arc<Self> {
+        Self::with_admission(metrics, None, access)
+    }
+
+    pub fn with_admission(
+        metrics: Arc<HostMetrics>,
+        limits: Option<crate::config::HttpAdmission>,
+        access: Option<Arc<AccessLog>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            admission: limits.map(super::admission::Admission::new),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
             metrics,
@@ -127,6 +137,9 @@ impl Router {
 
     pub async fn apply(&self, table: RouteTable) {
         self.upstreams.keep_only(&table.apps()).await;
+        if let Some(admission) = &self.admission {
+            admission.keep_only(&table.apps());
+        }
         *self.routes.write().await = Arc::new(table);
     }
 
@@ -218,7 +231,25 @@ impl Router {
             );
         };
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
-        let open = self.metrics.proxy.open(&route.app_id);
+        let permit = match self
+            .admission
+            .as_ref()
+            .map(|limits| limits.acquire(&route.app_id))
+            .transpose()
+        {
+            Ok(permit) => permit,
+            Err(()) => {
+                let mut response = say(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "This host or app is busy. Please retry.\n",
+                );
+                response
+                    .headers_mut()
+                    .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+                return (response, Outcome::Refused, Some(route));
+            }
+        };
+        let open = super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit);
         let upstream = self.upstreams.to(&route.app_id).await;
         let response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
         let reached = response.extensions().get::<Unreachable>().is_none();

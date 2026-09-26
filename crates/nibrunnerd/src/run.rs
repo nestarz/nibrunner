@@ -197,7 +197,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         artifacts,
         payloads,
         firewall: Arc::new(HostFirewall::new(commands)),
-        router: Router::new(metrics.clone(), Some(access)),
+        router: Router::with_admission(metrics.clone(), config.http_admission.clone(), Some(access)),
         tls,
         metrics,
         waker: deferred(),

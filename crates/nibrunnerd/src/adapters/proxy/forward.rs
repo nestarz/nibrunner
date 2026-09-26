@@ -19,12 +19,32 @@ use crate::domain::metrics::proxy::OpenRequest;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
+pub(crate) struct ForwardedRequest {
+    _metrics: OpenRequest,
+    _admission: Option<super::admission::Permit>,
+}
+
+impl ForwardedRequest {
+    pub(crate) fn new(metrics: OpenRequest, admission: Option<super::admission::Permit>) -> Self {
+        Self {
+            _metrics: metrics,
+            _admission: admission,
+        }
+    }
+}
+
+impl From<OpenRequest> for ForwardedRequest {
+    fn from(metrics: OpenRequest) -> Self {
+        Self::new(metrics, None)
+    }
+}
+
 /// An upstream's body carrying the request it answers, so the request stays open until the body
 /// has been sent whole or dropped: the proxy hands the response on as soon as its headers are in,
 /// and a stream's body is still being written long after that.
 struct HeldOpen<B> {
     body: B,
-    _request: OpenRequest,
+    _request: ForwardedRequest,
 }
 
 impl<B: Body + Unpin> Body for HeldOpen<B> {
@@ -166,7 +186,7 @@ async fn forward_upgrade(
     request: Request<Incoming>,
     host: &str,
     port: u16,
-    open: OpenRequest,
+    open: ForwardedRequest,
 ) -> Response<ProxyBody> {
     let (mut parts, body) = request.into_parts();
     parts.uri = rewritten(&parts.uri, host, port);
@@ -235,14 +255,15 @@ fn as_the_upstream_speaks(parts: &mut hyper::http::request::Parts) {
     }
 }
 
-pub async fn forward(
+pub(crate) async fn forward(
     client: &Client<HttpConnector, Incoming>,
     request: Request<Incoming>,
     host: &str,
     port: u16,
     keep_alive: bool,
-    open: OpenRequest,
+    open: impl Into<ForwardedRequest>,
 ) -> Response<ProxyBody> {
+    let open = open.into();
     if upgrade_requested(&request) {
         return forward_upgrade(request, host, port, open).await;
     }

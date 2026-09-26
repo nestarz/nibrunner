@@ -32,7 +32,7 @@ name = "metrics-page"
 path = "src/bin/metrics-page.rs"
 
 [dependencies]
-protocol.workspace = true
+protocol = { workspace = true, features = ["schema"] }
 guest-contract.workspace = true
 nft-render.workspace = true
 serde.workspace = true

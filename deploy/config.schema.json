@@ -17,6 +17,10 @@
       "description": "Absent is a host nothing can ask about a guest's files.",
       "$ref": "#/$defs/filesystem"
     },
+    "http_admission": {
+      "description": "Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.",
+      "$ref": "#/$defs/HttpAdmission"
+    },
     "logs": {
       "description": "Absent keeps the newest 256 MiB of each app's output.",
       "$ref": "#/$defs/logs"
@@ -59,6 +63,43 @@
     "network"
   ],
   "$defs": {
+    "HttpAdmission": {
+      "description": "Optional limits on requests through the hostname router. Omission preserves unrestricted ingress.",
+      "type": "object",
+      "properties": {
+        "app_concurrent": {
+          "description": "Default per-app limit. Aliases of an app share this capacity.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "apps": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 1
+            }
+          }
+        },
+        "host_concurrent": {
+          "description": "Requests across all routed apps, including those waiting for a wake or streaming a body.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "host_concurrent",
+        "app_concurrent"
+      ]
+    },
     "artifacts": {
       "description": "One store, in S3 or on this disk.",
       "type": "object",

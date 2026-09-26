@@ -70,3 +70,29 @@ is logged once per pass and counted in
   - **Lowering it below a slot an app occupies moves that app** to a new slot on the next start,
     with a new loopback port and a new guest address.
 </Callout>
+
+## HTTP concurrency
+
+By default the HTTP router imposes no concurrency limit. To bound requests across
+apps and per app, add an optional section to `config.toml`:
+
+```toml
+[http_admission]
+host_concurrent = 128
+app_concurrent = 16
+
+[http_admission.apps]
+app-one = 8
+```
+
+These are example capacities, not measured application throughput. Values must be
+between 1 and 65535. App overrides use app IDs; all hostnames of an app share its
+limit. Run `nibrunnerd start` after changing host configuration. This restarts the
+daemon when needed, interrupting proxy connections, without redeploying guests.
+
+A full app or host returns HTTP 503 with `Retry-After: 1` immediately. Requests
+waiting for a cold start, streaming response bodies and upgraded connections keep
+their permits until they finish or disconnect. No waiting queue is created. Unknown
+hostnames do not allocate admission state. This covers the hostname router, not raw
+ports, guest-to-guest connections or the private activator listeners. Limits bound
+proxy work; they do not cancel work a tenant continues after a client disconnects.
