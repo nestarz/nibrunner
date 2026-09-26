@@ -97,6 +97,24 @@ pub struct HttpAdmission {
     pub apps: std::collections::BTreeMap<protocol::AppId, std::num::NonZeroU16>,
 }
 
+/// Optional host-enforced budgets for each Firecracker process, including its guest memory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VmBudget {
+    /// 100 is one host CPU. This does not change the guest's vCPU count.
+    pub cpu_percent: std::num::NonZeroU16,
+    /// Includes guest RAM and Firecracker overhead. Exceeding it can kill the VM.
+    pub memory_mib: std::num::NonZeroU32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VmBudgets {
+    pub default: VmBudget,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub apps: std::collections::BTreeMap<protocol::AppId, VmBudget>,
+}
+
 /// Where the world reaches an app on this host.
 ///
 /// Every way in is a section under here, and each is absent or complete: there is no
@@ -193,6 +211,7 @@ pub const STARTER_STATE_DIR: &str = "/var/lib/nibrunner";
 pub struct HostConfig {
     pub http_admission: Option<HttpAdmission>,
     pub max_concurrent_vm_starts: Option<std::num::NonZeroU16>,
+    pub vm_budgets: Option<VmBudgets>,
     /// How many apps this host is laid out for. Everything that counts slots follows from it —
     /// the ring the allocator walks, the loopback ports reserved, the nbd minors the module is
     /// loaded with, the conntrack table's size, what the metrics page calls the total — and
@@ -296,6 +315,9 @@ mod file {
         /// Optional host-wide bound on simultaneous VM boots and snapshot restores.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) max_concurrent_vm_starts: Option<std::num::NonZeroU16>,
+        /// Absent preserves VM processes without additional cgroup limits.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) vm_budgets: Option<super::VmBudgets>,
         /// How many apps this host is laid out for. Everything that counts slots follows from it:
         /// the slot ring, the loopback ports reserved from 21000, the nbd minors on a zerofs host,
         /// the kernel's conntrack table at 1024 entries an app, what the metrics page calls the
@@ -692,6 +714,7 @@ impl HostConfig {
         Ok(Self {
             http_admission: document.http_admission.clone(),
             max_concurrent_vm_starts: document.max_concurrent_vm_starts,
+            vm_budgets: document.vm_budgets.clone(),
             max_apps,
             snapshot_dir: path_key("paths.snapshot_dir", &paths.snapshot_dir)?,
             guest_image_dir: path_key("paths.guest_image_dir", &paths.guest_image_dir)?,
@@ -788,6 +811,7 @@ impl HostConfig {
             filesystem: None,
             http_admission: None,
             max_concurrent_vm_starts: None,
+            vm_budgets: None,
             logs: LogsConfig::default(),
             export_store_url: state_dir.join("export-store").display().to_string(),
             export_staging_dir: state_dir.join("exports"),
@@ -862,6 +886,13 @@ impl HostConfig {
                 apps: Default::default(),
             }),
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2),
+            vm_budgets: Some(VmBudgets {
+                default: VmBudget {
+                    cpu_percent: std::num::NonZeroU16::new(100).expect("positive budget"),
+                    memory_mib: std::num::NonZeroU32::new(2304).expect("positive budget"),
+                },
+                apps: Default::default(),
+            }),
             logs: LogsConfig::default(),
             export_store_url: "s3://nibrunner-exports-eu-west-2-123456789012/exports".to_string(),
             export_staging_dir: PathBuf::from("/var/lib/nibrunner/exports"),
@@ -962,6 +993,7 @@ impl HostConfig {
             }),
             http_admission: self.http_admission.clone(),
             max_concurrent_vm_starts: self.max_concurrent_vm_starts,
+            vm_budgets: self.vm_budgets.clone(),
             logs: Some(file::Logs {
                 keep_mib_per_app: Some(self.logs.keep_bytes_per_app / BYTES_PER_MEBIBYTE),
             }),

@@ -96,13 +96,47 @@ pub fn host_boot_id_or_session() -> String {
 }
 
 pub struct VmProcesses {
+    budgets: Option<crate::config::VmBudgets>,
     runtime_dir: PathBuf,
     boot_id: String,
 }
 
 impl VmProcesses {
+    pub fn with_budgets(runtime_dir: PathBuf, budgets: Option<crate::config::VmBudgets>) -> Self {
+        Self {
+            budgets,
+            ..Self::new(runtime_dir)
+        }
+    }
+
+    fn command(&self, app_id: &AppId, binary: &Path) -> tokio::process::Command {
+        let Some(budgets) = &self.budgets else {
+            return tokio::process::Command::new(binary);
+        };
+        let budget = budgets.apps.get(app_id).unwrap_or(&budgets.default);
+        let mut command = tokio::process::Command::new("systemd-run");
+        // In scope mode systemd-run moves itself into the scope and execs the VMM: its PID,
+        // parent, exit status and inherited environment stay the ones the process record tracks.
+        command
+            .args(["--scope", "--quiet", "--collect"])
+            .arg(format!(
+                "--unit=nibrunner-vm-{}",
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(app_id.as_str().as_bytes()))
+            ))
+            .arg(format!("--property=CPUQuota={}%", budget.cpu_percent))
+            .arg(format!(
+                "--property=MemoryMax={}",
+                u64::from(budget.memory_mib.get()) * 1024 * 1024
+            ))
+            .arg("--property=MemorySwapMax=0")
+            .arg("--")
+            .arg(binary);
+        command
+    }
+
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
+            budgets: None,
             runtime_dir,
             boot_id: host_boot_id_or_session(),
         }
@@ -183,7 +217,8 @@ impl VmProcesses {
         let _ = std::fs::remove_file(working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME));
 
         let console = std::fs::File::create(self.console_path(app_id))?;
-        let mut command = tokio::process::Command::new(binary);
+        let mut command = self.command(app_id, binary);
+
         command
             .arg("--api-sock")
             .arg(&api_socket)
@@ -199,12 +234,33 @@ impl VmProcesses {
         {
             #[allow(
                 unsafe_code,
-                reason = "there is no safe way to call setsid between fork and exec"
+                reason = "session and OOM policy must be set between fork and exec"
             )]
             unsafe {
-                command.pre_exec(|| {
+                let constrained = self.budgets.is_some();
+                command.pre_exec(move || {
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "linux")]
+                    if constrained {
+                        let descriptor = libc::open(
+                            c"/proc/self/oom_score_adj".as_ptr(),
+                            libc::O_WRONLY | libc::O_CLOEXEC,
+                        );
+                        if descriptor < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let written = libc::write(descriptor, c"0".as_ptr().cast(), 1);
+                        let error = std::io::Error::last_os_error();
+                        libc::close(descriptor);
+                        if written != 1 {
+                            return Err(error);
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    if constrained {
+                        return Err(std::io::Error::other("VM budgets require Linux and systemd"));
                     }
                     Ok(())
                 });
@@ -224,6 +280,7 @@ impl VmProcesses {
         self.write_record(&record)?;
 
         let processes = Self {
+            budgets: self.budgets.clone(),
             runtime_dir: self.runtime_dir.clone(),
             boot_id: self.boot_id.clone(),
         };
@@ -292,9 +349,44 @@ mod tests {
 
     fn processes(directory: &Path) -> VmProcesses {
         VmProcesses {
+            budgets: None,
             runtime_dir: directory.to_path_buf(),
             boot_id: "boot-1".into(),
         }
+    }
+
+    #[test]
+    fn vm_budgets_are_opt_in_and_scope_the_same_executable_with_explicit_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let direct = VmProcesses::new(root.path().into());
+        assert_eq!(
+            direct
+                .command(&app_id(), Path::new("/bin/firecracker"))
+                .as_std()
+                .get_program(),
+            "/bin/firecracker"
+        );
+        let scoped = VmProcesses::with_budgets(
+            root.path().into(),
+            Some(crate::config::VmBudgets {
+                default: crate::config::VmBudget {
+                    cpu_percent: 50.try_into().unwrap(),
+                    memory_mib: 1280.try_into().unwrap(),
+                },
+                apps: Default::default(),
+            }),
+        );
+        let command = scoped.command(&app_id(), Path::new("/bin/firecracker"));
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(command.as_std().get_program(), "systemd-run");
+        assert!(args.contains(&"--scope"));
+        assert!(args.contains(&"--property=CPUQuota=50%"));
+        assert!(args.contains(&"--property=MemoryMax=1342177280"));
+        assert_eq!(args.last(), Some(&"/bin/firecracker"));
     }
 
     #[test]

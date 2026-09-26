@@ -55,6 +55,10 @@
       "description": "Absent serves nothing: no hostname, no raw port.",
       "$ref": "#/$defs/proxy"
     },
+    "vm_budgets": {
+      "description": "Absent preserves VM processes without additional cgroup limits.",
+      "$ref": "#/$defs/VmBudgets"
+    },
     "volumes": {
       "description": "Where volumes live, and how.",
       "$ref": "#/$defs/volumes"
@@ -105,6 +109,51 @@
       "required": [
         "host_concurrent",
         "app_concurrent"
+      ]
+    },
+    "VmBudget": {
+      "description": "Optional host-enforced budgets for each Firecracker process, including its guest memory.",
+      "type": "object",
+      "properties": {
+        "cpu_percent": {
+          "description": "100 is one host CPU. This does not change the guest's vCPU count.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "memory_mib": {
+          "description": "Includes guest RAM and Firecracker overhead. Exceeding it can kill the VM.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cpu_percent",
+        "memory_mib"
+      ]
+    },
+    "VmBudgets": {
+      "type": "object",
+      "properties": {
+        "apps": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$": {
+              "$ref": "#/$defs/VmBudget"
+            }
+          }
+        },
+        "default": {
+          "$ref": "#/$defs/VmBudget"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "default"
       ]
     },
     "artifacts": {

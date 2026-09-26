@@ -108,3 +108,30 @@ uses its existing retry path; callers waking an app receive the existing start
 failure. Requests for an app already being woken still share its single wake.
 The permit covers VM boot/restore work, not the app's entire health grace period,
 artifact preparation or volume attachment. HTTP request admission is separate.
+
+## VM process budgets
+
+Optional systemd scopes bound each Firecracker process and its guest. Omitting
+`vm_budgets` preserves direct process launches without these additional limits.
+
+```toml
+[vm_budgets.default]
+cpu_percent = 100
+memory_mib = 2304
+
+[vm_budgets.apps.app-one]
+cpu_percent = 50
+memory_mib = 1280
+```
+
+100 percent means one host CPU, independently of guest vCPU count. The memory
+budget includes guest RAM **and Firecracker overhead**; choose it above the guest's
+configured RAM. The kernel can kill a VM exceeding its limit. Scope swap is disabled.
+These limits do not reserve capacity for the host or replace guest RAM admission.
+
+Run `nibrunnerd start` to load the configuration. Budgets apply on subsequent VM
+boots and snapshot restores; existing VM processes retain their scopes and limits.
+Disabling budgets likewise affects subsequent starts. The daemon can restart and
+re-adopt scoped VMs normally. Linux and systemd with CPU and memory accounting are
+required when enabled. The daemon's OOM protection is not inherited by constrained
+VMs, so the kernel can enforce their memory budget.

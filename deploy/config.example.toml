@@ -19,6 +19,10 @@ max_apps = 1000
 host_concurrent = 128
 app_concurrent = 16
 
+[vm_budgets.default]
+cpu_percent = 100
+memory_mib = 2304
+
 [paths]
 state_dir = "/var/lib/nibrunner"
 runtime_dir = "/run/nibrunner"
