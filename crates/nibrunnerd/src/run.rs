@@ -11,6 +11,7 @@ use crate::adapters::logs::FileLogSink;
 use crate::adapters::net::allocator::SlotAllocator;
 use crate::adapters::net::firewall::HostFirewall;
 use crate::adapters::net::tap::HostNetwork;
+use crate::adapters::proxy::access::AccessLog;
 use crate::adapters::proxy::activator::AppActivator;
 use crate::adapters::proxy::{router, Router};
 use crate::adapters::vm::layers::LayerImages;
@@ -97,6 +98,10 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         config.logs.keep_bytes_per_app,
     ));
     let sink = Arc::new(RestartRecorder::new(state.clone(), files.clone()));
+    let access = Arc::new(
+        AccessLog::new(config.logs_dir())
+            .map_err(|error| StartupError::Config(format!("access logs could not be opened: {error}")))?,
+    );
 
     let processes = VmProcesses::new(config.runtime_dir.clone());
     let reaped = reap_stale_snapshots(&config.snapshot_dir, processes.boot_id());
@@ -192,7 +197,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         artifacts,
         payloads,
         firewall: Arc::new(HostFirewall::new(commands)),
-        router: Router::new(metrics.clone()),
+        router: Router::new(metrics.clone(), Some(access)),
         tls,
         metrics,
         waker: deferred(),

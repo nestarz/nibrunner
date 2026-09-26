@@ -1,10 +1,11 @@
-use protocol::{AppHostname, AppId, HostPort};
+use protocol::{AppHostname, AppId, DeploymentId, HostPort};
 
 use crate::domain::report::InstanceRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTarget {
     pub app_id: AppId,
+    pub deployment_id: DeploymentId,
     pub hostnames: Vec<AppHostname>,
     pub host_port: HostPort,
 }
@@ -15,6 +16,7 @@ pub fn renderable_routes(records: &[InstanceRecord]) -> Vec<RouteTarget> {
         .filter(|record| !record.hostnames.is_empty())
         .map(|record| RouteTarget {
             app_id: record.app_id.clone(),
+            deployment_id: record.deployment_id.clone(),
             hostnames: record.hostnames.clone(),
             host_port: record.host_port,
         })

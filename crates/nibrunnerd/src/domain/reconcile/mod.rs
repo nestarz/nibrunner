@@ -106,6 +106,7 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
                 let _ = host.vms.discard(app_id).await;
                 host.state.drop_record(app_id).await;
                 host.logs.discard(app_id);
+                host.router.discard_access(app_id);
             }
             _ => {}
         }
