@@ -13,6 +13,7 @@ use crate::adapters::vm::snapshot::{
     SleepSubject, SnapshotStamp, SnapshotsInFlight,
 };
 use crate::adapters::vm::status::VmStatus;
+use crate::adapters::vm::time_sync;
 use crate::adapters::volumes::VolumeBackend;
 use crate::json_store::{make_directory, write_json};
 use crate::ports::{BootRequest, LogSink, SuspendRequest, VmError, Vmm};
@@ -229,10 +230,30 @@ impl Vmm for VmManager {
             tracing::warn!(app_id = %request.app_id, error = %error.message(), "the volume backend would not flush");
         }
 
+        let control = self
+            .working_dir_for(&request.app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        if let Err(error) = time_sync::freeze_tenant(&control).await {
+            if let Err(recovery) = time_sync::wake(&control).await {
+                tracing::warn!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after sleep refusal");
+            }
+            return Err(error);
+        }
         let paused = std::time::Instant::now();
-        api.pause().await?;
+        if let Err(error) = api.pause().await {
+            let _ = api.resume().await;
+            if let Err(recovery) = time_sync::wake(&control).await {
+                tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after pause refusal");
+                self.processes.stop(&request.app_id).await;
+            }
+            return Err(error);
+        }
         if let Err(error) = api.create_snapshot(&paths.state_path, &paths.memory_path).await {
             let _ = api.resume().await;
+            if let Err(recovery) = time_sync::wake(&control).await {
+                tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after snapshot refusal");
+                self.processes.stop(&request.app_id).await;
+            }
             return Err(error);
         }
         self.processes.stop(&request.app_id).await;
@@ -277,15 +298,23 @@ impl Vmm for VmManager {
                     Err(error) => Err(error),
                     Ok(()) => match api.resume().await {
                         Err(error) => Err(error),
-                        Ok(()) => self
-                            .network
-                            .refresh_neighbour(&Neighbour {
-                                guest_ipv4: request.slot.guest_ipv4.clone(),
-                                guest_mac: request.slot.guest_mac.clone(),
-                                tap_name: request.slot.tap_name.clone(),
-                            })
-                            .await
-                            .map_err(|error| VmError::Host(error.message())),
+                        Ok(()) => {
+                            let control = working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+                            match time_sync::wake(&control).await {
+                                Err(error) => Err(VmError::SnapshotUnusable {
+                                    reason: error.message(),
+                                }),
+                                Ok(()) => self
+                                    .network
+                                    .refresh_neighbour(&Neighbour {
+                                        guest_ipv4: request.slot.guest_ipv4.clone(),
+                                        guest_mac: request.slot.guest_mac.clone(),
+                                        tap_name: request.slot.tap_name.clone(),
+                                    })
+                                    .await
+                                    .map_err(|error| VmError::Host(error.message())),
+                            }
+                        }
                     },
                 }
             }
@@ -444,7 +473,12 @@ mod tests {
     use crate::state::HostState;
     use crate::test_support::mocks;
     use crate::test_support::*;
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::TokioIo;
     use protocol::ObjectKey;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -490,6 +524,176 @@ mod tests {
             network: network_spy,
             state,
         }
+    }
+
+    async fn fake_firecracker(listener: UnixListener, calls: Arc<Mutex<Vec<String>>>) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                let service =
+                    hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                        let calls = calls.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            if path == "/snapshot/create" {
+                                let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                                std::fs::write(snapshot["snapshot_path"].as_str().unwrap(), b"state")
+                                    .unwrap();
+                                std::fs::write(snapshot["mem_file_path"].as_str().unwrap(), b"memory")
+                                    .unwrap();
+                            }
+                            calls.lock().unwrap().push(path);
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(hyper::StatusCode::NO_CONTENT)
+                                    .body(Full::new(bytes::Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    }
+
+    async fn fake_guest_control(listener: UnixListener, calls: Arc<Mutex<Vec<String>>>, old_init: bool) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                let mut wire = BufReader::new(stream);
+                let mut line = String::new();
+                wire.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "CONNECT 51001\n");
+                wire.get_mut().write_all(b"OK 1234\n").await.unwrap();
+                line.clear();
+                wire.read_line(&mut line).await.unwrap();
+                let request = line.trim().to_string();
+                calls.lock().unwrap().push(request.clone());
+                if old_init {
+                    return;
+                }
+                if request == guest_contract::control::TENANT_FREEZE_REQUEST {
+                    wire.get_mut().write_all(b"OK\n").await.unwrap();
+                } else if request.starts_with(guest_contract::control::TENANT_CLOCK_REQUEST) {
+                    wire.get_mut().write_all(b"READY\n").await.unwrap();
+                    line.clear();
+                    wire.read_line(&mut line).await.unwrap();
+                    calls.lock().unwrap().push(line.trim().to_string());
+                    if line == "GO\n" {
+                        wire.get_mut().write_all(b"OK\n").await.unwrap();
+                    }
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    async fn running_fake_vm(fixture: &mut Fixture, old_init: bool) -> Arc<Mutex<Vec<String>>> {
+        use std::os::unix::fs::PermissionsExt;
+        let working_dir = fixture.manager.working_dir_for(&app_id());
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let binary = fixture._directory.path().join("fake-firecracker");
+        std::fs::write(&binary, b"#!/bin/sh\n: > started\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager.firecracker = binary;
+        fixture
+            .manager
+            .processes
+            .spawn(&app_id(), &fixture.manager.firecracker, &working_dir, None)
+            .await
+            .unwrap();
+        let marker = working_dir.join("started");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let api = UnixListener::bind(fixture.manager.processes.api_socket(&app_id())).unwrap();
+        let control =
+            UnixListener::bind(working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME)).unwrap();
+        tokio::spawn(fake_firecracker(api, calls.clone()));
+        tokio::spawn(fake_guest_control(control, calls.clone(), old_init));
+        fixture
+            .state
+            .put_record(instance_record(|record| record.health.ever_healthy = true))
+            .await;
+        calls
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_guest_that_does_not_answer_sleep_keeps_running() {
+        let mut fixture = fixture();
+        let calls = running_fake_vm(&mut fixture, true).await;
+        let request = SuspendRequest {
+            app_id: app_id(),
+            deployment_id: deployment_id(),
+            slot: nft_render::describe_slot(0, app_id()),
+        };
+
+        assert!(fixture.manager.sleep(request).await.is_err());
+        assert!(fixture.manager.processes.status(&app_id()).active);
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls[0], "SLEEP");
+        assert!(calls[1].starts_with("WAKE "));
+        fixture.manager.processes.stop(&app_id()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sleep_and_wake_hold_the_tenant_until_its_clock_is_set() {
+        let mut fixture = fixture();
+        let calls = running_fake_vm(&mut fixture, false).await;
+        let request = SuspendRequest {
+            app_id: app_id(),
+            deployment_id: deployment_id(),
+            slot: nft_render::describe_slot(0, app_id()),
+        };
+
+        fixture.manager.sleep(request.clone()).await.unwrap();
+        let paths = snapshot_paths(&fixture.manager.snapshot_dir, &app_id());
+        assert!(paths.stamp_path.exists());
+        assert!(!fixture.manager.processes.status(&app_id()).active);
+
+        let working_dir = fixture.manager.working_dir_for(&app_id());
+        let marker = working_dir.join("started");
+        std::fs::remove_file(&marker).unwrap();
+        let api_path = fixture.manager.processes.api_socket(&app_id());
+        let control_path = working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        let seen = calls.clone();
+        let listeners = tokio::spawn(async move {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let api = UnixListener::bind(api_path).unwrap();
+            let control = UnixListener::bind(control_path).unwrap();
+            tokio::spawn(fake_firecracker(api, seen.clone()));
+            tokio::spawn(fake_guest_control(control, seen, false));
+        });
+
+        fixture.manager.wake(request).await.unwrap();
+        listeners.await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls[0], "SLEEP");
+        assert_eq!(calls[1..4], ["/vm", "/snapshot/create", "/snapshot/load"]);
+        assert_eq!(calls[4], "/vm");
+        assert!(calls[5].starts_with("WAKE "));
+        assert_eq!(calls[6], "GO");
+        assert_eq!(fixture.network.neighbours().len(), 1);
+        assert!(!paths.directory.exists());
+        fixture.manager.processes.stop(&app_id()).await;
     }
 
     fn config_drive(working_dir: &Path) -> String {
