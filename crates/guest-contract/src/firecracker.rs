@@ -88,6 +88,14 @@ pub struct VsockDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalloonConfig {
+    pub amount_mib: u32,
+    pub deflate_on_oom: bool,
+    pub stats_polling_interval_s: u16,
+    pub free_page_reporting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirecrackerConfig {
     #[serde(rename = "boot-source")]
     pub boot_source: BootSource,
@@ -97,6 +105,7 @@ pub struct FirecrackerConfig {
     #[serde(rename = "network-interfaces")]
     pub network_interfaces: Vec<NetworkInterface>,
     pub vsock: VsockDevice,
+    pub balloon: BalloonConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +169,12 @@ pub fn render_firecracker_config(
                 .map(|(index, path)| read_only_drive(&layer_drive_id(index), path, false)),
         )
         .collect(),
+        balloon: BalloonConfig {
+            amount_mib: 0,
+            deflate_on_oom: false,
+            stats_polling_interval_s: 0,
+            free_page_reporting: true,
+        },
         machine_config: MachineConfig {
             vcpu_count: resources.vcpu_count,
             mem_size_mib: resources.memory_mib,
@@ -275,6 +290,20 @@ mod tests {
         assert_eq!(netmask_for(16), "255.255.0.0");
         assert_eq!(netmask_for(32), "255.255.255.255");
         assert_eq!(netmask_for(0), "0.0.0.0");
+    }
+
+    #[test]
+    fn unused_pages_are_reported_without_inflating_the_balloon_or_polling_the_guest() {
+        let json = serde_json::to_value(config()).unwrap();
+        assert_eq!(
+            json["balloon"],
+            serde_json::json!({
+                "amount_mib": 0,
+                "deflate_on_oom": false,
+                "stats_polling_interval_s": 0,
+                "free_page_reporting": true,
+            })
+        );
     }
 
     #[test]

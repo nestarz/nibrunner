@@ -11,6 +11,19 @@ init=$root/target/x86_64-unknown-linux-musl/release/nibrunner-init
 
 [[ -x $init ]] || { echo "build crates/init first: cargo build -p nibrunner-init --target x86_64-unknown-linux-musl --release" >&2; exit 1; }
 
+python3 - "$here/vmlinux" <<'PYCONFIG'
+import pathlib, sys, zlib
+kernel = pathlib.Path(sys.argv[1]).read_bytes()
+start = kernel.find(b"IKCFG_ST")
+if start < 0:
+    raise SystemExit("guest kernel must embed its configuration to verify free-page reporting")
+config = zlib.decompress(kernel[start + 8:], 31).decode().splitlines()
+required = {"CONFIG_MEMORY_BALLOON=y", "CONFIG_VIRTIO_BALLOON=y", "CONFIG_PAGE_REPORTING=y"}
+missing = required.difference(config)
+if missing:
+    raise SystemExit("guest kernel lacks free-page reporting: " + ", ".join(sorted(missing)))
+PYCONFIG
+
 read -r base snapshot epoch uuid seed < <(python3 -c "
 import json
 i = json.load(open('$here/manifest.json'))['inputs']
