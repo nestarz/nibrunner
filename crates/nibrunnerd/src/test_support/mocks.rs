@@ -99,6 +99,7 @@ pub struct VmmSpy {
     removed_taps: Arc<Mutex<Vec<String>>>,
     present_taps: Arc<Mutex<Vec<String>>>,
     status: Arc<Mutex<VmStatus>>,
+    on_boot: Arc<Mutex<Option<VmError>>>,
     on_sleep: Arc<Mutex<Option<VmError>>>,
     on_wake: Arc<Mutex<Option<VmError>>>,
     verdict: Arc<Mutex<Option<String>>>,
@@ -112,6 +113,7 @@ impl Default for VmmSpy {
             removed_taps: shared(Vec::new()),
             present_taps: shared(Vec::new()),
             status: shared(VmStatus::default()),
+            on_boot: shared(None),
             on_sleep: shared(None),
             on_wake: shared(None),
             verdict: shared(None),
@@ -121,6 +123,10 @@ impl Default for VmmSpy {
 }
 
 impl VmmSpy {
+    pub fn boot_error(&self, error: Option<VmError>) {
+        *self.on_boot.lock().expect("no panic holds this lock") = error;
+    }
+
     pub fn calls(&self) -> Vec<VmCall> {
         held(&self.calls)
     }
@@ -160,10 +166,10 @@ pub fn vmm() -> (Arc<MockVmm>, VmmSpy) {
     let spy = VmmSpy::default();
     let mut vms = MockVmm::new();
 
-    let calls = spy.calls.clone();
+    let (calls, on_boot) = (spy.calls.clone(), spy.on_boot.clone());
     vms.expect_boot().returning(move |_| {
         push(&calls, VmCall::Boot);
-        Ok(())
+        held(&on_boot).map_or(Ok(()), Err)
     });
     let (calls, on_sleep) = (spy.calls.clone(), spy.on_sleep.clone());
     vms.expect_sleep().returning(move |_| {

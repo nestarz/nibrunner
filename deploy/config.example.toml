@@ -12,6 +12,7 @@
 # Nothing here is a secret. The AWS credentials and the ZeroFS encryption password live in
 # host.env beside this file, which `install` creates empty and never writes into.
 
+max_concurrent_vm_starts = 2
 max_apps = 1000
 
 [http_admission]

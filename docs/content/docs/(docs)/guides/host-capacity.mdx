@@ -96,3 +96,15 @@ their permits until they finish or disconnect. No waiting queue is created. Unkn
 hostnames do not allocate admission state. This covers the hostname router, not raw
 ports, guest-to-guest connections or the private activator listeners. Limits bound
 proxy work; they do not cancel work a tenant continues after a client disconnects.
+## Concurrent VM starts
+
+The optional top-level `max_concurrent_vm_starts = 2` in `config.toml` bounds
+simultaneous Firecracker boots and snapshot restores. Omit it to preserve the
+existing behavior. Values must be between 1 and 65535. Run `nibrunnerd start`
+after changing configuration.
+
+A full budget refuses a start immediately rather than queuing it. Reconciliation
+uses its existing retry path; callers waking an app receive the existing start
+failure. Requests for an app already being woken still share its single wake.
+The permit covers VM boot/restore work, not the app's entire health grace period,
+artifact preparation or volume attachment. HTTP request admission is separate.

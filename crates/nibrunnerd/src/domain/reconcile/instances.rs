@@ -422,15 +422,28 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
                     return;
                 }
             };
-            host.vms
+            let boot = host
+                .vms
                 .boot(BootRequest {
                     desired: desired.clone(),
                     slot,
                     data_device_path,
                     payload,
                 })
-                .await
-                .map_err(|error| (Failure::Boot, error.message()))
+                .await;
+            if matches!(boot, Err(VmError::StartBusy)) {
+                host.state
+                    .update_record(&desired.app_id, |record| {
+                        record.state = InstanceState::Pending;
+                        record.start_attempts = existing
+                            .as_ref()
+                            .map_or(NO_START_ATTEMPTS, |prior| prior.start_attempts);
+                        record.message = Some(StateMessage::new(VmError::StartBusy.message()));
+                    })
+                    .await;
+                return;
+            }
+            boot.map_err(|error| (Failure::Boot, error.message()))
         }
     };
 
@@ -870,6 +883,25 @@ mod tests {
             Some(StartRefused::OutOfRestarts { attempted, allowed: budget })
                 if attempted == allowed + 1 && budget == allowed
         ));
+    }
+
+    #[tokio::test]
+    async fn a_busy_host_does_not_spend_the_apps_restart_budget() {
+        let host = test_host().await;
+        host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
+        host.vms.boot_error(Some(VmError::StartBusy));
+        for _ in 0..10 {
+            start_instance(&host, &desired_instance(|_| {})).await;
+            let record = host.state.record(&app_id()).await.unwrap();
+            assert_eq!(record.state, InstanceState::Pending);
+            assert_eq!(record.start_attempts, NO_START_ATTEMPTS);
+        }
+        host.vms.boot_error(None);
+        start_instance(&host, &desired_instance(|_| {})).await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Starting
+        );
     }
 
     #[tokio::test]

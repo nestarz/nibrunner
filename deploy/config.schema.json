@@ -32,6 +32,13 @@
       "maximum": 5567,
       "minimum": 1
     },
+    "max_concurrent_vm_starts": {
+      "description": "Optional host-wide bound on simultaneous VM boots and snapshot restores.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 1
+    },
     "metrics": {
       "description": "Absent is a host that scrapes nothing.",
       "$ref": "#/$defs/metrics"

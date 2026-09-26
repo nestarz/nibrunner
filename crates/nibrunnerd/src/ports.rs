@@ -131,6 +131,8 @@ pub struct SuspendRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VmError {
+    #[error("this host is busy starting other microVMs; retry later")]
+    StartBusy,
     #[error("the saved microVM state cannot be restored: {reason}")]
     SnapshotUnusable { reason: String },
     #[error("this microVM must not be snapshotted: {reason}")]
