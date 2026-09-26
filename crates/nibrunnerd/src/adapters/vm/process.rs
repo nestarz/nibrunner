@@ -115,14 +115,9 @@ impl VmProcesses {
         };
         let budget = budgets.apps.get(app_id).unwrap_or(&budgets.default);
         let mut command = tokio::process::Command::new("systemd-run");
-        // In scope mode systemd-run moves itself into the scope and execs the VMM: its PID,
-        // parent, exit status and inherited environment stay the ones the process record tracks.
+        // Scope mode execs the VMM in place; a fresh unit name avoids waiting for the old scope to be collected.
         command
             .args(["--scope", "--quiet", "--collect"])
-            .arg(format!(
-                "--unit=nibrunner-vm-{}",
-                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(app_id.as_str().as_bytes()))
-            ))
             .arg(format!("--property=CPUQuota={}%", budget.cpu_percent))
             .arg(format!(
                 "--property=MemoryMax={}",
