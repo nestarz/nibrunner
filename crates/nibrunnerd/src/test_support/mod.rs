@@ -535,16 +535,22 @@ async fn test_host_over(
 #[derive(Clone, Default)]
 pub struct Said(Arc<std::sync::Mutex<Vec<String>>>);
 
+pub fn listen(
+    subscriber: impl tracing::Subscriber + Send + Sync + 'static,
+) -> tracing::subscriber::DefaultGuard {
+    static QUIET: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    // With just one registered dispatcher, tracing caches interest using whichever thread
+    // reaches a callsite first. Keep two registered while a thread-local capture is alive.
+    QUIET.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    tracing::subscriber::set_default(subscriber)
+}
+
 impl Said {
     /// Hears everything logged on this thread until the guard is dropped.
     pub fn listening() -> (Self, tracing::subscriber::DefaultGuard) {
         use tracing_subscriber::layer::SubscriberExt;
         let said = Self::default();
-        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(said.clone()));
-        // Interest in a callsite is cached for the whole process by whichever thread reaches it
-        // first, and a thread with no subscriber of its own caches it as never. This subscriber
-        // is this thread's alone, so the cache is told to ask again.
-        tracing::callsite::rebuild_interest_cache();
+        let guard = listen(tracing_subscriber::registry().with(said.clone()));
         (said, guard)
     }
 
@@ -573,5 +579,42 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Said {
             .lock()
             .unwrap()
             .push(format!("{} {}", event.metadata().level(), message.0));
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::Said;
+
+    #[test]
+    fn a_callsite_first_reached_on_another_thread_is_still_heard() {
+        fn say() {
+            tracing::warn!("the capture belongs to this thread");
+        }
+        let (said, _listening) = Said::listening();
+        std::thread::spawn(say).join().unwrap();
+        say();
+        assert_eq!(said.lines(), ["WARN the capture belongs to this thread"]);
+    }
+
+    #[test]
+    fn concurrent_captures_hear_only_their_own_thread() {
+        let ready = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let captures: Vec<_> = (0..16)
+                .map(|index| {
+                    let ready = &ready;
+                    scope.spawn(move || {
+                        let (said, _listening) = Said::listening();
+                        ready.wait();
+                        tracing::warn!("capture {index}");
+                        assert_eq!(said.lines(), [format!("WARN capture {index}")]);
+                    })
+                })
+                .collect();
+            for capture in captures {
+                capture.join().unwrap();
+            }
+        });
     }
 }

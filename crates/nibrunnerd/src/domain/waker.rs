@@ -481,14 +481,8 @@ mod tests {
     async fn the_requests_that_waited_on_a_wake_are_counted_on_it() {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let _woken = WOKEN_LOG.lock();
         let counted = CountsCoalesced::default();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(counted.clone()));
-        // Interest in a callsite is cached for the whole process by whichever thread reaches it
-        // first, and a thread with no subscriber of its own caches it as never. This subscriber is
-        // this thread's alone, so the cache is told the question is worth asking again — and the
-        // lock above keeps the other test that reaches the same callsite from answering it first.
-        tracing::callsite::rebuild_interest_cache();
+        let _guard = crate::test_support::listen(tracing_subscriber::registry().with(counted.clone()));
 
         let listening = listening().await;
         let host = test_host().await;
@@ -537,10 +531,6 @@ mod tests {
             "{page}"
         );
     }
-
-    /// Both tests below reach the log line a finished wake writes, and only one of them may be the
-    /// thread that first decides whether anything is listening for it.
-    static WOKEN_LOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[derive(Clone, Default)]
     struct CountsCoalesced(Arc<std::sync::Mutex<Vec<u64>>>);
@@ -696,7 +686,6 @@ mod tests {
     // by the guest; it is held until the port accepts once instead.
     #[tokio::test]
     async fn a_boot_completed_guest_is_woken_once_its_port_accepts_and_held_until_then() {
-        let _woken = WOKEN_LOG.lock();
         let host = test_host().await;
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
         host.state.modify(|snapshot| snapshot.isolated = true).await;
@@ -802,7 +791,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_wake_onto_a_device_that_does_not_answer_re_attaches_it_before_the_restore() {
-        let _woken = WOKEN_LOG.lock();
         let sysfs = tempfile::tempdir().unwrap();
         let pid_file = dead_device(sysfs.path());
         let (commands, log) = mocks::commands_answering(move |request| {
