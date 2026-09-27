@@ -348,7 +348,7 @@ async fn answer_scrape(host: &Arc<Host>, path: &str) -> hyper::Response<http_bod
             snapshot: &snapshot,
             now_ms: crate::clock::now_ms(),
             slots_used: host.slots().await.len(),
-            slots_total: host.config.max_apps,
+            slots_total: host.allocator.lock().await.limit(),
             memory_available_bytes: crate::domain::report::capacity::read_memory_available_bytes(),
             conntrack,
         },

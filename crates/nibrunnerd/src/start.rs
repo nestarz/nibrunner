@@ -27,6 +27,7 @@ pub enum StartError {
 pub enum Outcome {
     Started,
     Restarted,
+    Reloaded,
     /// Left as it was, because nothing it reads changed.
     Running,
     Failed,
@@ -37,6 +38,7 @@ impl Outcome {
         match self {
             Self::Started => "started",
             Self::Restarted => "restarted",
+            Self::Reloaded => "reloaded",
             Self::Running => "running",
             Self::Failed => "failed",
         }
@@ -92,6 +94,23 @@ pub fn run(config: &HostConfig, environment_file: &Path, laid: &Laid) -> Result<
     let mut units = Vec::new();
     for (unit, restart) in plan {
         let was_active = is_active(unit);
+        if unit == DAEMON_UNIT && was_active && permits_reload(laid) {
+            match crate::reload::request(config).map_err(|error| {
+                StartError::Systemd(format!(
+                    "the running host could not confirm its configuration: {error}"
+                ))
+            })? {
+                Some(crate::reload::Applied::Unchanged) => {
+                    units.push((unit, Outcome::Running));
+                    continue;
+                }
+                Some(crate::reload::Applied::Grown) => {
+                    units.push((unit, Outcome::Reloaded));
+                    continue;
+                }
+                None => {}
+            }
+        }
         let verb = if restart { "restart" } else { "start" };
         let outcome = match systemctl(&[verb, unit])? {
             true if !is_active(unit) => Outcome::Failed,
@@ -165,8 +184,8 @@ fn wall_clock_of(since_boot: Duration, now_since_boot: Duration, now: SystemTime
 }
 
 /// Which units this host has, in the order they come up, and whether each is restarted or merely
-/// started. The daemon always: it reads `config.toml` itself, so an edit there changes no rendered
-/// file, and its restart takes no tenant with it. ZeroFS only when something it reads changed:
+/// started. The daemon falls back to a restart when it cannot apply the configuration in place.
+/// ZeroFS only when something it reads changed:
 /// its restart drops every NBD device under every live guest, and the mount goes with it.
 fn plan(config: &HostConfig, laid: &Laid) -> Vec<(&'static str, bool)> {
     let mut plan = Vec::new();
@@ -183,6 +202,12 @@ fn plan(config: &HostConfig, laid: &Laid) -> Vec<(&'static str, bool)> {
     }
     plan.push((DAEMON_UNIT, true));
     plan
+}
+
+fn permits_reload(laid: &Laid) -> bool {
+    laid.written
+        .iter()
+        .all(|path| path == Path::new(crate::install::kernel::SYSCTL_FILE))
 }
 
 fn refuse_unstartable(config: &HostConfig, environment_file: &Path) -> Result<(), StartError> {
@@ -330,7 +355,16 @@ mod tests {
     }
 
     #[test]
-    fn a_local_file_host_has_one_unit_and_it_is_always_restarted() {
+    fn applied_kernel_settings_allow_reload_but_rewritten_service_files_do_not() {
+        assert!(permits_reload(&written(&[])));
+        assert!(permits_reload(&written(&[PathBuf::from(
+            crate::install::kernel::SYSCTL_FILE
+        )])));
+        assert!(!permits_reload(&written(&[unit_path(DAEMON_UNIT)])));
+    }
+
+    #[test]
+    fn a_local_file_host_has_one_unit_with_a_restart_fallback() {
         let plan = plan(&HostConfig::under(Path::new("/srv/nibrunner")), &Laid::default());
         assert_eq!(plan, [(DAEMON_UNIT, true)]);
     }

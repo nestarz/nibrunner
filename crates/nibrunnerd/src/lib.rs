@@ -13,6 +13,7 @@ pub mod host;
 pub mod install;
 pub mod json_store;
 pub mod ports;
+pub mod reload;
 pub mod repositories;
 pub mod run;
 pub mod services;

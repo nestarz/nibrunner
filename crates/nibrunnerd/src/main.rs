@@ -228,6 +228,13 @@ fn configuration(command: &Command) -> Result<(HostConfig, Origin), std::process
 }
 
 async fn serve(config: HostConfig) -> std::process::ExitCode {
+    let inputs = match nibrunnerd::reload::Inputs::read(&config) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            tracing::error!(%error, "host startup inputs could not be read");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let host = match run::build_host(config).await {
         Ok(host) => host,
         Err(error) => {
@@ -254,8 +261,18 @@ async fn serve(config: HostConfig) -> std::process::ExitCode {
         })
         .collect();
 
+    let reloading = match nibrunnerd::reload::serve(&host, inputs).await {
+        Ok(task) => task,
+        Err(error) => {
+            tracing::error!(%error, "host configuration could not be served");
+            lifecycle.stop().await;
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     ready();
     shutdown().await;
+    reloading.abort();
     tracing::info!("nibrunnerd stopping; every microVM on this host keeps running");
     for task in running {
         task.abort();

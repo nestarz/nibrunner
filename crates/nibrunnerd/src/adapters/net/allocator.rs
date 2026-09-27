@@ -75,6 +75,14 @@ impl SlotAllocator {
         self.cursor
     }
 
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    pub(crate) fn grow(&mut self, limit: u32) {
+        self.limit = self.limit.max(limit);
+    }
+
     fn span(&self) -> u32 {
         self.limit - FIRST_SLOT
     }

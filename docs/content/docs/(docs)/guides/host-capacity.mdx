@@ -63,6 +63,11 @@ is logged once per pass and counted in
 1. Edit `max_apps`.
 2. Run `nibrunnerd start`.
 
+Raising only `max_apps` on a `local-file` host grows its capacity in place. Existing slots and
+open proxy connections stay where they are. `start` reports `reloaded`; repeating it with the
+same configuration reports `running`. A changed executable, startup file, or other setting
+still takes the restart path.
+
 <Callout title="Note">
   - **Raising it on a `zerofs` host needs a reboot.** The nbd module is loaded with
     `max_apps + 1` minors, which cannot be changed in place. `start` says so rather than
