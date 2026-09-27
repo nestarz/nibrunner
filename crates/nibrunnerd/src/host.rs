@@ -22,6 +22,7 @@ use crate::state::SharedState;
 
 pub struct Host {
     pub config: HostConfig,
+    pub runtime_policy: Arc<crate::runtime_policy::RuntimePolicy>,
     pub guest_memory_mib: u64,
     pub guest_image_version: String,
     pub state: SharedState,

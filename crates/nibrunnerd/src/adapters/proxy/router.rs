@@ -107,7 +107,7 @@ pub struct Router {
     upstreams: Upstreams,
     metrics: Arc<HostMetrics>,
     access: Option<Arc<AccessLog>>,
-    admission: Option<super::admission::Admission>,
+    admission: super::admission::Admission,
 }
 
 impl Router {
@@ -120,8 +120,20 @@ impl Router {
         limits: Option<crate::config::HttpAdmission>,
         access: Option<Arc<AccessLog>>,
     ) -> Arc<Self> {
+        Self::with_policy(
+            metrics,
+            Arc::new(crate::runtime_policy::RuntimePolicy::new(limits, None)),
+            access,
+        )
+    }
+
+    pub fn with_policy(
+        metrics: Arc<HostMetrics>,
+        policy: Arc<crate::runtime_policy::RuntimePolicy>,
+        access: Option<Arc<AccessLog>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            admission: limits.map(super::admission::Admission::new),
+            admission: super::admission::Admission::new(policy),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
             metrics,
@@ -137,9 +149,6 @@ impl Router {
 
     pub async fn apply(&self, table: RouteTable) {
         self.upstreams.keep_only(&table.apps()).await;
-        if let Some(admission) = &self.admission {
-            admission.keep_only(&table.apps());
-        }
         *self.routes.write().await = Arc::new(table);
     }
 
@@ -231,13 +240,8 @@ impl Router {
             );
         };
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
-        let permit = match self
-            .admission
-            .as_ref()
-            .map(|limits| limits.acquire(&route.app_id))
-            .transpose()
-        {
-            Ok(permit) => permit,
+        let permit = match self.admission.acquire(&route.app_id) {
+            Ok(permit) => Some(permit),
             Err(()) => {
                 let mut response = say(
                     StatusCode::SERVICE_UNAVAILABLE,

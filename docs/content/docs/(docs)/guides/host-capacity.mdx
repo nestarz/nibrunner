@@ -92,8 +92,9 @@ app-one = 8
 
 These are example capacities, not measured application throughput. Values must be
 between 1 and 65535. App overrides use app IDs; all hostnames of an app share its
-limit. Run `nibrunnerd start` after changing host configuration. This restarts the
-daemon when needed, interrupting proxy connections, without redeploying guests.
+limit. Run `nibrunnerd start` after changing the limits. They apply in place and
+existing requests stay counted until they finish. Lowering a limit below the
+number already active refuses new requests until enough have finished.
 
 A full app or host returns HTTP 503 with `Retry-After: 1` immediately. Requests
 waiting for a cold start, streaming response bodies and upgraded connections keep
@@ -134,7 +135,7 @@ budget includes guest RAM **and Firecracker overhead**; choose it above the gues
 configured RAM. The kernel can kill a VM exceeding its limit. Scope swap is disabled.
 These limits do not reserve capacity for the host or replace guest RAM admission.
 
-Run `nibrunnerd start` to load the configuration. Budgets apply on subsequent VM
+Run `nibrunnerd start` to load the budgets without restarting the proxy. Budgets apply on subsequent VM
 boots and snapshot restores; existing VM processes retain their scopes and limits.
 Disabling budgets likewise affects subsequent starts. The daemon can restart and
 re-adopt scoped VMs normally. Linux and systemd with CPU and memory accounting are

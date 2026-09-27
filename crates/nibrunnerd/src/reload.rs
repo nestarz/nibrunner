@@ -166,6 +166,7 @@ struct Current {
     program: Program,
     allocator: Arc<Mutex<SlotAllocator>>,
     inputs: Inputs,
+    policy: Arc<crate::runtime_policy::RuntimePolicy>,
 }
 
 impl Current {
@@ -179,6 +180,8 @@ impl Current {
         };
         let mut supported = self.configuration.clone();
         supported.max_apps = next.max_apps;
+        supported.http_admission.clone_from(&next.http_admission);
+        supported.vm_budgets.clone_from(&next.vm_budgets);
         if supported != next || next.max_apps < self.configuration.max_apps {
             return Reply::RestartRequired;
         }
@@ -187,10 +190,13 @@ impl Current {
         }
         // The ZeroFS export reader occupies the device just past the last app slot.
         // Growing the ring would hand a guest the reader's still-attached device.
-        if next.volumes.zerofs().is_some() {
+        if next.volumes.zerofs().is_some() && next.max_apps != self.configuration.max_apps {
             return Reply::RestartRequired;
         }
-        self.allocator.lock().await.grow(next.max_apps);
+        let mut allocator = self.allocator.lock().await;
+        allocator.grow(next.max_apps);
+        self.policy
+            .replace(next.http_admission.clone(), next.vm_budgets.clone());
         self.configuration = next;
         Reply::Grown
     }
@@ -243,6 +249,7 @@ pub async fn serve(host: &Arc<Host>, inputs: Inputs) -> io::Result<tokio::task::
         program: Program::current()?,
         allocator: host.allocator.clone(),
         inputs,
+        policy: host.runtime_policy.clone(),
     }));
     Ok(tokio::spawn(async move {
         loop {
@@ -274,6 +281,7 @@ mod tests {
             program: Program::current().unwrap(),
             allocator: Arc::new(Mutex::new(SlotAllocator::addressing(2))),
             inputs: Inputs(Vec::new()),
+            policy: Arc::new(crate::runtime_policy::RuntimePolicy::default()),
         }
     }
 
@@ -327,6 +335,37 @@ mod tests {
         let mut requested = request(&current, &current.configuration);
         requested.program.inode += 1;
         assert_eq!(current.apply(requested).await, Reply::RestartRequired);
+    }
+
+    #[tokio::test]
+    async fn runtime_policies_are_applied_together_only_when_the_whole_change_is_supported() {
+        let mut current = current();
+        let app = AppId::parse("app-one").unwrap();
+        let mut next = current.configuration.clone();
+        next.http_admission = Some(crate::config::HttpAdmission {
+            host_concurrent: 16.try_into().unwrap(),
+            app_concurrent: 4.try_into().unwrap(),
+            apps: Default::default(),
+        });
+        next.vm_budgets = Some(crate::config::VmBudgets {
+            default: crate::config::VmBudget {
+                cpu_percent: 50.try_into().unwrap(),
+                memory_mib: 512.try_into().unwrap(),
+            },
+            apps: Default::default(),
+        });
+        next.max_concurrent_vm_starts = 2.try_into().ok();
+        assert_eq!(
+            current.apply(request(&current, &next)).await,
+            Reply::RestartRequired
+        );
+        assert_eq!(current.policy.http_limits(&app), None);
+        assert_eq!(current.policy.vm_budget(&app), None);
+        next.max_concurrent_vm_starts = None;
+        assert_eq!(current.apply(request(&current, &next)).await, Reply::Grown);
+        assert_eq!(current.policy.http_limits(&app), Some((16, 4)));
+        assert_eq!(current.policy.vm_budget(&app).unwrap().cpu_percent.get(), 50);
+        assert_eq!(current.apply(request(&current, &next)).await, Reply::Unchanged);
     }
 
     #[tokio::test]

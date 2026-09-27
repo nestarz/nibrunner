@@ -103,7 +103,11 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
             .map_err(|error| StartupError::Config(format!("access logs could not be opened: {error}")))?,
     );
 
-    let processes = VmProcesses::with_budgets(config.runtime_dir.clone(), config.vm_budgets.clone());
+    let runtime_policy = Arc::new(crate::runtime_policy::RuntimePolicy::new(
+        config.http_admission.clone(),
+        config.vm_budgets.clone(),
+    ));
+    let processes = VmProcesses::with_policy(config.runtime_dir.clone(), runtime_policy.clone());
     let reaped = reap_stale_snapshots(&config.snapshot_dir, processes.boot_id());
     if reaped.snapshots > 0 {
         tracing::info!(
@@ -200,7 +204,8 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         artifacts,
         payloads,
         firewall: Arc::new(HostFirewall::new(commands)),
-        router: Router::with_admission(metrics.clone(), config.http_admission.clone(), Some(access)),
+        router: Router::with_policy(metrics.clone(), runtime_policy.clone(), Some(access)),
+        runtime_policy,
         tls,
         metrics,
         waker: deferred(),

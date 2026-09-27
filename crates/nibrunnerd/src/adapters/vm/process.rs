@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use protocol::AppId;
 use serde::{Deserialize, Serialize};
@@ -96,24 +97,30 @@ pub fn host_boot_id_or_session() -> String {
 }
 
 pub struct VmProcesses {
-    budgets: Option<crate::config::VmBudgets>,
+    policy: Arc<crate::runtime_policy::RuntimePolicy>,
     runtime_dir: PathBuf,
     boot_id: String,
 }
 
 impl VmProcesses {
     pub fn with_budgets(runtime_dir: PathBuf, budgets: Option<crate::config::VmBudgets>) -> Self {
+        Self::with_policy(
+            runtime_dir,
+            Arc::new(crate::runtime_policy::RuntimePolicy::new(None, budgets)),
+        )
+    }
+
+    pub fn with_policy(runtime_dir: PathBuf, policy: Arc<crate::runtime_policy::RuntimePolicy>) -> Self {
         Self {
-            budgets,
+            policy,
             ..Self::new(runtime_dir)
         }
     }
 
     fn command(&self, app_id: &AppId, binary: &Path) -> tokio::process::Command {
-        let Some(budgets) = &self.budgets else {
+        let Some(budget) = self.policy.vm_budget(app_id) else {
             return tokio::process::Command::new(binary);
         };
-        let budget = budgets.apps.get(app_id).unwrap_or(&budgets.default);
         let mut command = tokio::process::Command::new("systemd-run");
         // Scope mode execs the VMM in place; a fresh unit name avoids waiting for the old scope to be collected.
         command
@@ -131,7 +138,7 @@ impl VmProcesses {
 
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
-            budgets: None,
+            policy: Arc::default(),
             runtime_dir,
             boot_id: host_boot_id_or_session(),
         }
@@ -232,7 +239,7 @@ impl VmProcesses {
                 reason = "session and OOM policy must be set between fork and exec"
             )]
             unsafe {
-                let constrained = self.budgets.is_some();
+                let constrained = command.as_std().get_program() == "systemd-run";
                 command.pre_exec(move || {
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
@@ -275,7 +282,7 @@ impl VmProcesses {
         self.write_record(&record)?;
 
         let processes = Self {
-            budgets: self.budgets.clone(),
+            policy: self.policy.clone(),
             runtime_dir: self.runtime_dir.clone(),
             boot_id: self.boot_id.clone(),
         };
@@ -344,7 +351,7 @@ mod tests {
 
     fn processes(directory: &Path) -> VmProcesses {
         VmProcesses {
-            budgets: None,
+            policy: Arc::default(),
             runtime_dir: directory.to_path_buf(),
             boot_id: "boot-1".into(),
         }
@@ -382,6 +389,33 @@ mod tests {
         assert!(args.contains(&"--property=CPUQuota=50%"));
         assert!(args.contains(&"--property=MemoryMax=1342177280"));
         assert_eq!(args.last(), Some(&"/bin/firecracker"));
+    }
+
+    #[test]
+    fn reloaded_budgets_are_used_by_the_next_process_without_changing_a_prepared_command() {
+        let processes = VmProcesses::new(PathBuf::from("/run/nibrunner"));
+        let before = processes.command(&app_id(), Path::new("/bin/firecracker"));
+        processes.policy.replace(
+            None,
+            Some(crate::config::VmBudgets {
+                default: crate::config::VmBudget {
+                    cpu_percent: 25.try_into().unwrap(),
+                    memory_mib: 512.try_into().unwrap(),
+                },
+                apps: Default::default(),
+            }),
+        );
+        let after = processes.command(&app_id(), Path::new("/bin/firecracker"));
+        assert_eq!(before.as_std().get_program(), "/bin/firecracker");
+        assert_eq!(after.as_std().get_program(), "systemd-run");
+        assert!(after
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "--property=CPUQuota=25%"));
+        assert!(after
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "--property=MemoryMax=536870912"));
     }
 
     #[test]
