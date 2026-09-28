@@ -69,6 +69,7 @@ mod tests {
                 listen_address: here(),
                 port: 8080,
                 tls: None,
+                redirect_from_port: None,
             }),
             raw: None,
         }

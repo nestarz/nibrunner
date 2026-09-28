@@ -132,14 +132,17 @@ pub struct ProxyConfig {
 ///
 /// One per host and one per guest: a guest's hostname resolves to this host, and this is what
 /// carries it to the one port that guest answers HTTP on. One rather than a plain port beside a
-/// TLS port, because nothing here redirects — two would serve every app unencrypted and encrypted
-/// at once, forever, with nothing moving a visitor from the first to the second.
+/// TLS port, because two would serve every app unencrypted and encrypted at once — the plain port
+/// a TLS host may add, `redirect_from_port`, only ever moves a visitor to the encrypted one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpListener {
     pub listen_address: IpAddr,
     pub port: u16,
     /// Absent serves plain HTTP, which is what a host behind an edge that terminates TLS wants.
     pub tls: Option<TlsMaterial>,
+    /// A second, plain port that answers every request with a redirect to the same host and path
+    /// over TLS. It carries no app: a visitor who reaches it is moved, never served.
+    pub redirect_from_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,8 +500,8 @@ mod file {
         pub(super) raw: Option<Raw>,
     }
 
-    /// The one HTTP listener, where the edge reaches it. One per host: nothing here redirects, so a
-    /// plain port beside a TLS one would serve every app both ways forever.
+    /// The one HTTP listener, where the edge reaches it. One per host: a plain port beside a TLS one
+    /// would serve every app both ways forever, so the only plain port allowed redirects.
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     #[schemars(rename = "proxy.http")]
@@ -512,10 +515,16 @@ mod file {
         /// terminates TLS wants.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) tls: Option<Tls>,
+        /// A plain port answering every request with a 301 to the same host and path over TLS,
+        /// where a browser typing a bare hostname arrives. Needs `tls`; serves no app.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(range(min = 1))]
+        pub(super) redirect_from_port: Option<u16>,
     }
 
     /// One certificate for the whole host — there is no SNI selection, so a wildcard in practice —
-    /// read once, at startup. Obtaining and renewing it is certbot's or the edge's.
+    /// re-read whenever either file changes, so a renewal needs no restart. Obtaining it is
+    /// certbot's or the edge's.
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     #[schemars(rename = "proxy.http.tls")]
@@ -779,6 +788,7 @@ impl HostConfig {
             listen_address: IpAddr::from([0, 0, 0, 0]),
             port: 80,
             tls: None,
+            redirect_from_port: None,
         });
         // What an app has used is published here and nowhere else, so a host laid out from
         // nothing still has somewhere to read it. On loopback, because it is this host's to read.
@@ -867,6 +877,7 @@ impl HostConfig {
                         key: PathBuf::from("/etc/nibrunner/tls/origin.key"),
                         client_ca: Some(PathBuf::from("/etc/nibrunner/tls/origin-pull-ca.pem")),
                     }),
+                    redirect_from_port: None,
                 }),
                 raw: Some(RawPorts {
                     listen_address: IpAddr::from([10, 0, 5, 18]),
@@ -971,6 +982,7 @@ impl HostConfig {
                 http: self.proxy.http.as_ref().map(|http| file::Http {
                     listen_address: Some(http.listen_address.to_string()),
                     port: Some(http.port),
+                    redirect_from_port: http.redirect_from_port,
                     tls: http.tls.as_ref().map(|tls| file::Tls {
                         certificate: text(&tls.certificate),
                         key: text(&tls.key),
@@ -1077,6 +1089,10 @@ fn proxy(document: Option<&file::Proxy>, max_apps: u32) -> Result<ProxyConfig, C
                         })
                     })
                     .transpose()?,
+                redirect_from_port: http
+                    .redirect_from_port
+                    .map(|port| redirect_port(port, http, max_apps))
+                    .transpose()?,
             })
         })
         .transpose()?;
@@ -1126,6 +1142,24 @@ fn apps(field: &str, count: u32) -> Result<u32, ConfigError> {
     Ok(count)
 }
 
+fn redirect_port(port: u16, http: &file::Http, max_apps: u32) -> Result<u16, ConfigError> {
+    const FIELD: &str = "proxy.http.redirect_from_port";
+    let port = listener(FIELD, port, max_apps)?;
+    if http.tls.is_none() {
+        return Err(ConfigError::invalid(
+            FIELD,
+            "absent unless proxy.http.tls is set, because a host serving plain HTTP has nowhere to redirect to",
+        ));
+    }
+    if http.port == Some(port) {
+        return Err(ConfigError::invalid(
+            FIELD,
+            format!("a different port from proxy.http.port, which is also {port}"),
+        ));
+    }
+    Ok(port)
+}
+
 fn metrics(
     document: Option<&file::Metrics>,
     proxy: &ProxyConfig,
@@ -1138,6 +1172,10 @@ fn metrics(
     let port = listener("metrics.port", required("metrics.port", document.port)?, max_apps)?;
     for (named, field) in [
         (proxy.http.as_ref().map(|http| http.port), "proxy.http.port"),
+        (
+            proxy.http.as_ref().and_then(|http| http.redirect_from_port),
+            "proxy.http.redirect_from_port",
+        ),
         // Rendered into ZeroFS's own config by `nibrunnerd install`, so this host does hold it
         // even though no key here names it, and a second binding is a startup failure over there.
         (
@@ -1583,6 +1621,68 @@ denied_egress_addresses_v6 = []
             .unwrap()
             .certificate,
             PathBuf::from("/tls/origin.crt")
+        );
+    }
+
+    #[test]
+    fn a_tls_host_may_name_a_plain_port_that_only_redirects() {
+        let tls = "[proxy.http.tls]\ncertificate = \"/tls/origin.crt\"\nkey = \"/tls/origin.key\"\n";
+        let served = with(&bound(&format!(
+            "[proxy.http]\nport = 443\nredirect_from_port = 80\n\n{tls}"
+        )))
+        .proxy
+        .http
+        .unwrap();
+        assert_eq!((served.port, served.redirect_from_port), (443, Some(80)));
+        assert_eq!(
+            with(&bound(&format!("[proxy.http]\nport = 443\n\n{tls}")))
+                .proxy
+                .http
+                .unwrap()
+                .redirect_from_port,
+            None
+        );
+
+        let plain = refused(&document(
+            &[],
+            &bound("[proxy.http]\nport = 8080\nredirect_from_port = 80\n"),
+        ));
+        assert!(plain.contains("proxy.http.redirect_from_port"), "{plain}");
+        assert!(plain.contains("proxy.http.tls"), "{plain}");
+
+        let same = refused(&document(
+            &[],
+            &bound(&format!(
+                "[proxy.http]\nport = 443\nredirect_from_port = 443\n\n{tls}"
+            )),
+        ));
+        assert!(same.contains("different port from proxy.http.port"), "{same}");
+
+        let slot = refused(&document(
+            &[],
+            &bound(&format!(
+                "[proxy.http]\nport = 443\nredirect_from_port = 21000\n\n{tls}"
+            )),
+        ));
+        assert!(
+            slot.contains("proxy.http.redirect_from_port") && slot.contains("21000"),
+            "{slot}"
+        );
+
+        let scrape = refused(&document(
+            &[],
+            &bound(&format!(
+                "[proxy.http]\nport = 443\nredirect_from_port = 9100\n\n{tls}\n[metrics]\nport = 9100\nlisten_address = \"127.0.0.1\"\n"
+            )),
+        ));
+        assert!(scrape.contains("proxy.http.redirect_from_port"), "{scrape}");
+
+        let mut config = HostConfig::example();
+        config.proxy.http.as_mut().unwrap().redirect_from_port = Some(80);
+        assert_eq!(
+            parsed(&config.to_toml()),
+            config,
+            "the key is written and read back"
         );
     }
 
@@ -2167,6 +2267,7 @@ keep_mib_per_app = 64
                     key: PathBuf::from("/etc/nibrunner/origin.key"),
                     client_ca: Some(PathBuf::from("/etc/nibrunner/origin-pull-ca.pem")),
                 }),
+                redirect_from_port: None,
             })
         );
         assert_eq!(

@@ -333,7 +333,7 @@
       "additionalProperties": false
     },
     "proxy.http": {
-      "description": "The one HTTP listener, where the edge reaches it. One per host: nothing here redirects, so a\nplain port beside a TLS one would serve every app both ways forever.",
+      "description": "The one HTTP listener, where the edge reaches it. One per host: a plain port beside a TLS one\nwould serve every app both ways forever, so the only plain port allowed redirects.",
       "type": "object",
       "properties": {
         "listen_address": {
@@ -342,6 +342,13 @@
         },
         "port": {
           "description": "A free port, outside the range the slots take from 21000. Not 0.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "redirect_from_port": {
+          "description": "A plain port answering every request with a 301 to the same host and path over TLS,\nwhere a browser typing a bare hostname arrives. Needs `tls`; serves no app.",
           "type": "integer",
           "format": "uint16",
           "maximum": 65535,
@@ -359,7 +366,7 @@
       ]
     },
     "proxy.http.tls": {
-      "description": "One certificate for the whole host — there is no SNI selection, so a wildcard in practice —\nread once, at startup. Obtaining and renewing it is certbot's or the edge's.",
+      "description": "One certificate for the whole host — there is no SNI selection, so a wildcard in practice —\nre-read whenever either file changes, so a renewal needs no restart. Obtaining it is\ncertbot's or the edge's.",
       "type": "object",
       "properties": {
         "certificate": {

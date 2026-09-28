@@ -342,6 +342,66 @@ pub async fn serve_http(router: Arc<Router>, address: SocketAddr) -> std::io::Re
     }
 }
 
+/// Where a plain request to `host` and `target` belongs: the same host and path over TLS, on the
+/// TLS port unless that is the default one. Refused for a host that could put a second header in
+/// the answer or send a visitor to another machine.
+pub fn secure_location(host: &str, target: &str, secure_port: u16) -> Option<String> {
+    let name = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let plain = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    let path = target.starts_with('/') && target.bytes().all(|b| b.is_ascii_graphic());
+    (plain && path).then(|| match secure_port {
+        443 => format!("https://{name}{target}"),
+        port => format!("https://{name}:{port}{target}"),
+    })
+}
+
+/// The plain port of a TLS host: it answers every request with a redirect to the encrypted one and
+/// forwards nothing, so an app is still never served unencrypted.
+pub async fn serve_redirect(address: SocketAddr, secure_port: u16) -> std::io::Result<()> {
+    let listener = TcpListener::bind(address).await?;
+    tracing::info!(%address, secure_port, "the proxy is redirecting plain HTTP to TLS");
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let stream = without_nagle(stream);
+        tokio::spawn(async move {
+            let service = service_fn(move |request: Request<Incoming>| async move {
+                let target = request.uri().path_and_query().map_or("/", |p| p.as_str());
+                let response = match hostname_of(&request)
+                    .and_then(|host| secure_location(&host, target, secure_port))
+                {
+                    Some(location) => {
+                        let mut redirect = say(StatusCode::MOVED_PERMANENTLY, "");
+                        if let Ok(value) = hyper::header::HeaderValue::from_str(&location) {
+                            redirect.headers_mut().insert(hyper::header::LOCATION, value);
+                        }
+                        redirect
+                    }
+                    None => say(
+                        StatusCode::BAD_REQUEST,
+                        "This request names no host to redirect.\n",
+                    ),
+                };
+                Ok::<_, std::convert::Infallible>(response)
+            });
+            let _ = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(GREETING_TIMEOUT)
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
 pub async fn serve_https(
     router: Arc<Router>,
     address: SocketAddr,
@@ -427,22 +487,13 @@ pub fn tls_acceptor(
     key: &Path,
     client_ca: Option<&Path>,
 ) -> std::io::Result<tokio_rustls::TlsAcceptor> {
-    let certificates = pem::read_certificates(certificate)?;
-    tracing::info!(
-        certificates = certificates.len(),
-        chain = %certificate.display(),
-        "origin certificate chain loaded"
-    );
-    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key)?))?
-        .ok_or_else(|| invalid("the key file holds no private key"))?;
+    let resolver = Arc::new(super::certificate::ReloadingCertificate::open(certificate, key)?);
     let builder = rustls::ServerConfig::builder();
     let builder = match client_ca {
         Some(client_ca) => builder.with_client_cert_verifier(client_verifier(client_ca)?),
         None => builder.with_no_client_auth(),
     };
-    let mut config = builder
-        .with_single_cert(certificates, private_key)
-        .map_err(invalid)?;
+    let mut config = builder.with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
@@ -1102,6 +1153,67 @@ mod tests {
             let _ = feed.unbounded_send(bytes::Bytes::from_static(b"to nobody"));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn a_redirect_keeps_the_host_and_path_and_refuses_what_could_split_the_response() {
+        assert_eq!(
+            secure_location("Hello.Apps.Example.com", "/a/b?c=1", 443).as_deref(),
+            Some("https://hello.apps.example.com/a/b?c=1")
+        );
+        assert_eq!(
+            secure_location("hello.example.com:80", "/", 8443).as_deref(),
+            Some("https://hello.example.com:8443/"),
+            "the plain port in the Host header is dropped and a non-default TLS port is named"
+        );
+        for host in [
+            "",
+            "evil.com/../x",
+            "a b",
+            "a@b.com",
+            "x\r\nSet-Cookie: 1",
+            ".",
+            "a..b",
+        ] {
+            assert_eq!(secure_location(host, "/", 443), None, "{host:?}");
+        }
+        for target in ["", "*", "//x y", "/a\r\nb", "/ünïcode"] {
+            assert_eq!(secure_location("ok.example.com", target, 443), None, "{target:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_plain_port_of_a_tls_host_moves_every_visitor_and_serves_no_app() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        tokio::spawn(serve_redirect(address, 443));
+        let mut answered = String::new();
+        for _ in 0..50 {
+            match std::net::TcpStream::connect(address) {
+                Ok(_) => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        answered.push_str(
+            &asked(
+                address.port(),
+                "GET /hello?q=1 HTTP/1.1\r\nHost: hello.example.com\r\n\r\n",
+            )
+            .await,
+        );
+        assert!(answered.starts_with("HTTP/1.1 301 "), "{answered}");
+        assert!(
+            answered.contains("location: https://hello.example.com/hello?q=1\r\n"),
+            "{answered}"
+        );
+        let unnamed = asked(address.port(), "GET / HTTP/1.0\r\n\r\n").await;
+        assert!(
+            unnamed.starts_with("HTTP/1.0 400 ") || unnamed.starts_with("HTTP/1.1 400 "),
+            "{unnamed}"
+        );
+        let injected = asked(address.port(), "GET / HTTP/1.1\r\nHost: evil@example.com\r\n\r\n").await;
+        assert!(injected.contains(" 400 "), "{injected}");
     }
 
     #[test]

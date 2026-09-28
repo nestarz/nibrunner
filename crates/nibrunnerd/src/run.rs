@@ -259,13 +259,21 @@ pub fn serve_proxy(host: &Arc<Host>) {
     let Some(http) = host.config.proxy.http.clone() else {
         return;
     };
+    if let Some(port) = http.redirect_from_port {
+        let (address, secure_port) = (SocketAddr::new(http.listen_address, port), http.port);
+        tokio::spawn(async move {
+            if let Err(error) = router::serve_redirect(address, secure_port).await {
+                tracing::error!(%error, "the redirect listener could not listen");
+            }
+        });
+    }
     let router = host.router.clone();
     let acceptor = host.tls.clone();
     let address = SocketAddr::new(http.listen_address, http.port);
     tokio::spawn(async move {
-        // One listener, and what it is depends on whether this host was given the material to
-        // encrypt with. Nothing here redirects, so a second plain port beside a TLS one would
-        // serve every app both ways at once with nothing moving a visitor off the first.
+        // One app listener, and what it is depends on whether this host was given the material to
+        // encrypt with. A plain port beside a TLS one would serve every app both ways at once, so
+        // the only one allowed is `redirect_from_port`, which serves none.
         let served = match acceptor {
             None => router::serve_http(router, address).await,
             Some(acceptor) => {
