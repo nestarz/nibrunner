@@ -127,6 +127,9 @@ pub struct DesiredInstance {
     /// Removing the policy or changing deploymentId revives the instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry: Option<ExpiryPolicy>,
+    /// Overrides per-app configuration limits live; omission restores configuration defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<InstanceLimits>,
     /// The root filesystem, bottom layer first. At least one; at most `MAX_LAYERS`.
     pub layers: Vec<DesiredLayer>,
     pub config: AppConfig,
@@ -166,6 +169,8 @@ struct DesiredInstanceFields {
     activation: Option<ActivationPolicy>,
     #[serde(default)]
     expiry: Option<ExpiryPolicy>,
+    #[serde(default)]
+    limits: Option<InstanceLimits>,
     layers: Vec<DesiredLayer>,
     config: AppConfig,
     hostnames: Vec<AppHostname>,
@@ -212,6 +217,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             idle_timeout_ms: fields.idle_timeout_ms,
             activation: fields.activation,
             expiry: fields.expiry,
+            limits: fields.limits,
             layers: fields.layers,
             config: fields.config,
             hostnames: fields.hostnames,

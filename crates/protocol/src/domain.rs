@@ -8,6 +8,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::*;
 
+/// Host-enforced limits, applied live without replacing an instance's deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstanceLimits {
+    /// Concurrent HTTP requests, including wake waits and open streams.
+    pub concurrent: std::num::NonZeroU16,
+    /// Host CPU percentage; 100 means one CPU.
+    pub cpu_percent: std::num::NonZeroU16,
+    /// Host memory budget including guest RAM and Firecracker overhead.
+    #[cfg_attr(feature = "schema", schemars(range(max = 4294967295_u64)))]
+    pub memory_mib: std::num::NonZeroU32,
+}
+
 const ENVIRONMENT_RESERVED_NAME: &str = "__proto__";
 pub const ENVIRONMENT_NAME_PATTERN: &str = "^[A-Za-z_][A-Za-z0-9_]*$";
 

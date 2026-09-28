@@ -419,6 +419,30 @@ mod tests {
     }
 
     #[test]
+    fn document_budget_overrides_the_next_scope_command() {
+        let processes = VmProcesses::new(PathBuf::from("/run/nibrunner"));
+        processes
+            .policy
+            .replace_instances(&[crate::test_support::desired_instance(|instance| {
+                instance.limits = Some(protocol::InstanceLimits {
+                    concurrent: 8.try_into().unwrap(),
+                    cpu_percent: 75.try_into().unwrap(),
+                    memory_mib: 640.try_into().unwrap(),
+                });
+            })]);
+        let command = processes.command(&app_id(), Path::new("/bin/firecracker"));
+        assert_eq!(command.as_std().get_program(), "systemd-run");
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "--property=CPUQuota=75%"));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "--property=MemoryMax=671088640"));
+    }
+
+    #[test]
     fn a_host_with_no_record_holds_no_microvm() {
         let directory = tempfile::tempdir().unwrap();
         let processes = processes(directory.path());

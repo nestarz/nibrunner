@@ -119,6 +119,7 @@ impl ConvergeController {
     async fn accept(&self, desired: &HostDesiredState) -> Option<Changes> {
         let mut cache = self.host.cache.lock().await;
         let changes = cache.changes_in(desired);
+        self.host.runtime_policy.replace_instances(&desired.instances);
         cache.accept(desired.clone()).then_some(changes)
     }
 }
@@ -158,6 +159,32 @@ mod tests {
 
     fn controller(host: &TestHost, reconciler: MockReconcileService) -> Arc<ConvergeController> {
         ConvergeController::new(host.arc().clone(), Arc::new(reconciler))
+    }
+
+    #[tokio::test]
+    async fn limits_are_taken_up_without_starting_a_new_deployment() {
+        let host = test_host().await;
+        let controller = controller(&host, MockReconcileService::new());
+        let mut desired = desired_state(|state| state.instances = vec![desired_instance(|_| {})]);
+        controller.accept(&desired).await;
+        desired.instances[0].limits = Some(protocol::InstanceLimits {
+            concurrent: 3.try_into().unwrap(),
+            cpu_percent: 150.try_into().unwrap(),
+            memory_mib: 640.try_into().unwrap(),
+        });
+        assert_eq!(controller.accept(&desired).await, Some(Changes::default()));
+        assert_eq!(host.runtime_policy.http_limits(&app_id()).unwrap().1, 3);
+        assert_eq!(
+            host.runtime_policy
+                .vm_budget(&app_id())
+                .unwrap()
+                .cpu_percent
+                .get(),
+            150
+        );
+        desired.instances[0].limits = None;
+        assert_eq!(controller.accept(&desired).await, Some(Changes::default()));
+        assert_eq!(host.runtime_policy.vm_budget(&app_id()), None);
     }
 
     #[tokio::test]

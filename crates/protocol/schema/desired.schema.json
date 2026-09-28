@@ -274,6 +274,17 @@
           "maxItems": 8,
           "minItems": 1
         },
+        "limits": {
+          "description": "Overrides per-app configuration limits live; omission restores configuration defaults.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "volumeId": {
           "description": "One of this document's `volumes`, mounted in the guest as the app's data directory.",
           "$ref": "#/$defs/VolumeId"
@@ -653,6 +664,39 @@
         "digest",
         "objectKey",
         "destinationPath"
+      ]
+    },
+    "InstanceLimits": {
+      "description": "Host-enforced limits, applied live without replacing an instance's deployment.",
+      "type": "object",
+      "properties": {
+        "concurrent": {
+          "description": "Concurrent HTTP requests, including wake waits and open streams.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "cpuPercent": {
+          "description": "Host CPU percentage; 100 means one CPU.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "memoryMib": {
+          "description": "Host memory budget including guest RAM and Firecracker overhead.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "concurrent",
+        "cpuPercent",
+        "memoryMib"
       ]
     },
     "InstancePort": {

@@ -617,6 +617,29 @@ mod schema {
     }
 
     #[test]
+    fn limits_schema_and_parser_agree_on_integer_bounds() {
+        let validator = validator(crate::schema::desired_state());
+        for (field, maximum) in [
+            ("concurrent", u16::MAX as u64),
+            ("cpuPercent", u16::MAX as u64),
+            ("memoryMib", u32::MAX as u64),
+        ] {
+            for value in [0, 1, maximum, maximum + 1] {
+                let mut document = desired_json();
+                document["instances"][0]["limits"] =
+                    serde_json::json!({"concurrent": 8, "cpuPercent": 100, "memoryMib": 512});
+                document["instances"][0]["limits"][field] = value.into();
+                let accepted = value > 0 && value <= maximum;
+                assert_eq!(
+                    serde_json::from_value::<HostDesiredState>(document.clone()).is_ok(),
+                    accepted
+                );
+                assert_eq!(validator.is_valid(&document), accepted);
+            }
+        }
+    }
+
+    #[test]
     fn expiry_schema_and_parser_agree_on_state_and_bounds() {
         let validator = validator(crate::schema::desired_state());
         for state in ["on-request", "running", "stopped"] {
@@ -923,5 +946,29 @@ fn expiry_is_bounded_optional_and_only_for_on_request_instances() {
     assert_eq!(parsed.instances[0].expiry, None);
     assert!(serde_json::to_value(parsed).unwrap()["instances"][0]
         .get("expiry")
+        .is_none());
+}
+
+#[test]
+fn instance_limits_are_optional_nonzero_and_strict() {
+    let mut document = desired_json();
+    let limits = serde_json::json!({"concurrent": 8, "cpuPercent": 100, "memoryMib": 512});
+    document["instances"][0]["limits"] = limits.clone();
+    let parsed: HostDesiredState = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(parsed).unwrap()["instances"][0]["limits"],
+        limits
+    );
+    for field in ["concurrent", "cpuPercent", "memoryMib"] {
+        let mut invalid = document.clone();
+        invalid["instances"][0]["limits"][field] = 0.into();
+        assert!(serde_json::from_value::<HostDesiredState>(invalid).is_err());
+    }
+    document["instances"][0]["limits"]["typo"] = 1.into();
+    assert!(serde_json::from_value::<HostDesiredState>(document).is_err());
+    let parsed: HostDesiredState = serde_json::from_value(desired_json()).unwrap();
+    assert_eq!(parsed.instances[0].limits, None);
+    assert!(serde_json::to_value(parsed).unwrap()["instances"][0]
+        .get("limits")
         .is_none());
 }

@@ -8,6 +8,13 @@ which apps run on the host, on which volumes, and how they are reached.
 [Deploy an app](/docs/getting-started/deploy-an-app) is the guide; this page lists every field.
 A file the host cannot parse is rejected as a whole, and `reported.json` says why.
 
+An instance may set `limits: { concurrent, cpuPercent, memoryMib }` with positive integers.
+These override its `http_admission.apps` and `vm_budgets.apps` configuration entries;
+omitting `limits` restores the current configuration fallback. The host-wide HTTP limit
+still applies. Limits-only edits are taken up without replacing the deployment: HTTP
+admission changes immediately, while CPU and memory budgets apply when the VM next starts.
+Change `deploymentId` as well when a running VM must be replaced with the new budget.
+
 An editor validates and autocompletes the file when it names the schema:
 
 ```json

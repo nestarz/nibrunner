@@ -146,6 +146,7 @@ pub fn desired_instance(edit: impl FnOnce(&mut DesiredInstance)) -> DesiredInsta
         desired_state: DesiredInstanceState::Running,
         idle_timeout_ms: None,
         expiry: None,
+        limits: None,
         activation: None,
         layers: vec![layer(|_| {})],
         config: app_config(|_| {}),
