@@ -203,6 +203,29 @@ mod tests {
     }
 
     #[test]
+    fn one_file_holding_a_comment_the_chain_and_the_key_serves_as_both_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first, second) = (pair(), pair());
+        let both = |p: &Pair, seq: u32| {
+            format!(
+                "# mf force_cert_seq={seq}\n{}\n{}",
+                p.certificate.trim_end(),
+                p.key
+            )
+        };
+        let file = install(directory.path(), "pair.pem", &both(&first, 1));
+        let resolver = ReloadingCertificate::open(&file, &file).unwrap();
+        let before = leaf(&resolver.current());
+        assert_eq!(before, pem::read_certificates(&file).unwrap()[0].as_ref());
+        install(directory.path(), "pair.pem", &both(&second, 2));
+        assert_ne!(
+            leaf(&resolver.current()),
+            before,
+            "one atomic rename renews certificate and key together"
+        );
+    }
+
+    #[test]
     fn a_host_that_starts_without_a_usable_certificate_does_not_start_serving() {
         let directory = tempfile::tempdir().unwrap();
         let absent = directory.path().join("absent.pem");
