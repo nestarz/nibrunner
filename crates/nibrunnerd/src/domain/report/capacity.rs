@@ -34,8 +34,12 @@ fn apps_that_fit(room: u64, each: u64) -> u32 {
         .map_or(0, |fit| u32::try_from(fit).unwrap_or(u32::MAX))
 }
 
-const HOLDS_NOTHING: [InstanceState; 3] =
-    [InstanceState::Idle, InstanceState::Stopped, InstanceState::Failed];
+const HOLDS_NOTHING: [InstanceState; 4] = [
+    InstanceState::Idle,
+    InstanceState::Stopped,
+    InstanceState::Failed,
+    InstanceState::Expired,
+];
 
 /// A record holds what it was given while there is a microVM behind it or one on its way. A
 /// boot in flight is pending with its attempt spent; a record pending with none spent is one

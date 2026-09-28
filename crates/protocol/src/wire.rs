@@ -332,6 +332,7 @@ validated_string!(
 );
 
 const MAX_REVISION_LENGTH: usize = 128;
+#[cfg(feature = "schema")]
 const REVISION_PATTERN: &str = r"^[\x21-\x7e]{1,128}$";
 
 fn is_revision(value: &str) -> bool {

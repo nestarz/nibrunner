@@ -57,6 +57,7 @@ pub struct HostState {
     refresh: Notify,
     report: Notify,
     transitions: Mutex<Transitions>,
+    pub(crate) persistence: tokio::sync::Mutex<()>,
 }
 
 impl HostState {
@@ -66,6 +67,7 @@ impl HostState {
             refresh: Notify::new(),
             report: Notify::new(),
             transitions: Mutex::new(BTreeMap::new()),
+            persistence: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -99,27 +101,57 @@ impl HostState {
         self.snapshot.read().await.records.get(app_id).cloned()
     }
 
+    pub(crate) async fn locked_snapshot(&self) -> tokio::sync::RwLockWriteGuard<'_, HostSnapshot> {
+        self.snapshot.write().await
+    }
+
     pub async fn modify<T>(&self, change: impl FnOnce(&mut HostSnapshot) -> T) -> T {
         change(&mut *self.snapshot.write().await)
     }
 
-    pub async fn put_record(&self, record: InstanceRecord) {
-        self.snapshot
-            .write()
-            .await
-            .records
-            .insert(record.app_id.clone(), record);
+    pub async fn put_record(&self, mut record: InstanceRecord) {
+        let mut snapshot = self.snapshot.write().await;
+        if let Some(previous) = snapshot.records.get(&record.app_id) {
+            if previous.deployment_id == record.deployment_id
+                && record.expiry.is_some()
+                && previous.expired_at_ms.is_some()
+            {
+                record.expired_at_ms = previous.expired_at_ms;
+                record.state = protocol::InstanceState::Expired;
+            }
+        }
+        snapshot.records.insert(record.app_id.clone(), record);
     }
 
     pub async fn update_record(&self, app_id: &AppId, change: impl FnOnce(&mut InstanceRecord)) {
         let mut snapshot = self.snapshot.write().await;
         if let Some(record) = snapshot.records.get_mut(app_id) {
+            let terminal = record.expired_at_ms;
+            let deployment = record.deployment_id.clone();
             change(record);
+            if terminal.is_some() && record.expiry.is_some() && record.deployment_id == deployment {
+                record.expired_at_ms = terminal;
+                record.state = protocol::InstanceState::Expired;
+            }
         }
     }
 
     pub async fn drop_record(&self, app_id: &AppId) {
         self.snapshot.write().await.records.remove(app_id);
+    }
+
+    /// Admit and count the request under the same lock that makes expiry terminal.
+    pub(crate) async fn admit<T>(&self, app_id: &AppId, now_ms: i64, open: impl FnOnce() -> T) -> Option<T> {
+        let mut snapshot = self.snapshot.write().await;
+        if snapshot
+            .records
+            .get(app_id)
+            .is_some_and(|r| r.expired_at_ms.is_some())
+        {
+            return None;
+        }
+        snapshot.last_active_at_ms.insert(app_id.clone(), now_ms);
+        Some(open())
     }
 
     pub async fn mark_active(&self, app_id: &AppId, now_ms: i64) {

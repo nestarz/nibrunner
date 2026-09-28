@@ -19,6 +19,7 @@ pub struct ObservedInstance {
     /// not one asleep, nor one that spent its budget: it is started the pass the refusal lifts,
     /// on request or not.
     pub refused: bool,
+    pub expired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +212,17 @@ fn plan_instance(
                 desired: wanted.clone(),
             };
         }
+        if current.expired {
+            return if wanted.expiry.is_some() {
+                InstancePlan::None {
+                    app_id: wanted.app_id.clone(),
+                }
+            } else {
+                InstancePlan::Replace {
+                    desired: wanted.clone(),
+                }
+            };
+        }
         // An idle on-request app has no live guest to recover: its device reading as gone is only
         // the outage, and it is left asleep to be woken (and re-attached) when it is next asked for.
         // One refused before it was ever brought up is not asleep: a request would only find it
@@ -394,11 +406,47 @@ fn plan_volumes(desired: &HostDesiredState, observed: &ObservedState) -> Vec<Vol
             }
         })
         .collect();
+    // A terminal retention decision authorizes deleting its unreferenced disk once the
+    // document drops both entries. Keep planning this even if an earlier delete reached disk
+    // but the daemon crashed before forgetting the record.
+    let mut expired_disks = BTreeSet::new();
+    for instance in &observed.instances {
+        let Some(id) = &instance.volume_id else {
+            continue;
+        };
+        if !instance.expired
+            || instance.running
+            || wanted_apps.contains(&instance.app_id)
+            || desired_ids.contains(id)
+            || kept_for.contains(id)
+            || desired.instances.iter().any(|i| i.volume_id == *id)
+            || observed
+                .instances
+                .iter()
+                .any(|i| i.app_id != instance.app_id && i.volume_id.as_ref() == Some(id))
+        {
+            continue;
+        }
+        expired_disks.insert(id.clone());
+        plans.push(VolumePlan::Teardown {
+            desired: DesiredVolume {
+                volume_id: id.clone(),
+                app_id: instance.app_id.clone(),
+                size_bytes: observed_by_id.get(id).map_or(0, |v| v.size_bytes),
+                desired_state: DesiredPresence::Absent,
+                initial_contents: None,
+            },
+        });
+    }
     plans.extend(
         observed
             .volumes
             .iter()
-            .filter(|current| current.attached && !desired_ids.contains(&current.volume_id))
+            .filter(|current| {
+                current.attached
+                    && !desired_ids.contains(&current.volume_id)
+                    && !expired_disks.contains(&current.volume_id)
+            })
             .filter(|current| !kept_for.contains(&current.volume_id))
             .map(|current| VolumePlan::Detach {
                 volume_id: current.volume_id.clone(),

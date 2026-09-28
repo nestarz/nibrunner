@@ -117,7 +117,18 @@ impl AppActivator {
         if !record.desired_running {
             return (app_is_down(), Answer::Down);
         }
-        self.state.mark_active(&app_id, crate::clock::now_ms()).await;
+        let Some(open) = self
+            .state
+            .admit(&app_id, crate::clock::now_ms(), || {
+                self.metrics.proxy.open(&app_id)
+            })
+            .await
+        else {
+            return (
+                say(StatusCode::GONE, "This revision has expired.\n"),
+                Answer::Down,
+            );
+        };
 
         let started = std::time::Instant::now();
         // An idle guest is asleep and has to be woken. Any other guest that reaches the activator
@@ -171,7 +182,7 @@ impl AppActivator {
             woken.guest_ipv4.as_str(),
             woken.http_port.get(),
             false,
-            self.metrics.proxy.open(&app_id),
+            open,
         )
         .await;
         self.metrics.sleep_wake.first_response(served.elapsed());

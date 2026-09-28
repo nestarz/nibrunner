@@ -13,6 +13,9 @@ use crate::json_store::write_text;
 
 pub const ACCESS_KEY_VARIABLE: &str = "AWS_ACCESS_KEY_ID";
 pub const SECRET_KEY_VARIABLE: &str = "AWS_SECRET_ACCESS_KEY";
+pub const ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT";
+pub const ALLOW_HTTP_VARIABLE: &str = "AWS_ALLOW_HTTP";
+pub const VIRTUAL_HOST_VARIABLE: &str = "AWS_VIRTUAL_HOSTED_STYLE_REQUEST";
 
 const SECRET_FILE_MODE: u32 = 0o600;
 
@@ -40,6 +43,18 @@ pub fn of(config: &HostConfig) -> Vec<Secret> {
         Secret {
             name: SECRET_KEY_VARIABLE,
             needed: remote,
+        },
+        Secret {
+            name: ENDPOINT_VARIABLE,
+            needed: false,
+        },
+        Secret {
+            name: ALLOW_HTTP_VARIABLE,
+            needed: false,
+        },
+        Secret {
+            name: VIRTUAL_HOST_VARIABLE,
+            needed: false,
         },
     ]
 }
@@ -116,11 +131,16 @@ fn render(config: &HostConfig) -> String {
          # so it is permanent for the life of the bucket. volumes.backend = \"zerofs\" needs it.\n\
          {}\n\
          # A store_url or storage_url that is s3:// needs these.\n\
+         {}{}{}\n\
+         # Optional S3 endpoint and addressing policy. HTTP defaults to false.\n\
          {}{}{}",
         line(PASSWORD_VARIABLE),
         line(REGION_VARIABLE),
         line(ACCESS_KEY_VARIABLE),
         line(SECRET_KEY_VARIABLE),
+        line(ENDPOINT_VARIABLE),
+        line(ALLOW_HTTP_VARIABLE),
+        line(VIRTUAL_HOST_VARIABLE),
     )
 }
 
@@ -218,7 +238,15 @@ mod tests {
             names(&secrets, true),
             [REGION_VARIABLE, ACCESS_KEY_VARIABLE, SECRET_KEY_VARIABLE]
         );
-        assert_eq!(names(&secrets, false), [PASSWORD_VARIABLE]);
+        assert_eq!(
+            names(&secrets, false),
+            [
+                PASSWORD_VARIABLE,
+                ENDPOINT_VARIABLE,
+                ALLOW_HTTP_VARIABLE,
+                VIRTUAL_HOST_VARIABLE
+            ]
+        );
         let written = render(&config);
         assert!(written.contains("\nAWS_ACCESS_KEY_ID=\n"), "{written}");
         assert!(written.contains("\n# ZEROFS_ENCRYPTION_PASSWORD=\n"), "{written}");

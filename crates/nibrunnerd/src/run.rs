@@ -190,7 +190,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     let host = Arc::new(Host {
         guest_memory_mib: guest_memory_mib(read_host_memory_mib(), volumes.reserved_cache().memory_mib()),
         guest_image_version,
-        state,
+        state: state.clone(),
         allocator: allocator.clone(),
         repositories,
         exports,
@@ -204,7 +204,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         artifacts,
         payloads,
         firewall: Arc::new(HostFirewall::new(commands)),
-        router: Router::with_policy(metrics.clone(), runtime_policy.clone(), Some(access)),
+        router: Router::with_state(metrics.clone(), runtime_policy.clone(), Some(access), state),
         runtime_policy,
         tls,
         metrics,

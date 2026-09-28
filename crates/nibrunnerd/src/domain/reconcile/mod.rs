@@ -1,4 +1,5 @@
 pub mod checkpoints;
+pub(crate) mod expiry;
 pub mod exports;
 pub mod idle;
 pub mod ingress;
@@ -40,6 +41,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                     volume_id: record.map(|record| record.volume_id.clone()),
                     deployment_id: record.map(|record| record.deployment_id.clone()),
                     present: status.loaded || record.is_some(),
+                    expired: record.is_some_and(|record| record.expired_at_ms.is_some()),
                     running: status.active,
                     exited: !status.active
                         && status.started_this_boot
@@ -63,8 +65,10 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
 
 async fn sync_desired(host: &Host, desired: &HostDesiredState) {
     for wanted in &desired.instances {
+        let _transition = host.state.transition(&wanted.app_id).await;
         host.state
             .update_record(&wanted.app_id, |record| {
+                record.apply_expiry(wanted.expiry, &wanted.deployment_id, crate::clock::now_ms());
                 record.hostnames = wanted.hostnames.clone();
                 record.health_check = wanted.config.health_check.clone();
                 record.resources = wanted.config.resources;
@@ -84,12 +88,14 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
                 instances::stop_instance(host, app_id, reason.as_str()).await;
             }
             InstancePlan::Replace { desired } => {
+                let _transition = host.state.transition(&desired.app_id).await;
                 instances::stop_instance(host, &desired.app_id, InstanceStopReason::Superseded.as_str())
                     .await;
                 let _ = host.vms.discard(&desired.app_id).await;
                 host.state.drop_record(&desired.app_id).await;
             }
             InstancePlan::Recover { desired } => {
+                let _transition = host.state.transition(&desired.app_id).await;
                 // Same clean teardown as a replacement — stop, discard, forget the record — so the
                 // start below is a fresh boot that re-attaches the volume, rather than a wake onto
                 // the snapshot whose disk is already dead. The slot (and its device) is kept.
@@ -103,8 +109,23 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             // wrote. The discard detaches the log receiver, so nothing is still writing to the
             // files taken below.
             InstancePlan::Forget { app_id } => {
+                let _transition = host.state.transition(app_id).await;
                 let _ = host.vms.discard(app_id).await;
-                host.state.drop_record(app_id).await;
+                let deleting_expired_disk = plan.volumes.iter().any(|v| {
+                    matches!(v,
+                    VolumePlan::Teardown { desired } if desired.app_id == *app_id)
+                });
+                if deleting_expired_disk
+                    && host
+                        .state
+                        .record(app_id)
+                        .await
+                        .is_some_and(|r| r.expired_at_ms.is_some())
+                {
+                    host.state.update_record(app_id, |r| r.hostnames.clear()).await;
+                } else {
+                    host.state.drop_record(app_id).await;
+                }
                 host.logs.discard(app_id);
                 host.router.discard_access(app_id);
             }
@@ -160,6 +181,7 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
     let mut records = host.state.records().await;
     let (mut waiting, mut waiting_mib) = (0, 0u64);
     for desired in starts {
+        let _transition = host.state.transition(&desired.app_id).await;
         let wanted = &desired.config.resources;
         if let Some(shortfall_mib) =
             memory_shortfall_for(host.guest_memory_mib, &records, &desired.app_id, wanted)

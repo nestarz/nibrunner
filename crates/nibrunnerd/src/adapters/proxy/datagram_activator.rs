@@ -134,7 +134,13 @@ impl DatagramActivator {
         if !record.on_request || !record.desired_running {
             return Err(RawOutcome::Down);
         }
-        self.state.mark_active(app_id, crate::clock::now_ms()).await;
+        let Some(_open) = self
+            .state
+            .admit(app_id, crate::clock::now_ms(), || self.metrics.proxy.open(app_id))
+            .await
+        else {
+            return Err(RawOutcome::Down);
+        };
 
         let started = std::time::Instant::now();
         if let Err(refusal) = self.waker.wake(app_id).await {
@@ -195,6 +201,15 @@ async fn receive(
 
     loop {
         let Ok((length, client)) = inbound.recv_from(&mut buffer).await else {
+            continue;
+        };
+        let Some(_open) = activator
+            .state
+            .admit(&app_id, crate::clock::now_ms(), || {
+                activator.metrics.proxy.open(&app_id)
+            })
+            .await
+        else {
             continue;
         };
         let datagram = &buffer[..length];

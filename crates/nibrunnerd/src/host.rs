@@ -90,7 +90,8 @@ impl Host {
         }
     }
 
-    async fn write_down(&self) -> Result<(), crate::domain::store::StoreError> {
+    pub(crate) async fn write_down(&self) -> Result<(), crate::domain::store::StoreError> {
+        let _writing = self.state.persistence.lock().await;
         let snapshot = self.state.snapshot().await;
         let records: Vec<_> = snapshot.records.values().cloned().collect();
         let (assignments, cursor) = {
@@ -112,7 +113,14 @@ impl Host {
     }
 
     pub async fn load(&self) {
-        let records = self.repositories.instances.all().await.unwrap_or_default();
+        let mut records = self.repositories.instances.all().await.unwrap_or_default();
+        // A request admitted just before a crash may not have reached the activity repository.
+        // Give non-terminal policies a full observed window; durable expiry itself never revives.
+        for record in &mut records {
+            if record.expiry.is_some() && record.expired_at_ms.is_none() {
+                record.expiry_since_ms = Some(crate::clock::now_ms());
+            }
+        }
         let last_active = self.repositories.activity.all().await.unwrap_or_default();
         let meters = self.repositories.meters.all().await.unwrap_or_default();
         let deleted = self.repositories.deleted_volumes.all().await.unwrap_or_default();

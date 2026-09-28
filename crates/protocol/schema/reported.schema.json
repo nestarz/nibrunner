@@ -213,6 +213,7 @@
         "stopping",
         "stopped",
         "idle",
+        "expired",
         "failed"
       ]
     },
@@ -348,6 +349,17 @@
         },
         "deploymentId": {
           "$ref": "#/$defs/DeploymentId"
+        },
+        "expiredAt": {
+          "description": "The durable terminal-expiry decision; absent until this deployment expires.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "guestIpv4": {
           "anyOf": [

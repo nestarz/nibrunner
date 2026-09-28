@@ -59,10 +59,13 @@ pub fn zerofs_config(settings: &ZerofsSettings, config_file: &Path, environment_
          url = \"{}\"\n\
          encryption_password = \"${{{PASSWORD_VARIABLE}}}\"\n\
          \n\
-         # Region only. Credentials resolve through the default chain, which on a machine with no\n\
+         # Credentials and endpoint resolve through the environment. HTTP is explicit because\n\
+         # ZeroFS resets environment-derived client options before applying this table.\n\
+         # Credentials resolve through the default chain, which on a machine with no\n\
          # instance role is the same environment file this unit already loads.\n\
          [aws]\n\
          region = \"${{{REGION_VARIABLE}}}\"\n\
+         allow_http = \"${{AWS_ALLOW_HTTP:-false}}\"\n\
          \n\
          [filesystem]\n\
          # Honouring fsync costs ~244 ms a call, which is unusable. With this it is ~1.24 ms, and\n\
@@ -127,6 +130,7 @@ pub fn checkpoint_config(settings: &ZerofsSettings, config_file: &Path) -> Strin
          \n\
          [aws]\n\
          region = \"${{{REGION_VARIABLE}}}\"\n\
+         allow_http = \"${{AWS_ALLOW_HTTP:-false}}\"\n\
          \n\
          # No [filesystem], [lsm] or [gc]: every setting in them is about writing, and a checkpoint\n\
          # server never writes. No [servers.rpc] either — checkpoints are created, listed and\n\
@@ -334,6 +338,21 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&rendered).expect("a config zerofs could parse");
         assert!(parsed.get("cache").is_some());
         assert!(parsed.get("storage").is_some());
+    }
+
+    #[test]
+    fn zerofs_http_policy_survives_client_option_defaults_in_both_configs() {
+        for rendered in [
+            zerofs_config(&settings(), config_file(), environment_file()),
+            checkpoint_config(&settings(), config_file()),
+        ] {
+            let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
+            assert_eq!(
+                parsed["aws"]["allow_http"].as_str(),
+                Some("${AWS_ALLOW_HTTP:-false}")
+            );
+            assert_eq!(parsed["aws"]["region"].as_str(), Some("${AWS_REGION}"));
+        }
     }
 
     #[test]

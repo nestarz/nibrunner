@@ -179,7 +179,11 @@ pub async fn record_activity(host: &Host) {
             snapshot.meters = metered;
             snapshot.metered_at_ms = Some(now);
             snapshot.app_traffic = traffic;
-            snapshot.last_active_at_ms = last_active_at_ms;
+            for (id, at) in last_active_at_ms {
+                let latest = snapshot.last_active_at_ms.entry(id).or_insert(at);
+                *latest = (*latest).max(at);
+            }
+            snapshot.last_active_at_ms.retain(|id, _| held.contains(id));
             snapshot.last_measured_at_ms = last_measured_at_ms;
         })
         .await;
@@ -303,6 +307,7 @@ async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bo
 /// that put nothing to sleep returns none whatever was due, since run again at once it would try
 /// the same apps against the same full disk.
 pub async fn apply_sleep(host: &std::sync::Arc<Host>) -> usize {
+    super::expiry::apply(host, crate::clock::now_ms()).await;
     let policies: BTreeMap<AppId, ActivationPolicy> = {
         let cache = host.cache.lock().await;
         cache

@@ -65,6 +65,7 @@ fn record_fields(desired: &DesiredInstance, slot: &nft_render::AppSlot) -> Recor
         restart_policy: desired.config.restart_policy.clone(),
         desired_running: desired.desired_state != DesiredInstanceState::Stopped,
         on_request: desired.desired_state == DesiredInstanceState::OnRequest,
+        expiry: desired.expiry,
     }
 }
 
@@ -99,6 +100,9 @@ pub async fn stop_instance(host: &Host, app_id: &AppId, reason: &str) {
 pub async fn suspend_instance(host: &Host, app_id: &AppId, why: SleepReason) -> Option<SleepOutcome> {
     let reason = why.as_str();
     let record = host.state.record(app_id).await?;
+    if record.expired_at_ms.is_some() {
+        return None;
+    }
     let Some(slot) = host.slot_of(app_id).await else {
         stop_instance(host, app_id, reason).await;
         return None;
@@ -315,6 +319,11 @@ pub async fn wait_for_room(host: &Host, desired: &DesiredInstance, shortfall_mib
 pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     let now = now_ms();
     let existing = host.state.record(&desired.app_id).await;
+    if existing.as_ref().is_some_and(|r| {
+        r.expired_at_ms.is_some() && r.deployment_id == desired.deployment_id && desired.expiry.is_some()
+    }) {
+        return;
+    }
     if let Some(refusal) = start_refused(existing.as_ref(), now, desired) {
         if let StartRefused::OutOfRestarts { attempted, allowed } = refusal {
             say_it_is_out_of_restarts(host, &desired.app_id, attempted, allowed).await;
@@ -488,6 +497,14 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         kind: WakeFailure::WouldNotStart,
         reason,
     };
+    if host
+        .state
+        .record(&desired.app_id)
+        .await
+        .is_some_and(|r| r.expired_at_ms.is_some())
+    {
+        return Err(would_not_start("This revision has expired.".into()));
+    }
     let Ok(slot) = host.slot_for(&desired.app_id).await else {
         return Err(would_not_start("this host has no slot left".to_string()));
     };
@@ -621,6 +638,9 @@ async fn settle(
     snapshotting: bool,
     now_ms: i64,
 ) {
+    if record.expired_at_ms.is_some() {
+        return;
+    }
     let health = if status.active && due {
         let probed = std::time::Instant::now();
         let outcome = if asks_the_port(&record.health, &record.health_check) {
@@ -704,6 +724,9 @@ async fn settle(
             .is_some_and(|at| now_ms - at.epoch_ms() >= record.restart_policy.reset_after_ms as i64);
     host.state
         .update_record(&record.app_id, |latest| {
+            if latest.expired_at_ms.is_some() {
+                return;
+            }
             latest.health = health;
             latest.state = state;
             if let Some(exit) = status.exit.filter(|_| !status.active) {

@@ -17,6 +17,7 @@ pub fn to_reported_instance(record: &InstanceRecord) -> ReportedInstance {
         last_restart: record.last_restart.clone(),
         started_at: record.started_at.clone(),
         converged_at: record.converged_at.clone(),
+        expired_at: record.expired_at_ms.map(Timestamp::from_epoch_ms),
         last_exit_code: record.last_exit_code,
         message: record.message.clone(),
     }

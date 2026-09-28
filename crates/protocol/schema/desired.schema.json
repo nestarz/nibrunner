@@ -236,6 +236,17 @@
         "desiredState": {
           "$ref": "#/$defs/DesiredInstanceState"
         },
+        "expiry": {
+          "description": "Optional terminal retention for on-request instances: expired hostnames answer HTTP 410.\nRemoving the policy or changing deploymentId revives the instance.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpiryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "hostnames": {
           "description": "What the HTTP proxy routes to this app's `httpPort`. Empty for an app nothing outside needs\nto reach by name.",
           "type": "array",
@@ -268,6 +279,27 @@
           "$ref": "#/$defs/VolumeId"
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "expiry": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "expiry"
+            ]
+          },
+          "then": {
+            "properties": {
+              "desiredState": {
+                "const": "on-request"
+              }
+            }
+          }
+        }
+      ],
       "if": {
         "properties": {
           "desiredState": {
@@ -438,6 +470,23 @@
         ]
       },
       "pattern": "^/$|^(/(?!\\.\\.?(/|$))[^/\\\\\"'\\x00-\\x1f]+)+$"
+    },
+    "ExpiryIdleMs": {
+      "type": "integer",
+      "maximum": 3153600000000,
+      "minimum": 3600000
+    },
+    "ExpiryPolicy": {
+      "type": "object",
+      "properties": {
+        "idleMs": {
+          "$ref": "#/$defs/ExpiryIdleMs"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "idleMs"
+      ]
     },
     "ExportId": {
       "description": "an identifier",

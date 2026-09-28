@@ -108,6 +108,7 @@ pub struct Router {
     metrics: Arc<HostMetrics>,
     access: Option<Arc<AccessLog>>,
     admission: super::admission::Admission,
+    state: crate::state::SharedState,
 }
 
 impl Router {
@@ -132,7 +133,17 @@ impl Router {
         policy: Arc<crate::runtime_policy::RuntimePolicy>,
         access: Option<Arc<AccessLog>>,
     ) -> Arc<Self> {
+        Self::with_state(metrics, policy, access, crate::state::HostState::shared())
+    }
+
+    pub(crate) fn with_state(
+        metrics: Arc<HostMetrics>,
+        policy: Arc<crate::runtime_policy::RuntimePolicy>,
+        access: Option<Arc<AccessLog>>,
+        state: crate::state::SharedState,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            state,
             admission: super::admission::Admission::new(policy),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
@@ -239,6 +250,18 @@ impl Router {
                 None,
             );
         };
+        if self
+            .state
+            .record(&route.app_id)
+            .await
+            .is_some_and(|r| r.expired_at_ms.is_some())
+        {
+            return (
+                say(StatusCode::GONE, "This revision has expired.\n"),
+                Outcome::Refused,
+                Some(route),
+            );
+        }
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
         let permit = match self.admission.acquire(&route.app_id) {
             Ok(permit) => Some(permit),
@@ -253,7 +276,19 @@ impl Router {
                 return (response, Outcome::Refused, Some(route));
             }
         };
-        let open = super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit);
+        let Some(open) = self
+            .state
+            .admit(&route.app_id, crate::clock::now_ms(), || {
+                super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit)
+            })
+            .await
+        else {
+            return (
+                say(StatusCode::GONE, "This revision has expired.\n"),
+                Outcome::Refused,
+                Some(route),
+            );
+        };
         let upstream = self.upstreams.to(&route.app_id).await;
         let response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
         let reached = response.extensions().get::<Unreachable>().is_none();
@@ -415,6 +450,35 @@ pub fn tls_acceptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_expired_revision_answers_gone_without_activity_or_upstream_traffic() {
+        let state = crate::state::HostState::shared();
+        let record = instance_record(|r| {
+            r.expired_at_ms = Some(42);
+            r.state = protocol::InstanceState::Expired;
+        });
+        let router = Router::with_state(
+            Arc::new(HostMetrics::new()),
+            Arc::new(crate::runtime_policy::RuntimePolicy::new(None, None)),
+            None,
+            state.clone(),
+        );
+        router
+            .apply(RouteTable::from_targets(&renderable_routes(
+                std::slice::from_ref(&record),
+            )))
+            .await;
+        state.put_record(record).await;
+        let answer = asked(
+            serving(router).await,
+            "GET / HTTP/1.1\r\nHost: app-1.apps.example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 410"));
+        assert!(answer.ends_with("This revision has expired.\n"));
+        assert!(state.snapshot().await.last_active_at_ms.is_empty());
+    }
 
     #[tokio::test]
     async fn a_visitor_never_waits_on_an_ack_the_other_end_is_delaying() {
