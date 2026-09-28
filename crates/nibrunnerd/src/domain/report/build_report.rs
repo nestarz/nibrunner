@@ -1,11 +1,12 @@
 use protocol::{
-    HostCapacity, HostId, HostReportedState, HostState, HostVersions, ReportedCheckpoint, ReportedExport,
-    ReportedInstance, ReportedVolume, Revision, Sha256Digest, StateMessage, Timestamp,
+    AppId, HostCapacity, HostId, HostReportedState, HostState, HostVersions, ReportedCheckpoint,
+    ReportedExport, ReportedInstance, ReportedVolume, Revision, Sha256Digest, StateMessage, Timestamp,
 };
+use std::collections::BTreeMap;
 
 use crate::domain::report::InstanceRecord;
 
-pub fn to_reported_instance(record: &InstanceRecord) -> ReportedInstance {
+pub fn to_reported_instance(record: &InstanceRecord, last_active_at_ms: Option<i64>) -> ReportedInstance {
     ReportedInstance {
         app_id: record.app_id.clone(),
         deployment_id: record.deployment_id.clone(),
@@ -17,6 +18,7 @@ pub fn to_reported_instance(record: &InstanceRecord) -> ReportedInstance {
         last_restart: record.last_restart.clone(),
         started_at: record.started_at.clone(),
         converged_at: record.converged_at.clone(),
+        last_active_at: last_active_at_ms.map(Timestamp::from_epoch_ms),
         expired_at: record.expired_at_ms.map(Timestamp::from_epoch_ms),
         last_exit_code: record.last_exit_code,
         message: record.message.clone(),
@@ -31,6 +33,7 @@ pub struct ReportInputs<'a> {
     pub allocatable: HostCapacity,
     pub versions: HostVersions,
     pub records: &'a [InstanceRecord],
+    pub last_active_at_ms: &'a BTreeMap<AppId, i64>,
     pub volumes: Vec<ReportedVolume>,
     pub checkpoints: Vec<ReportedCheckpoint>,
     pub exports: Vec<ReportedExport>,
@@ -48,7 +51,11 @@ pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
         allocatable: inputs.allocatable,
         versions: inputs.versions,
         volumes: inputs.volumes,
-        instances: inputs.records.iter().map(to_reported_instance).collect(),
+        instances: inputs
+            .records
+            .iter()
+            .map(|record| to_reported_instance(record, inputs.last_active_at_ms.get(&record.app_id).copied()))
+            .collect(),
         checkpoints: inputs.checkpoints,
         exports: inputs.exports,
         accepted_digest: inputs.accepted_digest,
@@ -86,6 +93,7 @@ mod tests {
                 firecracker: "v1.16.1".into(),
             },
             records,
+            last_active_at_ms: &BTreeMap::new(),
             volumes: vec![],
             checkpoints,
             exports,
@@ -97,13 +105,13 @@ mod tests {
 
     #[test]
     fn the_report_always_names_the_host_side_port_and_omits_what_it_does_not_know() {
-        let instance = to_reported_instance(&instance_record(|_| {}));
+        let instance = to_reported_instance(&instance_record(|_| {}), None);
         let written = serde_json::to_value(&instance).unwrap();
         assert_eq!(written["hostPort"], u32::from(instance.host_port.unwrap()));
         for absent in ["startedAt", "lastExitCode", "message"] {
             assert!(written.get(absent).is_none(), "{absent} should be absent");
         }
-        let exited = to_reported_instance(&instance_record(|record| record.last_exit_code = Some(0)));
+        let exited = to_reported_instance(&instance_record(|record| record.last_exit_code = Some(0)), None);
         assert_eq!(serde_json::to_value(&exited).unwrap()["lastExitCode"], 0);
     }
 

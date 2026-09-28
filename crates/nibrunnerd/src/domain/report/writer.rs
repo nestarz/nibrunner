@@ -38,6 +38,7 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
         allocatable,
         versions,
         records: &records,
+        last_active_at_ms: &snapshot.last_active_at_ms,
         volumes: snapshot.volume_reports.clone(),
         checkpoints: snapshot.checkpoint_reports.clone(),
         exports: snapshot.export_reports.clone(),

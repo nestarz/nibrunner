@@ -100,6 +100,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_activity_reaches_the_report_without_a_separate_activity_file() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let reporter = reporter(&host);
+        assert!(reporter.build().await.instances[0].last_active_at.is_none());
+        for at_ms in [1_000, 2_000] {
+            assert_eq!(host.state.admit(&app_id(), at_ms, || ()).await, Some(()));
+            reporter.publish().await;
+            let report: HostReportedState = crate::json_store::read_json(&writer::reported_state_file(&host))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                report.instances[0]
+                    .last_active_at
+                    .as_ref()
+                    .map(protocol::Timestamp::epoch_ms),
+                Some(at_ms)
+            );
+            let json = serde_json::to_value(&report.instances[0]).unwrap();
+            assert_eq!(
+                json["lastActiveAt"],
+                protocol::Timestamp::from_epoch_ms(at_ms).as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_host_that_has_not_converged_yet_reports_itself_as_registering() {
         let host = test_host().await;
         assert_eq!(reporter(&host).build().await.state, HostState::Registering);

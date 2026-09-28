@@ -365,6 +365,9 @@ pub struct ReportedInstance {
     /// deployment this host was not there to see arrive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub converged_at: Option<Timestamp>,
+    /// The latest host activity, including request admission and activation; absent before activity is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<Timestamp>,
     /// The durable terminal-expiry decision; absent until this deployment expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expired_at: Option<Timestamp>,

@@ -7,4 +7,7 @@ The file the host writes to `reported.json` in `paths.state_dir` after every rec
 metrics page is built from the same data. A control plane that reads only this file learns the
 result of its last write to `desired.json`, and the reason for any failure.
 
+An instance's optional `lastActiveAt` comes from the host's activity state, including request
+admission. An absent value means the host has no activity timestamp; it is not the report time.
+
 <SchemaReference file="crates/protocol/schema/reported.schema.json" />

@@ -381,6 +381,17 @@
             }
           ]
         },
+        "lastActiveAt": {
+          "description": "The latest host activity, including request admission and activation; absent before activity is known.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "lastExitCode": {
           "type": [
             "integer",

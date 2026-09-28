@@ -189,6 +189,7 @@ fn a_report_omits_what_it_does_not_know() {
         last_restart: None,
         started_at: None,
         converged_at: None,
+        last_active_at: None,
         expired_at: None,
         last_exit_code: Some(0),
         message: None,
@@ -197,6 +198,7 @@ fn a_report_omits_what_it_does_not_know() {
     assert_eq!(written["lastExitCode"], 0);
     assert!(written.get("startedAt").is_none());
     assert!(written.get("convergedAt").is_none());
+    assert!(written.get("lastActiveAt").is_none());
     assert!(written.get("message").is_none());
     assert!(written.get("lastRestart").is_none());
     assert_eq!(written["hostPort"], 21000);
@@ -579,6 +581,7 @@ mod schema {
                 }),
                 started_at: Some(now.clone()),
                 converged_at: Some(now.clone()),
+        last_active_at: None,
         expired_at: None,
                 last_exit_code: Some(0),
                 message: Some(StateMessage::new("healthy")),

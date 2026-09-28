@@ -215,6 +215,7 @@ pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedIn
         last_restart: None,
         started_at: None,
         converged_at: None,
+        last_active_at: None,
         expired_at: None,
         last_exit_code: None,
         message: None,
