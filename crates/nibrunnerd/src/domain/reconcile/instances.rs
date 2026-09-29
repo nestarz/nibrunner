@@ -58,7 +58,7 @@ fn record_fields(desired: &DesiredInstance, slot: &nft_render::AppSlot) -> Recor
         layer_digests: desired
             .layers
             .iter()
-            .map(|layer| layer.object().digest.clone())
+            .map(|layer| layer.digest().clone())
             .collect(),
         health_check: desired.config.health_check.clone(),
         resources: desired.config.resources,
@@ -766,7 +766,7 @@ pub async fn prefetch_layers(host: &Host, plan: &ReconcilePlan) {
                 host.metrics
                     .resources
                     .done(Operation::LayerFetch, false, fetching.elapsed());
-                tracing::warn!(digest = %layer.object().digest, error = %error.message(), "layer prefetch failed");
+                tracing::warn!(digest = %layer.digest(), error = %error.message(), "layer prefetch failed");
             }
         }
         let ready_at = now_ms();
@@ -815,7 +815,7 @@ mod tests {
         let wanted = layers_to_start(&plan);
         assert_eq!(wanted, vec![base_layer(), same.clone()]);
         let whole = protocol::DesiredLayer::Filesystem {
-            object: same.object().clone(),
+            object: same.stored_object().unwrap().clone(),
         };
         let same_bytes_twice = layers_to_start(&ReconcilePlan {
             instances: vec![InstancePlan::Start {

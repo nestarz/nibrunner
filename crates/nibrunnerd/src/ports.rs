@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use guest_contract::filesystem::{MeasuredBytes, MeasuredCompute};
-use protocol::{AppId, DeploymentId, DesiredInstance, DesiredLayer, ObjectKey, Sha256Digest, StoredObject};
+use protocol::{
+    AppId, DeploymentId, DesiredInstance, DesiredLayer, DownloadUrl, ObjectKey, Sha256Digest, StoredObject,
+};
 
 use crate::adapters::vm::VmStatus;
 
@@ -200,6 +202,8 @@ pub enum ArtifactError {
     DigestMismatch { expected: Sha256Digest, actual: String },
     #[error("the layer {digest} is neither a squashfs nor an ext4 image")]
     NotAnImage { digest: Sha256Digest },
+    #[error("{entry} is not in the archive {url} serves")]
+    NotInArchive { url: DownloadUrl, entry: String },
     #[error("the layer image could not be built: {0}")]
     Unpackable(String),
 }
@@ -226,6 +230,8 @@ pub trait GuestMeasurements: Send + Sync {
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
     async fn read(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ArtifactError>;
+    /// The body a URL answers with, for a layer the document says to fetch rather than to find here.
+    async fn download(&self, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError>;
 }
 
 #[async_trait]

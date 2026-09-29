@@ -107,7 +107,7 @@ fn a_layer_that_still_declares_its_size_is_read_as_one_that_does_not() {
     let mut document = instance_json();
     document["layers"][1]["sizeBytes"] = serde_json::json!(27);
     let parsed: DesiredInstance = serde_json::from_value(document).expect("parses");
-    assert_eq!(parsed.layers[1].object().digest.as_str(), "a".repeat(64));
+    assert_eq!(parsed.layers[1].digest().as_str(), "a".repeat(64));
     let written = serde_json::to_value(&parsed).expect("serialises");
     assert!(written["layers"][1].get("sizeBytes").is_none());
 }

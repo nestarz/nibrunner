@@ -1,11 +1,11 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use backhand::compression::{CompressionOptions, Compressor, Zstd};
 use backhand::{FilesystemCompressor, FilesystemWriter, NodeHeader};
-use protocol::DesiredLayer;
+use protocol::{DesiredLayer, DownloadUrl, Sha256Digest, ZipEntry};
 
 use crate::json_store::make_directory;
 use crate::ports::{ArtifactError, ArtifactStore, ArtifactStoreExt, PayloadBuilder, PreparedPayload};
@@ -17,6 +17,9 @@ const CONFIG_MODE: u16 = 0o600;
 const DIRECTORY_MODE: u16 = 0o755;
 const CACHE_DIR_MODE: u32 = 0o755;
 const VM_DIR_MODE: u32 = 0o700;
+
+/// What one program may inflate to, so that a small zip cannot fill the host's memory.
+const MAX_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 
 const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
 const EXT4_MAGIC_OFFSET: usize = 0x438;
@@ -89,10 +92,11 @@ fn short_hash(text: &str) -> String {
 /// Where a layer's image lives in the cache. The object is the same bytes whether it is attached
 /// whole or packed as a program at some path, so the kind and the path are part of the name.
 pub fn layer_image_path(cache_dir: &Path, layer: &DesiredLayer) -> PathBuf {
-    let directory = cache_dir.join(layer.object().digest.as_str());
+    let directory = cache_dir.join(layer.digest().as_str());
     match layer {
         DesiredLayer::Filesystem { .. } => directory.join(VERBATIM_IMAGE_FILENAME),
-        DesiredLayer::Executable { destination_path, .. } => directory.join(format!(
+        DesiredLayer::Executable { destination_path, .. }
+        | DesiredLayer::DownloadedExecutable { destination_path, .. } => directory.join(format!(
             "executable-{}.squashfs",
             short_hash(destination_path.as_str())
         )),
@@ -127,6 +131,42 @@ impl PayloadBuilder for LayerImages {
     }
 }
 
+async fn downloaded_program(
+    store: &Arc<dyn ArtifactStore>,
+    url: &DownloadUrl,
+    digest: &Sha256Digest,
+    zip_entry: Option<&ZipEntry>,
+) -> Result<Vec<u8>, ArtifactError> {
+    use sha2::Digest;
+
+    let body = store.download(url).await?;
+    let program = match zip_entry {
+        None => body,
+        Some(entry) => {
+            let not_in_archive = || ArtifactError::NotInArchive {
+                url: url.clone(),
+                entry: entry.as_str().to_owned(),
+            };
+            let mut archive = zip::ZipArchive::new(Cursor::new(body))
+                .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
+            let file = archive.by_name(entry.as_str()).map_err(|_| not_in_archive())?;
+            let mut program = Vec::new();
+            std::io::Read::take(file, MAX_PROGRAM_BYTES)
+                .read_to_end(&mut program)
+                .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
+            program
+        }
+    };
+    let actual = hex::encode(sha2::Sha256::digest(&program));
+    if actual != digest.as_str() {
+        return Err(ArtifactError::DigestMismatch {
+            expected: digest.clone(),
+            actual,
+        });
+    }
+    Ok(program)
+}
+
 /// A layer's image in the cache, and what putting it there cost: nothing for one already held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerImage {
@@ -154,7 +194,17 @@ pub async fn ensure_layer_image(
         });
     }
 
-    let bytes = store.read_verified(layer.object()).await?;
+    let bytes = match layer {
+        DesiredLayer::Filesystem { object } | DesiredLayer::Executable { object, .. } => {
+            store.read_verified(object).await?
+        }
+        DesiredLayer::DownloadedExecutable {
+            url,
+            digest,
+            zip_entry,
+            ..
+        } => downloaded_program(store, url, digest, zip_entry.as_ref()).await?,
+    };
     let fetched_bytes = bytes.len() as u64;
     let image = match layer {
         DesiredLayer::Filesystem { .. } if is_filesystem_image(&bytes) => bytes,
@@ -163,7 +213,8 @@ pub async fn ensure_layer_image(
                 digest: object.digest.clone(),
             })
         }
-        DesiredLayer::Executable { destination_path, .. } => {
+        DesiredLayer::Executable { destination_path, .. }
+        | DesiredLayer::DownloadedExecutable { destination_path, .. } => {
             pack(&[(destination_path.as_str(), &bytes, BINARY_MODE)])?
         }
     };
@@ -181,7 +232,7 @@ pub async fn ensure_layer_image(
     std::fs::write(&staged, &image).map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
     std::fs::rename(&staged, &image_path).map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
     tracing::info!(
-        digest = %layer.object().digest,
+        digest = %layer.digest(),
         size_bytes = fetched_bytes,
         image_bytes = image.len(),
         packed = matches!(layer, DesiredLayer::Executable { .. }),
@@ -217,7 +268,8 @@ mod tests {
     use super::*;
     use crate::test_support::mocks;
     use crate::test_support::{base_layer, layer, ARTIFACT_BYTES, ARTIFACT_DIGEST, BASE_LAYER_BYTES};
-    use protocol::{ExecutablePath, Sha256Digest};
+    use protocol::ExecutablePath;
+    use sha2::Digest;
 
     fn artifact_bytes() -> Vec<u8> {
         ARTIFACT_BYTES.to_vec()
@@ -225,13 +277,13 @@ mod tests {
 
     fn as_filesystem(layer: DesiredLayer) -> DesiredLayer {
         DesiredLayer::Filesystem {
-            object: layer.object().clone(),
+            object: layer.stored_object().unwrap().clone(),
         }
     }
 
     fn placed_at(layer: DesiredLayer, path: &str) -> DesiredLayer {
         DesiredLayer::Executable {
-            object: layer.object().clone(),
+            object: layer.stored_object().unwrap().clone(),
             destination_path: ExecutablePath::parse(path).unwrap(),
         }
     }
@@ -394,7 +446,10 @@ mod tests {
     async fn bytes_that_match_are_handed_back_whole_before_anything_is_built_from_them() {
         let store = store(artifact_bytes());
         assert_eq!(
-            store.read_verified(layer(|_| {}).object()).await.unwrap(),
+            store
+                .read_verified(layer(|_| {}).stored_object().unwrap())
+                .await
+                .unwrap(),
             artifact_bytes()
         );
     }
@@ -404,7 +459,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut store = crate::ports::MockArtifactStore::new();
         store.expect_read().returning(|key| {
-            Ok(if key == &base_layer().object().object_key {
+            Ok(if key == &base_layer().stored_object().unwrap().object_key {
                 BASE_LAYER_BYTES.to_vec()
             } else {
                 ARTIFACT_BYTES.to_vec()
@@ -511,5 +566,91 @@ mod tests {
             .unwrap();
         let touched = std::fs::metadata(&image_path).unwrap().modified().unwrap();
         assert!(touched > backdated, "the image was not touched on a cache hit");
+    }
+
+    fn downloaded(body: &[u8], zip_entry: Option<&str>) -> (DesiredLayer, Arc<dyn ArtifactStore>) {
+        let served = body.to_vec();
+        let mut artifacts = crate::ports::MockArtifactStore::new();
+        artifacts.expect_download().returning(move |_| Ok(served.clone()));
+        let layer = DesiredLayer::DownloadedExecutable {
+            url: DownloadUrl::parse("https://example.test/program").unwrap(),
+            digest: Sha256Digest::parse(hex::encode(sha2::Sha256::digest(artifact_bytes()))).unwrap(),
+            zip_entry: zip_entry.map(|entry| ZipEntry::parse(entry).unwrap()),
+            destination_path: ExecutablePath::parse("/opt/tool/tool").unwrap(),
+        };
+        (layer, Arc::new(artifacts))
+    }
+
+    fn zipped(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_program_is_packed_where_the_document_put_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(&artifact_bytes(), None);
+        let image = ensure_layer_image(&store, directory.path(), &layer)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_back(&std::fs::read(image.path).unwrap(), "/opt/tool/tool"),
+            artifact_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_program_is_taken_from_the_zip_entry_the_document_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = zipped(&[("README", b"not it"), ("tool", &artifact_bytes())]);
+        let (layer, store) = downloaded(&archive, Some("tool"));
+        let image = ensure_layer_image(&store, directory.path(), &layer)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_back(&std::fs::read(image.path).unwrap(), "/opt/tool/tool"),
+            artifact_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_that_hashes_to_something_else_never_reaches_a_guest() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(b"something else", None);
+        let error = ensure_layer_image(&store, directory.path(), &layer)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ArtifactError::DigestMismatch { .. }));
+        assert!(!layer_image_path(directory.path(), &layer).exists());
+    }
+
+    #[tokio::test]
+    async fn an_entry_the_archive_does_not_hold_is_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(&zipped(&[("README", b"x")]), Some("tool"));
+        let error = ensure_layer_image(&store, directory.path(), &layer)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ArtifactError::NotInArchive { ref entry, .. } if entry == "tool"));
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_program_is_fetched_once_however_often_it_is_asked_for() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(&artifact_bytes(), None);
+        ensure_layer_image(&store, directory.path(), &layer)
+            .await
+            .unwrap();
+        let again = ensure_layer_image(&store, directory.path(), &layer)
+            .await
+            .unwrap();
+        assert_eq!(again.fetched_bytes, 0);
     }
 }

@@ -331,6 +331,29 @@ validated_string!(
     { "minLength": 1, "maxLength": MAX_OBJECT_KEY_LENGTH }
 );
 
+const MAX_DOWNLOAD_URL_LENGTH: usize = 2048;
+
+validated_string!(
+    /// Where a downloaded layer is fetched from. Only https, so that the bytes cross the network
+    /// under a certificate and not merely under their digest.
+    DownloadUrl,
+    "download url",
+    "an https URL of at most 2048 characters",
+    |value| value.starts_with("https://") && value.len() <= MAX_DOWNLOAD_URL_LENGTH && value.is_ascii(),
+    { "pattern": "^https://[\\x21-\\x7e]+$", "maxLength": MAX_DOWNLOAD_URL_LENGTH }
+);
+
+const MAX_ZIP_ENTRY_LENGTH: usize = 512;
+
+validated_string!(
+    /// The path of one file inside a zip, as the archive names it.
+    ZipEntry,
+    "zip entry",
+    "a relative path of between 1 and 512 characters",
+    |value| !value.is_empty() && value.len() <= MAX_ZIP_ENTRY_LENGTH && !value.starts_with('/'),
+    { "minLength": 1, "maxLength": MAX_ZIP_ENTRY_LENGTH, "pattern": "^[^/]" }
+);
+
 pub const MAX_STATE_MESSAGE_LENGTH: usize = 512;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

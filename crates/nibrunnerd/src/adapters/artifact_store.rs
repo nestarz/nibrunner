@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use object_store::{ObjectStore, ObjectStoreExt};
-use protocol::ObjectKey;
+use protocol::{DownloadUrl, ObjectKey};
 
 use crate::ports::{ArtifactError, ArtifactStore};
+
+/// A program is held whole in memory to be checked, so a URL cannot make the daemon hold more.
+const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 
 pub struct ObjectArtifactStore {
     store: Arc<dyn ObjectStore>,
@@ -60,6 +63,26 @@ impl ArtifactStore for ObjectArtifactStore {
             .await
             .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
         Ok(bytes.to_vec())
+    }
+
+    async fn download(&self, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError> {
+        crate::install_crypto_provider();
+        let transferred = |error: reqwest::Error| ArtifactError::Transfer(error.to_string());
+        let mut response = reqwest::get(url.as_str())
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(transferred)?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transferred)? {
+            if body.len() + chunk.len() > MAX_DOWNLOAD_BYTES {
+                return Err(ArtifactError::Transfer(format!(
+                    "{url} is larger than the {MAX_DOWNLOAD_BYTES} bytes a downloaded layer may be",
+                    url = url.as_str()
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
