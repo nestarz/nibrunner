@@ -37,7 +37,7 @@ RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian
       > /etc/apt/sources.list \
  && rm -f /etc/apt/sources.list.d/*.sources \
  && apt-get -o Acquire::Check-Valid-Until=false update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
+ && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /usr/share/doc /usr/share/man /usr/share/locale
 DOCKER

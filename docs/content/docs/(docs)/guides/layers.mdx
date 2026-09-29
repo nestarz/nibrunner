@@ -13,8 +13,6 @@ layers[0]
 Debian            the guest image nibrunner ships; always the bottom
 ```
 
-The Debian guest image carries `ca-certificates` and `curl`, so a build or startup step can fetch over HTTPS. Anything else is a layer.
-
 ## Layers
 
 A layer is an object in the artifact store, identified by its digest, with a `kind`:
