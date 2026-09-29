@@ -73,12 +73,31 @@ pub enum DesiredLayer {
         object: StoredObject,
         destination_path: ExecutablePath,
     },
+    /// One program the host fetches for itself from `url`, so that nothing has to be put in the
+    /// store first. `digest` is the program's: of the response, or of `zipEntry` inside it when the
+    /// URL serves a zip. Nothing is made from the bytes before they match it.
+    DownloadedExecutable {
+        url: DownloadUrl,
+        digest: Sha256Digest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zip_entry: Option<ZipEntry>,
+        destination_path: ExecutablePath,
+    },
 }
 
 impl DesiredLayer {
-    pub fn object(&self) -> &StoredObject {
+    pub fn digest(&self) -> &Sha256Digest {
         match self {
-            DesiredLayer::Filesystem { object } | DesiredLayer::Executable { object, .. } => object,
+            DesiredLayer::Filesystem { object } | DesiredLayer::Executable { object, .. } => &object.digest,
+            DesiredLayer::DownloadedExecutable { digest, .. } => digest,
+        }
+    }
+
+    /// The layer's object in the store; a downloaded layer has none.
+    pub fn stored_object(&self) -> Option<&StoredObject> {
+        match self {
+            DesiredLayer::Filesystem { object } | DesiredLayer::Executable { object, .. } => Some(object),
+            DesiredLayer::DownloadedExecutable { .. } => None,
         }
     }
 }

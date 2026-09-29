@@ -21,6 +21,7 @@ A layer is an object in the artifact store, identified by its digest, with a `ki
 | --- | --- |
 | `executable` | One program. The host packs it into an image at `destinationPath`. |
 | `filesystem` | A squashfs or ext4 image. Attached as uploaded. |
+| `downloaded-executable` | One program the host fetches itself from an `https` URL. Nothing goes in the store. |
 
 ```json
 "layers": [
@@ -28,6 +29,23 @@ A layer is an object in the artifact store, identified by its digest, with a `ki
   { "kind": "executable", "destinationPath": "/app/server", "digest": "<sha256, lowercase hex>", "objectKey": "my-server" }
 ]
 ```
+
+A `downloaded-executable` names a `url` instead of an `objectKey`. Its `digest` is the program's:
+of the response body, or, when the URL serves a zip and `zipEntry` names a file in it, of that file.
+The host packs the program only once the bytes match, so a URL that changes is refused, not run.
+
+```json
+{
+  "kind": "downloaded-executable",
+  "destinationPath": "/opt/tool/tool",
+  "url": "https://example.com/tool-linux-x64.zip",
+  "zipEntry": "tool",
+  "digest": "<sha256 of the tool file, lowercase hex>"
+}
+```
+
+A download larger than 512 MiB is refused. The guest never needs network access for this: the host
+does the fetching.
 
 A layer is downloaded once per host and cached by digest. Ten apps on the same base image share
 one copy.
