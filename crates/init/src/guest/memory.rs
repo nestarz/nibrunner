@@ -31,6 +31,13 @@ pub(crate) fn mount() -> Result<(), MountFailed> {
 /// process in it together: a tenant that forks would otherwise limp on without the one that
 /// held its memory.
 pub(crate) fn prepare(guest_total_bytes: u64) -> Result<Ceiling, String> {
+    // Linux 6.1 resets the boot parameter when the balloon registers. Set the order after
+    // device initialization, so 64 KiB free blocks can actually reach the host.
+    if let Err(error) = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_order", "4") {
+        crate::guest::log(&format!(
+            "small free-page reporting could not be enabled: {error}"
+        ));
+    }
     let limit_bytes = ceiling_for(guest_total_bytes);
     let unwritable = |path: &str, error: std::io::Error| format!("{path} could not be written: {error}");
 
