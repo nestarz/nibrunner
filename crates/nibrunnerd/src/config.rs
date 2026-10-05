@@ -1328,7 +1328,12 @@ fn host_tcp_endpoints(values: &[String]) -> Result<Vec<SocketAddr>, ConfigError>
         .iter()
         .map(|value| {
             let endpoint: SocketAddr = value.parse().map_err(|_| invalid())?;
-            if endpoint.port() == 0 || endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() {
+            if endpoint.port() == 0
+                || endpoint.ip().is_unspecified()
+                || endpoint.ip().is_multicast()
+                || matches!(endpoint.ip(), IpAddr::V4(address) if address.is_broadcast())
+                || matches!(endpoint, SocketAddr::V6(address) if address.scope_id() != 0)
+            {
                 return Err(invalid());
             }
             Ok(endpoint)
@@ -1497,6 +1502,8 @@ denied_egress_addresses_v6 = []
             "[::]:443",
             "203.0.113.10:0",
             "224.0.0.1:443",
+            "255.255.255.255:443",
+            "[fe80::1%1]:443",
             "[ff02::1]:443",
             "203.0.113.10:443; accept",
         ] {

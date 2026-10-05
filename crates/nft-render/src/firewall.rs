@@ -256,12 +256,12 @@ fn input_chain(state: &FirewallState, ipv4: bool) -> Vec<String> {
         ("ip6 daddr", &state.denied_egress_addresses_v6)
     };
     let mut rules = vec!["type filter hook input priority filter; policy accept;".to_string()];
-    rules.extend(denied_egress_rules(&tap, daddr, denied));
     // Only replies to host-initiated flows bypass the endpoint list, so removing an endpoint
     // also closes guest-initiated connections that were already established.
     rules.push(format!(
         "iifname {tap} ct direction reply ct state established,related accept"
     ));
+    rules.extend(denied_egress_rules(&tap, daddr, denied));
     for endpoint in state
         .allowed_host_tcp_endpoints
         .iter()
