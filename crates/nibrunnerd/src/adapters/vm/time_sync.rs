@@ -9,7 +9,7 @@ use crate::ports::VmError;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn failed(reason: impl std::fmt::Display) -> VmError {
-    VmError::Host(format!("guest clock synchronization failed: {reason}"))
+    VmError::Host(format!("guest control failed: {reason}"))
 }
 
 async fn line(wire: &mut BufReader<UnixStream>) -> Result<String, VmError> {
@@ -64,6 +64,18 @@ pub(super) async fn freeze_tenant(path: &Path) -> Result<(), VmError> {
     Ok(())
 }
 
+pub(super) async fn reclaim(path: &Path) -> Result<(), VmError> {
+    let mut wire = connect(path).await?;
+    wire.get_mut()
+        .write_all(format!("{}\n", guest_contract::control::TENANT_RECLAIM_REQUEST).as_bytes())
+        .await
+        .map_err(failed)?;
+    if line(&mut wire).await? != "OK" {
+        return Err(VmError::Host("the guest could not reclaim memory".into()));
+    }
+    Ok(())
+}
+
 pub(super) async fn wake(path: &Path) -> Result<(), VmError> {
     let mut wire = connect(path).await?;
     let sent = SystemTime::now().duration_since(UNIX_EPOCH).map_err(failed)?;
@@ -96,6 +108,25 @@ pub(super) async fn wake(path: &Path) -> Result<(), VmError> {
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn reclaim_uses_the_guest_control_channel_and_accepts_only_a_success_reply() {
+        for reply in ["OK\n", "REFUSED\n"] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("control.vsock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let answer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut wire = BufReader::new(stream);
+                assert_eq!(line(&mut wire).await.unwrap(), "CONNECT 51001");
+                wire.get_mut().write_all(b"OK 1234\n").await.unwrap();
+                assert_eq!(line(&mut wire).await.unwrap(), "RECLAIM");
+                wire.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            });
+            assert_eq!(reclaim(&socket).await.is_ok(), reply == "OK\n");
+            answer.await.unwrap();
+        }
+    }
 
     async fn guest(listener: UnixListener, ready: bool) -> Option<String> {
         let (stream, _) = listener

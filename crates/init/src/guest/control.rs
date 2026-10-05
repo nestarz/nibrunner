@@ -16,6 +16,7 @@ const MAX_HOLD: Duration = Duration::from_secs(900);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn serve() -> ! {
+    let mut reclaimer = crate::reclaim::Reclaimer::default();
     let Ok(listener) = vsock::listener(guest_contract::vsock::GUEST_CONTROL_VSOCK_PORT) else {
         log("the control port could not be opened; no export can freeze this tenant");
         loop {
@@ -24,16 +25,23 @@ pub(crate) fn serve() -> ! {
     };
     loop {
         match vsock::accept_one(&listener) {
-            Ok(connection) => answer(connection),
+            Ok(connection) => answer(connection, &mut reclaimer),
             Err(_) => std::thread::sleep(POLL_INTERVAL),
         }
     }
 }
 
-fn answer(connection: OwnedFd) {
+fn answer(connection: OwnedFd, reclaimer: &mut crate::reclaim::Reclaimer) {
     let mut wire = BufReader::new(std::fs::File::from(connection));
     let mut request = String::new();
     if wire.read_line(&mut request).is_err() {
+        return;
+    }
+    if request.trim() == guest_contract::control::TENANT_RECLAIM_REQUEST {
+        let result = super::memory::reclaim(reclaimer);
+        let _ = wire
+            .get_mut()
+            .write_all(if result.is_ok() { b"OK\n" } else { b"REFUSED\n" });
         return;
     }
     if request.trim() == guest_contract::control::TENANT_FREEZE_REQUEST {

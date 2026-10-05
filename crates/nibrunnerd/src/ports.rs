@@ -180,6 +180,9 @@ pub trait Vmm: Send + Sync {
     async fn boot(&self, request: BootRequest) -> Result<(), VmError>;
     async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError>;
     async fn wake(&self, request: SuspendRequest) -> Result<(), VmError>;
+    async fn reclaim(&self, _app_id: &AppId) -> Result<(), VmError> {
+        Ok(())
+    }
     async fn stop(&self, app_id: &AppId) -> Result<(), VmError>;
     async fn discard(&self, app_id: &AppId) -> Result<(), VmError>;
     async fn delete_tap(&self, tap_name: &str) -> Result<(), VmError>;

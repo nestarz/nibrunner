@@ -29,6 +29,7 @@ pub struct HostSnapshot {
     // it watched, so a restart has measured nothing and must take a reading before it may call
     // an app quiet.
     pub last_measured_at_ms: BTreeMap<AppId, i64>,
+    pub reclaimed_at_ms: BTreeMap<AppId, i64>,
     pub volume_usage: BTreeMap<AppId, FilesystemUsage>,
     pub compute_usage: BTreeMap<AppId, ComputeUsage>,
     pub compute_ticks: BTreeMap<AppId, guest_contract::filesystem::MeasuredCompute>,

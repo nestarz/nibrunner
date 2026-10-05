@@ -183,6 +183,7 @@ pub async fn record_activity(host: &Host) {
             }
             snapshot.last_active_at_ms.retain(|id, _| held.contains(id));
             snapshot.last_measured_at_ms = last_measured_at_ms;
+            snapshot.reclaimed_at_ms.retain(|id, _| held.contains(id));
         })
         .await;
 }
@@ -297,6 +298,79 @@ async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bo
     outcome == Some(SleepOutcome::Slept)
 }
 
+fn reclaim_due(
+    policy: &ActivationPolicy,
+    record: &InstanceRecord,
+    snapshot: &HostSnapshot,
+    open: u64,
+    now: i64,
+) -> bool {
+    let protocol::SleepPolicy::TrafficIdle { timeout_ms } = policy.sleep_when else {
+        return false;
+    };
+    let signals = signals(snapshot, record, open);
+    let Some(active) = signals.last_active_at_ms else {
+        return false;
+    };
+    let quiet = now.saturating_sub(active);
+    record.on_request
+        && record.desired_running
+        && record.state == protocol::InstanceState::Running
+        && open == 0
+        && signals.measured_lately(now)
+        && quiet >= (timeout_ms.get() / 2).max(30_000) as i64
+        && quiet < timeout_ms.get() as i64
+        && snapshot
+            .reclaimed_at_ms
+            .get(&record.app_id)
+            .is_none_or(|at| *at < active)
+}
+
+async fn reclaim_quiet(host: &Host, policies: &BTreeMap<AppId, ActivationPolicy>) {
+    let snapshot = host.state.snapshot().await;
+    let now = crate::clock::now_ms();
+    let candidates: Vec<_> = snapshot
+        .records
+        .values()
+        .filter_map(|record| {
+            let policy = policies.get(&record.app_id)?;
+            reclaim_due(
+                policy,
+                record,
+                &snapshot,
+                host.metrics.proxy.open_requests_for(&record.app_id),
+                now,
+            )
+            .then_some((record.app_id.clone(), *policy))
+        })
+        .take(SLEEP_CONCURRENCY)
+        .collect();
+    for (app_id, policy) in candidates {
+        let _transition = host.state.transition(&app_id).await;
+        let now = crate::clock::now_ms();
+        let mut snapshot = host.state.locked_snapshot().await;
+        let Some(record) = snapshot.records.get(&app_id) else {
+            continue;
+        };
+        if !reclaim_due(
+            &policy,
+            record,
+            &snapshot,
+            host.metrics.proxy.open_requests_for(&app_id),
+            now,
+        ) {
+            continue;
+        }
+        snapshot.reclaimed_at_ms.insert(app_id.clone(), now);
+        drop(snapshot);
+        // Reclaim does not freeze the guest. Incoming work can continue; freed pages have
+        // time to reach the balloon before the later idle pass pauses the VM.
+        if let Err(error) = host.vms.reclaim(&app_id).await {
+            tracing::debug!(%app_id, error = %error, "quiet guest memory reclaim was unavailable");
+        }
+    }
+}
+
 /// Puts the due apps to sleep, the most overdue first and `SLEEPS_PER_PASS` of them at most, and
 /// returns how many due apps it left for the next pass. A caller handed more than none runs again
 /// at once rather than at the interval: the bound keeps a pass short, not the host slow. A pass
@@ -317,6 +391,7 @@ pub async fn apply_sleep(host: &std::sync::Arc<Host>) -> usize {
             })
             .unwrap_or_default()
     };
+    reclaim_quiet(host, &policies).await;
     let snapshot = host.state.snapshot().await;
     let requests_open = host.metrics.proxy.open_requests();
     let now = crate::clock::now_ms();
@@ -729,6 +804,65 @@ mod sleep_tests {
     async fn last_reached(host: &TestHost, ms_ago: i64) {
         let moment = crate::clock::now_ms() - ms_ago;
         measured_quiet_since(&host.state, &app_id(), moment).await;
+    }
+
+    #[tokio::test]
+    async fn quiet_reclaim_runs_once_per_idle_window_without_sleeping_or_interrupting_requests() {
+        let mut host = on_request_host(Some(IdleTimeoutMs::try_from(120_000).unwrap())).await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut vms = crate::ports::MockVmm::new();
+        vms.expect_reclaim().returning(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        std::sync::Arc::get_mut(&mut host.host).unwrap().vms = std::sync::Arc::new(vms);
+        let policies = BTreeMap::from([(
+            app_id(),
+            ActivationPolicy {
+                sleep_when: protocol::SleepPolicy::TrafficIdle {
+                    timeout_ms: IdleTimeoutMs::try_from(120_000).unwrap(),
+                },
+            },
+        )]);
+        last_reached(&host, 61_000).await;
+        reclaim_quiet(&host, &policies).await;
+        reclaim_quiet(&host, &policies).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Running
+        );
+        host.state
+            .modify(|snapshot| {
+                snapshot.reclaimed_at_ms.clear();
+            })
+            .await;
+        let snapshot = host.state.snapshot().await;
+        let record = &snapshot.records[&app_id()];
+        let now = crate::clock::now_ms();
+        assert!(!reclaim_due(&policies[&app_id()], record, &snapshot, 1, now));
+        let never = ActivationPolicy {
+            sleep_when: protocol::SleepPolicy::Never,
+        };
+        assert!(!reclaim_due(&never, record, &snapshot, 0, now));
+        let mut stale = snapshot;
+        stale
+            .last_measured_at_ms
+            .insert(app_id(), now - MAX_ACTIVITY_AGE_MS - 1);
+        assert!(!reclaim_due(
+            &policies[&app_id()],
+            &stale.records[&app_id()],
+            &stale,
+            0,
+            now
+        ));
+        last_reached(&host, 1_000).await;
+        reclaim_quiet(&host, &policies).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        last_reached(&host, 61_000).await;
+        reclaim_quiet(&host, &policies).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

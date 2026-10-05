@@ -376,21 +376,15 @@ mod tests {
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     use guest_contract::logs::{decode_frames, GuestLogFrame};
     use protocol::TenantLogStream;
 
     use super::*;
 
-    /// `reap_until` takes every child of this process, so two of these at once would take each
-    /// other's.
-    static ONE_TENANT_AT_A_TIME: Mutex<()> = Mutex::new(());
-
     fn one_tenant_at_a_time() -> MutexGuard<'static, ()> {
-        ONE_TENANT_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::child_process_guard()
     }
 
     /// A tenant that is this process forked, running `run` on its two pipes and exiting well

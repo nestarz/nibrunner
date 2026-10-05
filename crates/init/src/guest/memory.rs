@@ -31,6 +31,13 @@ pub(crate) fn mount() -> Result<(), MountFailed> {
 /// process in it together: a tenant that forks would otherwise limp on without the one that
 /// held its memory.
 pub(crate) fn prepare(guest_total_bytes: u64) -> Result<Ceiling, String> {
+    // Linux 6.1 resets the boot parameter when the balloon registers. Set the order after
+    // device initialization, so 64 KiB free blocks can actually reach the host.
+    if let Err(error) = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_order", "4") {
+        crate::guest::log(&format!(
+            "small free-page reporting could not be enabled: {error}"
+        ));
+    }
     let limit_bytes = ceiling_for(guest_total_bytes);
     let unwritable = |path: &str, error: std::io::Error| format!("{path} could not be written: {error}");
 
@@ -95,4 +102,19 @@ pub(crate) fn read() -> Option<Reading> {
         major_faults: field(&value("memory.stat")?, "pgmajfault")?,
         oom_kills: field(&value("memory.events")?, "oom_kill")?,
     })
+}
+
+pub(crate) fn reclaim(reclaimer: &mut crate::reclaim::Reclaimer) -> std::io::Result<()> {
+    let stat = std::fs::read_to_string(format!("{TENANT_CGROUP}/memory.stat"))?;
+    let bytes = field(&stat, "file")
+        .unwrap_or(0)
+        .saturating_sub(field(&stat, "shmem").unwrap_or(0));
+    let bytes = bytes.min(64 * 1024 * 1024);
+    if bytes == 0 {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("{TENANT_CGROUP}/memory.reclaim"))?;
+    reclaimer.reclaim(file, bytes, std::time::Duration::from_millis(500))
 }

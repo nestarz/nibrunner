@@ -2,6 +2,7 @@ pub const FREEZE_REQUEST: &str = "FREEZE\n";
 pub const FREEZE_HELD: &str = "OK";
 pub const TENANT_FREEZE_REQUEST: &str = "SLEEP";
 pub const TENANT_FREEZE_HELD: &str = "OK";
+pub const TENANT_RECLAIM_REQUEST: &str = "RECLAIM";
 pub const TENANT_CLOCK_REQUEST: &str = "WAKE ";
 pub const TENANT_CLOCK_READY: &str = "READY";
 pub const TENANT_CLOCK_RELEASE: &str = "GO";
