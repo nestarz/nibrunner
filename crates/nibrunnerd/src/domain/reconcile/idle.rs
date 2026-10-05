@@ -266,12 +266,9 @@ fn left_up(
 
 /// Puts the app to sleep if it is still due, and says whether it went.
 async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bool {
-    // Decided again, against the state and the clock as they are now: an app picked for the
-    // batch may have been asked for while it waited its turn, and how late the policy is acted on
-    // is measured from when it is, not from when the batch was picked. Decided before the
-    // transition lock rather than under it, so the lock is held for the move and nothing else.
+    let _transition = host.state.transition(app_id).await;
     let now = crate::clock::now_ms();
-    let snapshot = host.state.snapshot().await;
+    let mut snapshot = host.state.locked_snapshot().await;
     let Some(record) = snapshot.records.get(app_id) else {
         return false;
     };
@@ -281,6 +278,10 @@ async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bo
         left_up(app_id, record, policy, &signals, now);
         return false;
     };
+    // Admission uses this same lock. Earlier requests prevent idle sleep; later ones wait for
+    // the transition before opening an upstream connection.
+    snapshot.snapshotting.insert(app_id.clone());
+    drop(snapshot);
     host.metrics
         .sleep_wake
         .sleep_due(due.reason, std::time::Duration::from_millis(due.late_ms as u64));
@@ -291,12 +292,9 @@ async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bo
         late_ms = due.late_ms,
         "letting an app sleep"
     );
-    // Held across the flush and the snapshot, and taken by a wake for as long as it is bringing
-    // the guest back: a request that reaches an app mid-snapshot waits for the snapshot and then
-    // restores what it wrote, rather than finding a guest that is paused or half written out.
-    let _transition = host.state.transition(app_id).await;
-    crate::domain::reconcile::instances::suspend_instance(host, app_id, due.reason).await
-        == Some(SleepOutcome::Slept)
+    let outcome = crate::domain::reconcile::instances::suspend_instance(host, app_id, due.reason).await;
+    host.state.mark_snapshotting(app_id, false).await;
+    outcome == Some(SleepOutcome::Slept)
 }
 
 /// Puts the due apps to sleep, the most overdue first and `SLEEPS_PER_PASS` of them at most, and
@@ -744,6 +742,29 @@ mod sleep_tests {
         let record = host.state.record(&app_id()).await.unwrap();
         assert_eq!(record.state, InstanceState::Idle);
         assert!(record.stop_requested);
+    }
+
+    #[tokio::test]
+    async fn a_request_admitted_while_sleep_waits_for_the_transition_keeps_the_app_awake() {
+        let host = on_request_host(None).await;
+        last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 + 1).await;
+        let held = host.state.transition(&app_id()).await;
+        let sleeping = {
+            let host = host.arc().clone();
+            tokio::spawn(async move { apply_sleep(&host).await })
+        };
+        tokio::task::yield_now().await;
+        let open = host
+            .state
+            .admit(&app_id(), crate::clock::now_ms(), || {
+                host.metrics.proxy.open(&app_id())
+            })
+            .await;
+        drop(held);
+        sleeping.await.unwrap();
+        assert!(host.vms.calls().is_empty());
+        assert!(!host.state.is_snapshotting(&app_id()).await);
+        drop(open);
     }
 
     #[tokio::test]
