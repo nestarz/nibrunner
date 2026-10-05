@@ -105,6 +105,8 @@ pub struct VmBudget {
     pub cpu_percent: std::num::NonZeroU16,
     /// Includes guest RAM and Firecracker overhead. Exceeding it can kill the VM.
     pub memory_mib: std::num::NonZeroU32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<protocol::MemoryPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -924,6 +926,7 @@ impl HostConfig {
                 default: VmBudget {
                     cpu_percent: std::num::NonZeroU16::new(100).expect("positive budget"),
                     memory_mib: std::num::NonZeroU32::new(2304).expect("positive budget"),
+                    memory: None,
                 },
                 apps: Default::default(),
             }),

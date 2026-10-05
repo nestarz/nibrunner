@@ -119,6 +119,7 @@ mod tests {
         host.state.put_record(instance_record(|_| {})).await;
         let mut previous = build(&host, versions()).await;
         previous.instances[0].memory = Some(protocol::ReportedMemory {
+            limits: None,
             measured_at: now_timestamp(),
             current_bytes: 256 << 20,
             peak_bytes: Some(300 << 20),

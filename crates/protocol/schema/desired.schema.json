@@ -708,7 +708,7 @@
       ]
     },
     "InstanceLimits": {
-      "description": "Host-enforced limits, applied live without replacing an instance's deployment.",
+      "description": "HTTP limits apply live; process budgets apply on the next boot or snapshot restore.",
       "type": "object",
       "properties": {
         "concurrent": {
@@ -724,6 +724,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 1
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "memoryMib": {
           "description": "Host memory budget including guest RAM and Firecracker overhead.",
@@ -779,6 +789,41 @@
       "type": "integer",
       "maximum": 604800000,
       "minimum": 60000
+    },
+    "MemoryPolicy": {
+      "type": "object",
+      "properties": {
+        "priority": {
+          "$ref": "#/$defs/MemoryPriority"
+        },
+        "swapMib": {
+          "description": "Maximum uncompressed bytes allowed in host swap, in MiB. Zero disables swap.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "targetMib": {
+          "description": "Working-set target, capped by the hard memory budget. Does not resize guest RAM.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "targetMib",
+        "swapMib",
+        "priority"
+      ]
+    },
+    "MemoryPriority": {
+      "type": "string",
+      "enum": [
+        "production",
+        "standard",
+        "preview",
+        "build"
+      ]
     },
     "ObjectKey": {
       "description": "between 1 and 1024 characters",

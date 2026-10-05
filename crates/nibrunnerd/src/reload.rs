@@ -351,6 +351,7 @@ mod tests {
             default: crate::config::VmBudget {
                 cpu_percent: 50.try_into().unwrap(),
                 memory_mib: 512.try_into().unwrap(),
+                memory: None,
             },
             apps: Default::default(),
         });

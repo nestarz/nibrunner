@@ -122,15 +122,16 @@ impl VmProcesses {
             return tokio::process::Command::new(binary);
         };
         let mut command = tokio::process::Command::new("systemd-run");
+        let memory = super::memory::Controls::for_budget(&budget);
         // Scope mode execs the VMM in place; a fresh unit name avoids waiting for the old scope to be collected.
         command
             .args(["--scope", "--quiet", "--collect"])
             .arg(format!("--property=CPUQuota={}%", budget.cpu_percent))
-            .arg(format!(
-                "--property=MemoryMax={}",
-                u64::from(budget.memory_mib.get()) * 1024 * 1024
-            ))
-            .arg("--property=MemorySwapMax=0")
+            .arg(format!("--property=MemoryLow={}", memory.low))
+            .arg(format!("--property=MemoryHigh={}", memory.high))
+            .arg(format!("--property=MemoryMax={}", memory.max))
+            .arg(format!("--property=MemorySwapMax={}", memory.swap))
+            .arg("--property=MemoryOOMGroup=yes")
             .arg("--")
             .arg(binary);
         command
@@ -242,6 +243,11 @@ impl VmProcesses {
         }
         #[cfg(unix)]
         {
+            let oom_score = self
+                .policy
+                .vm_budget(app_id)
+                .map(|budget| super::memory::Controls::for_budget(&budget).oom_score)
+                .unwrap_or("0");
             #[allow(
                 unsafe_code,
                 reason = "session and OOM policy must be set between fork and exec"
@@ -261,15 +267,16 @@ impl VmProcesses {
                         if descriptor < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        let written = libc::write(descriptor, c"0".as_ptr().cast(), 1);
+                        let written = libc::write(descriptor, oom_score.as_ptr().cast(), oom_score.len());
                         let error = std::io::Error::last_os_error();
                         libc::close(descriptor);
-                        if written != 1 {
+                        if written != oom_score.len() as isize {
                             return Err(error);
                         }
                     }
                     #[cfg(not(target_os = "linux"))]
                     if constrained {
+                        let _ = oom_score;
                         return Err(std::io::Error::other("VM budgets require Linux and systemd"));
                     }
                     Ok(())
@@ -382,6 +389,7 @@ mod tests {
                 default: crate::config::VmBudget {
                     cpu_percent: 50.try_into().unwrap(),
                     memory_mib: 1280.try_into().unwrap(),
+                    memory: None,
                 },
                 apps: Default::default(),
             }),
@@ -409,6 +417,7 @@ mod tests {
                 default: crate::config::VmBudget {
                     cpu_percent: 25.try_into().unwrap(),
                     memory_mib: 512.try_into().unwrap(),
+                    memory: None,
                 },
                 apps: Default::default(),
             }),
@@ -436,6 +445,7 @@ mod tests {
                     concurrent: 8.try_into().unwrap(),
                     cpu_percent: 75.try_into().unwrap(),
                     memory_mib: 640.try_into().unwrap(),
+                    memory: None,
                 });
             })]);
         let command = processes.command(&app_id(), Path::new("/bin/firecracker"));
