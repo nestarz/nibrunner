@@ -161,8 +161,22 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(held.contains("reject comment \"guest to host\""));
     assert!(held.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
     assert!(held.contains("ct direction reply ct state established,related accept"));
-    assert!(held.contains("ct direction original counter name work_app-1"));
-    assert!(held.contains("counter name rx_app-1"));
+    let activity_rules: Vec<_> = held
+        .lines()
+        .filter(|line| line.contains("counter name") && line.contains("work_app-1"))
+        .collect();
+    assert_eq!(activity_rules.len(), 2, "{held}");
+    assert!(
+        activity_rules
+            .iter()
+            .all(|line| line.contains("ct direction original")),
+        "{held}"
+    );
+    assert!(
+        held.lines()
+            .any(|line| line.contains("counter name") && line.contains("rx_app-1")),
+        "{held}"
+    );
     assert!(held.contains("dnat to 10.201.0.2:3000"));
     assert!(held.contains("masquerade"));
     assert!(held.contains("hook output"));
