@@ -123,8 +123,9 @@ artifact preparation or volume attachment. HTTP request admission is separate.
 
 ## VM process budgets
 
-Optional systemd scopes bound each Firecracker process and its guest. Omitting
-`vm_budgets` preserves direct process launches without these additional limits.
+Each desired instance runs in its own systemd scope. Without an explicit budget,
+the hard limit is its declared guest RAM plus 64 MiB of VMM overhead, and its CPU
+quota is 100 percent per guest vCPU. Use `vm_budgets` to override these defaults.
 
 ```toml
 [vm_budgets.default]
@@ -138,12 +139,35 @@ memory_mib = 1280
 
 100 percent means one host CPU, independently of guest vCPU count. The memory
 budget includes guest RAM **and Firecracker overhead**; choose it above the guest's
-configured RAM. The kernel can kill a VM exceeding its limit. Scope swap is disabled.
+configured RAM. The kernel can kill a VM exceeding its limit. Scope swap is disabled by default.
 These limits do not reserve capacity for the host or replace guest RAM admission.
+
+An optional `memory` policy in an instance's `limits` sets its working-set target,
+host swap allowance, and priority:
+
+```json
+{
+  "concurrent": 256,
+  "cpuPercent": 100,
+  "memoryMib": 1280,
+  "memory": { "targetMib": 384, "swapMib": 512, "priority": "production" }
+}
+```
+
+Production protects the target with `memory.low`. Preview and build priorities
+use the target as `memory.high`, which throttles allocation and triggers reclaim.
+The target is capped at the hard limit; it does not resize guest RAM. OOM scores
+are -500 for production, 0 for standard, 500 for previews, and 1000 for builds.
+These priorities influence reclaim and OOM selection; they cannot guarantee survival.
+Set the target from measured usage plus a margin. Host swap must be configured
+separately, and its physical compression ratio is not a capacity guarantee.
 
 Run `nibrunnerd start` to load the budgets without restarting the proxy. Budgets apply on subsequent VM
 boots and snapshot restores; existing VM processes retain their scopes and limits.
-Disabling budgets likewise affects subsequent starts. The daemon can restart and
+Removing overrides restores the default budget on subsequent starts. The daemon can restart and
 re-adopt scoped VMs normally. Linux and systemd with CPU and memory accounting are
-required when enabled. The daemon's OOM protection is not inherited by constrained
-VMs, so the kernel can enforce their memory budget.
+required. Each VM receives its configured OOM priority instead of inheriting the daemon's protection.
+
+Starts and request-triggered wakes reserve capacity through the same controller.
+Reservations end after the instance record accounts for the process, or when the
+attempt is cancelled. This prevents simultaneous starts from claiming the same RAM.

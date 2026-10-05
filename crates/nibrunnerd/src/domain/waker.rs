@@ -7,7 +7,6 @@ use tokio::sync::broadcast;
 
 use crate::domain::health::is_within_grace_period;
 use crate::domain::health::probe::probe_instance;
-use crate::domain::report::capacity::{committed_resources, memory_shortfall_mib};
 use crate::host::Host;
 use crate::ports::{WakeFailure, WakeRefusal, Waker};
 
@@ -34,24 +33,16 @@ impl AppWaker {
         })
     }
 
-    async fn refusal_for_room(
+    async fn reserve_room(
         &self,
         app_id: &AppId,
         wanted: &protocol::InstanceResources,
-    ) -> Option<WakeRefusal> {
-        let others: Vec<_> = self
-            .host
+    ) -> Result<crate::state::MemoryReservation, WakeRefusal> {
+        self.host
             .state
-            .records()
+            .reserve_memory(self.host.guest_memory_mib, app_id, *wanted)
             .await
-            .into_iter()
-            .filter(|record| &record.app_id != app_id)
-            .collect();
-        let shortfall =
-            memory_shortfall_mib(self.host.guest_memory_mib, &committed_resources(&others), wanted);
-        (shortfall > 0).then_some(WakeRefusal::NoRoom {
-            shortfall_mib: shortfall,
-        })
+            .map_err(|shortfall_mib| WakeRefusal::NoRoom { shortfall_mib })
     }
 
     async fn boot(&self, app_id: &AppId) -> Outcome {
@@ -89,29 +80,29 @@ impl AppWaker {
         if wanted.desired_state == DesiredInstanceState::Running {
             return self.hold(app_id, &wanted).await;
         }
-        if let Some(refusal) = self.refusal_for_room(app_id, &wanted.config.resources).await {
-            if let WakeRefusal::NoRoom { shortfall_mib } = &refusal {
-                let message = format!(
+        // A request arriving during sleep waits for the completed snapshot before reserving RAM.
+        let transition = self.host.state.transition(app_id).await;
+        let reservation = match self.reserve_room(app_id, &wanted.config.resources).await {
+            Ok(reservation) => reservation,
+            Err(refusal) => {
+                if let WakeRefusal::NoRoom { shortfall_mib } = &refusal {
+                    let message = format!(
                     "{app_id} could not be woken: its host is {shortfall_mib} MiB short of the memory it needs"
                 );
-                self.host
-                    .state
-                    .update_record(app_id, |record| {
-                        record.message = Some(protocol::StateMessage::new(message));
-                    })
-                    .await;
+                    self.host
+                        .state
+                        .update_record(app_id, |record| {
+                            record.message = Some(protocol::StateMessage::new(message));
+                        })
+                        .await;
+                }
+                return Err(refusal);
             }
-            return Err(refusal);
-        }
-
-        // The lock a sleep of this app holds while it is writing the guest out. A request that
-        // lands mid-snapshot waits here for the snapshot to finish and restores from it, rather
-        // than finding a paused guest or bringing up a second beside a half-written one. The
-        // restore is the whole of resume_instance, the volume attach that opens it included.
-        let outcome = {
-            let _transition = self.host.state.transition(app_id).await;
-            crate::domain::reconcile::instances::resume_instance(&self.host, &wanted).await?
         };
+
+        let outcome = crate::domain::reconcile::instances::resume_instance(&self.host, &wanted).await?;
+        drop(reservation);
+        drop(transition);
 
         let Some(record) = self.host.state.record(app_id).await else {
             return Err(WakeRefusal::Failed {

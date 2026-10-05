@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::*;
 
-/// Host-enforced limits, applied live without replacing an instance's deployment.
+/// HTTP limits apply live; process budgets apply on the next boot or snapshot restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -20,6 +20,29 @@ pub struct InstanceLimits {
     /// Host memory budget including guest RAM and Firecracker overhead.
     #[cfg_attr(feature = "schema", schemars(range(max = 4294967295_u64)))]
     pub memory_mib: std::num::NonZeroU32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryPolicy {
+    /// Working-set target, capped by the hard memory budget. Does not resize guest RAM.
+    pub target_mib: std::num::NonZeroU32,
+    /// Maximum uncompressed bytes allowed in host swap, in MiB. Zero disables swap.
+    pub swap_mib: u32,
+    pub priority: MemoryPriority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryPriority {
+    Production,
+    Standard,
+    Preview,
+    Build,
 }
 
 const ENVIRONMENT_RESERVED_NAME: &str = "__proto__";

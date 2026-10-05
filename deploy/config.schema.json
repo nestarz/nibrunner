@@ -111,6 +111,41 @@
         "app_concurrent"
       ]
     },
+    "MemoryPolicy": {
+      "type": "object",
+      "properties": {
+        "priority": {
+          "$ref": "#/$defs/MemoryPriority"
+        },
+        "swapMib": {
+          "description": "Maximum uncompressed bytes allowed in host swap, in MiB. Zero disables swap.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "targetMib": {
+          "description": "Working-set target, capped by the hard memory budget. Does not resize guest RAM.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "targetMib",
+        "swapMib",
+        "priority"
+      ]
+    },
+    "MemoryPriority": {
+      "type": "string",
+      "enum": [
+        "production",
+        "standard",
+        "preview",
+        "build"
+      ]
+    },
     "VmBudget": {
       "description": "Optional host-enforced budgets for each Firecracker process, including its guest memory.",
       "type": "object",
@@ -121,6 +156,9 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 1
+        },
+        "memory": {
+          "$ref": "#/$defs/MemoryPolicy"
         },
         "memory_mib": {
           "description": "Includes guest RAM and Firecracker overhead. Exceeding it can kill the VM.",

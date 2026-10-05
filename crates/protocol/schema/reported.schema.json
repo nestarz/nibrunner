@@ -477,6 +477,16 @@
           "format": "uint64",
           "minimum": 0
         },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportedMemoryLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "measuredAt": {
           "$ref": "#/$defs/Timestamp"
         },
@@ -517,6 +527,44 @@
         "oomKills",
         "pressureSomeUs",
         "pressureFullUs"
+      ]
+    },
+    "ReportedMemoryLimits": {
+      "type": "object",
+      "properties": {
+        "highBytes": {
+          "description": "Null means the kernel imposes no limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lowBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "maxBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "swapMaxBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "lowBytes"
       ]
     },
     "ReportedRestart": {

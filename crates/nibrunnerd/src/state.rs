@@ -51,12 +51,28 @@ pub struct HostSnapshot {
 pub type SharedState = Arc<HostState>;
 
 type Transitions = BTreeMap<AppId, Arc<tokio::sync::Mutex<()>>>;
+type MemoryReservations = Arc<Mutex<BTreeMap<AppId, protocol::InstanceResources>>>;
+
+pub(crate) struct MemoryReservation {
+    app_id: AppId,
+    reservations: MemoryReservations,
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.app_id);
+    }
+}
 
 pub struct HostState {
     snapshot: RwLock<HostSnapshot>,
     refresh: Notify,
     report: Notify,
     transitions: Mutex<Transitions>,
+    memory_reservations: MemoryReservations,
     pub(crate) persistence: tokio::sync::Mutex<()>,
 }
 
@@ -67,7 +83,41 @@ impl HostState {
             refresh: Notify::new(),
             report: Notify::new(),
             transitions: Mutex::new(BTreeMap::new()),
+            memory_reservations: Arc::default(),
             persistence: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Called under the app's transition lock. Starts and wakes share the reservation until
+    /// their instance record accounts for the running process, including cancelled attempts.
+    pub(crate) async fn reserve_memory(
+        &self,
+        capacity_mib: u64,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+    ) -> Result<MemoryReservation, u64> {
+        let snapshot = self.snapshot.read().await;
+        let mut reservations = self
+            .memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records: Vec<_> = snapshot
+            .records
+            .values()
+            .filter(|record| &record.app_id != app_id && !reservations.contains_key(&record.app_id))
+            .cloned()
+            .collect();
+        let mut committed = crate::domain::report::capacity::committed_resources(&records);
+        committed.extend(reservations.values().copied());
+        let shortfall =
+            crate::domain::report::capacity::memory_shortfall_mib(capacity_mib, &committed, &wanted);
+        if shortfall > 0 {
+            return Err(shortfall);
+        }
+        reservations.insert(app_id.clone(), wanted);
+        Ok(MemoryReservation {
+            app_id: app_id.clone(),
+            reservations: self.memory_reservations.clone(),
         })
     }
 
@@ -231,6 +281,40 @@ mod tests {
     use super::*;
     use crate::test_support::{app_id, instance_record, volume_id};
     use protocol::{InstanceState, VolumeState};
+
+    #[tokio::test]
+    async fn simultaneous_starts_and_wakes_cannot_reserve_the_same_capacity() {
+        let state = HostState::shared();
+        let wanted = protocol::DEFAULT_INSTANCE_RESOURCES;
+        let room = u64::from(wanted.memory_mib);
+        let first_id = app_id();
+        let second_id = AppId::parse("app-2").unwrap();
+        let (first, second) = tokio::join!(
+            state.reserve_memory(room, &first_id, wanted),
+            state.reserve_memory(room, &second_id, wanted)
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        drop(first);
+        drop(second);
+        assert!(state.reserve_memory(room, &second_id, wanted).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_reservation_and_its_starting_record_are_counted_once_until_the_guard_is_released() {
+        let state = HostState::shared();
+        let wanted = protocol::DEFAULT_INSTANCE_RESOURCES;
+        let room = u64::from(wanted.memory_mib) * 2;
+        let first_id = app_id();
+        let second_id = AppId::parse("app-2").unwrap();
+        let held = state.reserve_memory(room, &first_id, wanted).await.ok().unwrap();
+        state
+            .put_record(instance_record(|record| record.state = InstanceState::Starting))
+            .await;
+        assert!(state.reserve_memory(room, &second_id, wanted).await.is_ok());
+        drop(held);
+        assert!(state.reserve_memory(room, &second_id, wanted).await.is_ok());
+        assert!(state.reserve_memory(room / 2, &second_id, wanted).await.is_err());
+    }
 
     fn reported(state: VolumeState) -> ReportedVolume {
         ReportedVolume {

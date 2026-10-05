@@ -20,7 +20,6 @@ use crate::domain::backoff::NO_START_ATTEMPTS;
 use crate::domain::metrics::converge;
 use crate::domain::metrics::passes::Trigger;
 use crate::domain::metrics::resources::StartRefusal;
-use crate::domain::report::capacity::memory_shortfall_for;
 use crate::host::Host;
 
 pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
@@ -175,25 +174,24 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
         return;
     }
 
-    // Each start is measured against what the host holds, the starts before it in this pass
-    // included, so a wave of them boots what fits and no more. The records are read once and
-    // the one a start touched read back, rather than the thousand of them once per start.
-    let mut records = host.state.records().await;
     let (mut waiting, mut waiting_mib) = (0, 0u64);
     for desired in starts {
         let _transition = host.state.transition(&desired.app_id).await;
         let wanted = &desired.config.resources;
-        if let Some(shortfall_mib) =
-            memory_shortfall_for(host.guest_memory_mib, &records, &desired.app_id, wanted)
+        let _reservation = match host
+            .state
+            .reserve_memory(host.guest_memory_mib, &desired.app_id, *wanted)
+            .await
         {
-            instances::wait_for_room(host, desired, shortfall_mib).await;
-            waiting += 1;
-            waiting_mib += u64::from(wanted.memory_mib);
-            continue;
-        }
+            Ok(reservation) => reservation,
+            Err(shortfall_mib) => {
+                instances::wait_for_room(host, desired, shortfall_mib).await;
+                waiting += 1;
+                waiting_mib += u64::from(wanted.memory_mib);
+                continue;
+            }
+        };
         instances::start_instance(host, desired).await;
-        records.retain(|record| record.app_id != desired.app_id);
-        records.extend(host.state.record(&desired.app_id).await);
     }
     if waiting > 0 {
         tracing::warn!(

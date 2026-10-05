@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::RwLock};
 
-use protocol::{AppId, DesiredInstance, InstanceLimits};
+use protocol::{AppId, DesiredInstance, InstanceLimits, InstanceResources};
 
 use crate::config::{HttpAdmission, VmBudget, VmBudgets};
 
@@ -9,6 +9,7 @@ struct Settings {
     admission: Option<HttpAdmission>,
     budgets: Option<VmBudgets>,
     instances: BTreeMap<AppId, InstanceLimits>,
+    resources: BTreeMap<AppId, InstanceResources>,
 }
 
 #[derive(Default)]
@@ -38,12 +39,17 @@ impl RuntimePolicy {
 
     /// Replace document overrides, preserving the latest live configuration fallback.
     pub(crate) fn replace_instances(&self, instances: &[DesiredInstance]) {
-        self.settings
+        let mut settings = self
+            .settings
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .instances = instances
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        settings.instances = instances
             .iter()
             .filter_map(|instance| instance.limits.map(|limits| (instance.app_id.clone(), limits)))
+            .collect();
+        settings.resources = instances
+            .iter()
+            .map(|instance| (instance.app_id.clone(), instance.config.resources))
             .collect();
     }
 
@@ -76,10 +82,21 @@ impl RuntimePolicy {
             return Some(VmBudget {
                 cpu_percent: limits.cpu_percent,
                 memory_mib: limits.memory_mib,
+                memory: limits.memory,
             });
         }
-        let budgets = settings.budgets.as_ref()?;
-        Some(budgets.apps.get(app).unwrap_or(&budgets.default).clone())
+        if let Some(budgets) = &settings.budgets {
+            return Some(budgets.apps.get(app).unwrap_or(&budgets.default).clone());
+        }
+        let resources = settings.resources.get(app)?;
+        Some(VmBudget {
+            cpu_percent: u16::try_from(resources.vcpu_count.saturating_mul(100))
+                .unwrap_or(u16::MAX)
+                .try_into()
+                .ok()?,
+            memory_mib: resources.memory_mib.saturating_add(64).try_into().ok()?,
+            memory: None,
+        })
     }
 }
 
@@ -87,6 +104,22 @@ impl RuntimePolicy {
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    #[test]
+    fn every_desired_instance_gets_a_host_budget_even_without_an_override() {
+        let policy = RuntimePolicy::default();
+        let instance = desired_instance(|_| {});
+        policy.replace_instances(std::slice::from_ref(&instance));
+        let budget = policy.vm_budget(&app_id()).unwrap();
+        assert_eq!(
+            u32::from(budget.cpu_percent.get()),
+            instance.config.resources.vcpu_count * 100
+        );
+        assert_eq!(budget.memory_mib.get(), instance.config.resources.memory_mib + 64);
+        assert_eq!(budget.memory, None);
+        policy.replace_instances(&[]);
+        assert!(policy.vm_budget(&app_id()).is_none());
+    }
 
     #[test]
     fn document_overrides_survive_reload_and_removal_restores_latest_fallback() {
@@ -99,6 +132,7 @@ mod tests {
         let budget = VmBudget {
             cpu_percent: 100.try_into().unwrap(),
             memory_mib: 512.try_into().unwrap(),
+            memory: None,
         };
         let budgets = VmBudgets {
             default: budget.clone(),
@@ -110,9 +144,10 @@ mod tests {
                 concurrent: 2.try_into().unwrap(),
                 cpu_percent: 200.try_into().unwrap(),
                 memory_mib: 768.try_into().unwrap(),
+                memory: None,
             })
         });
-        policy.replace_instances(&[instance.clone()]);
+        policy.replace_instances(std::slice::from_ref(&instance));
         assert_eq!(policy.http_limits(&app), Some((32, 2)));
         assert_eq!(policy.vm_budget(&app).unwrap().memory_mib.get(), 768);
         let mut reloaded = admission();
@@ -134,6 +169,7 @@ mod tests {
                 concurrent: 1.try_into().unwrap(),
                 cpu_percent: 50.try_into().unwrap(),
                 memory_mib: 256.try_into().unwrap(),
+                memory: None,
             })
         });
         policy.replace_instances(&[instance]);

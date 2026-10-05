@@ -171,6 +171,7 @@ mod tests {
             concurrent: 3.try_into().unwrap(),
             cpu_percent: 150.try_into().unwrap(),
             memory_mib: 640.try_into().unwrap(),
+            memory: None,
         });
         assert_eq!(controller.accept(&desired).await, Some(Changes::default()));
         assert_eq!(host.runtime_policy.http_limits(&app_id()).unwrap().1, 3);
@@ -184,7 +185,10 @@ mod tests {
         );
         desired.instances[0].limits = None;
         assert_eq!(controller.accept(&desired).await, Some(Changes::default()));
-        assert_eq!(host.runtime_policy.vm_budget(&app_id()), None);
+        assert_eq!(
+            host.runtime_policy.vm_budget(&app_id()).unwrap().memory_mib.get(),
+            desired.instances[0].config.resources.memory_mib + 64
+        );
     }
 
     #[tokio::test]

@@ -403,6 +403,8 @@ pub struct ReportedInstance {
 #[serde(rename_all = "camelCase")]
 pub struct ReportedMemory {
     pub measured_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ReportedMemoryLimits>,
     pub current_bytes: u64,
     pub peak_bytes: Option<u64>,
     pub swap_bytes: u64,
@@ -410,6 +412,17 @@ pub struct ReportedMemory {
     pub oom_kills: u64,
     pub pressure_some_us: u64,
     pub pressure_full_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedMemoryLimits {
+    pub low_bytes: u64,
+    /// Null means the kernel imposes no limit.
+    pub high_bytes: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub swap_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
