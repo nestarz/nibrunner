@@ -28,6 +28,7 @@ pub const GUEST_MANIFEST_FILENAME: &str = "manifest.json";
 
 const VM_DIR_MODE: u32 = 0o700;
 const FIRST_GUEST_CID: u32 = 3;
+const START_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct VmManager {
     pub start_permits: Option<tokio::sync::Semaphore>,
@@ -47,11 +48,15 @@ pub struct VmManager {
 }
 
 impl VmManager {
-    fn admit_start(&self) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, VmError> {
-        self.start_permits
-            .as_ref()
-            .map(|permits| permits.try_acquire().map_err(|_| VmError::StartBusy))
-            .transpose()
+    async fn admit_start(&self) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, VmError> {
+        let Some(permits) = &self.start_permits else {
+            return Ok(None);
+        };
+        tokio::time::timeout(START_QUEUE_TIMEOUT, permits.acquire())
+            .await
+            .map_err(|_| VmError::StartBusy)?
+            .map(Some)
+            .map_err(|_| VmError::StartBusy)
     }
 
     pub fn working_dir_for(&self, app_id: &AppId) -> PathBuf {
@@ -202,7 +207,7 @@ impl Vmm for VmManager {
     }
 
     async fn boot(&self, request: BootRequest) -> Result<(), VmError> {
-        let _starting = self.admit_start()?;
+        let _starting = self.admit_start().await?;
         let app_id = request.desired.app_id.clone();
         self.discard_snapshot(&app_id);
         let staged = std::time::Instant::now();
@@ -290,7 +295,7 @@ impl Vmm for VmManager {
     }
 
     async fn wake(&self, request: SuspendRequest) -> Result<(), VmError> {
-        let _starting = self.admit_start()?;
+        let _starting = self.admit_start().await?;
         let paths = snapshot_paths(&self.snapshot_dir, &request.app_id);
         let expected = self.current_stamp(&request);
         if let Err(error) = ensure_loadable(&paths.stamp_path, &expected) {
@@ -504,15 +509,45 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    #[test]
-    fn a_full_start_budget_refuses_immediately_and_recovers_when_a_start_finishes() {
+    #[tokio::test(start_paused = true)]
+    async fn a_full_start_budget_queues_the_next_wake_until_a_start_finishes() {
         let mut host = fixture();
-        assert!(host.manager.admit_start().unwrap().is_none());
+        assert!(host.manager.admit_start().await.unwrap().is_none());
         host.manager.start_permits = Some(tokio::sync::Semaphore::new(1));
-        let first = host.manager.admit_start().unwrap();
-        assert!(host.manager.admit_start().is_err());
+        let first = host.manager.admit_start().await.unwrap();
+        let mut second = Box::pin(host.manager.admit_start());
+        assert!(futures::poll!(&mut second).is_pending());
         drop(first);
-        assert!(host.manager.admit_start().is_ok());
+        assert!(second.await.unwrap().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_queue_timeout_bounds_waiting_without_consuming_a_slot() {
+        let mut host = fixture();
+        host.manager.start_permits = Some(tokio::sync::Semaphore::new(1));
+        let first = host.manager.admit_start().await.unwrap();
+        let began = tokio::time::Instant::now();
+        assert!(matches!(
+            host.manager.admit_start().await,
+            Err(VmError::StartBusy)
+        ));
+        assert_eq!(began.elapsed(), START_QUEUE_TIMEOUT);
+        drop(first);
+        assert!(host.manager.admit_start().await.unwrap().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_queued_start_does_not_strand_the_next_waiter() {
+        let mut host = fixture();
+        host.manager.start_permits = Some(tokio::sync::Semaphore::new(1));
+        let first = host.manager.admit_start().await.unwrap();
+        let mut cancelled = Box::pin(host.manager.admit_start());
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+        let mut next = Box::pin(host.manager.admit_start());
+        assert!(futures::poll!(&mut next).is_pending());
+        drop(first);
+        assert!(next.await.unwrap().is_some());
     }
 
     struct Fixture {
