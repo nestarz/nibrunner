@@ -58,6 +58,47 @@ pub struct Host {
 }
 
 impl Host {
+    pub(crate) async fn reserve_memory(
+        &self,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+    ) -> Result<crate::state::MemoryReservation, u64> {
+        let Some(policy) = &self.config.memory_admission else {
+            return self
+                .state
+                .reserve_memory(self.guest_memory_mib, app_id, wanted)
+                .await;
+        };
+        let records = self.state.records().await;
+        let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
+        let apps = self.vms.memory(&ids).await;
+        let ceilings = ids
+            .iter()
+            .chain(std::iter::once(app_id))
+            .filter_map(|app| {
+                self.runtime_policy
+                    .vm_budget(app)
+                    .map(|budget| (app.clone(), u64::from(budget.memory_mib.get()) * 1_048_576))
+            })
+            .collect();
+        let measured =
+            crate::domain::report::capacity::read_memory_available_bytes().map(|available_bytes| {
+                (
+                    policy.mode,
+                    crate::domain::memory_admission::MemoryReadings {
+                        available_bytes,
+                        headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
+                        measured_at_ms: crate::clock::now_ms(),
+                        apps,
+                        ceilings,
+                    },
+                )
+            });
+        self.state
+            .reserve_with_readings(self.guest_memory_mib, app_id, wanted, measured)
+            .await
+    }
+
     pub async fn slot_for(
         &self,
         app_id: &AppId,

@@ -117,6 +117,21 @@ pub struct VmBudgets {
     pub apps: std::collections::BTreeMap<protocol::AppId, VmBudget>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryAdmissionMode {
+    Observe,
+    Adaptive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAdmission {
+    pub mode: MemoryAdmissionMode,
+    /// Physical memory held back for the host and bursts; swap never increases this capacity.
+    pub headroom_mib: std::num::NonZeroU32,
+}
+
 /// Where the world reaches an app on this host.
 ///
 /// Every way in is a section under here, and each is absent or complete: there is no
@@ -215,6 +230,7 @@ pub const STARTER_STATE_DIR: &str = "/var/lib/nibrunner";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     pub http_admission: Option<HttpAdmission>,
+    pub memory_admission: Option<MemoryAdmission>,
     pub max_concurrent_vm_starts: Option<std::num::NonZeroU16>,
     pub vm_budgets: Option<VmBudgets>,
     /// How many apps this host is laid out for. Everything that counts slots follows from it —
@@ -318,6 +334,10 @@ mod file {
         /// Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) http_admission: Option<super::HttpAdmission>,
+        /// Absent retains ceiling-based admission. Observe reports measured decisions without applying them.
+        /// Changes require a daemon restart.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) memory_admission: Option<super::MemoryAdmission>,
         /// Optional host-wide bound on simultaneous VM boots and snapshot restores.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) max_concurrent_vm_starts: Option<std::num::NonZeroU16>,
@@ -737,6 +757,7 @@ impl HostConfig {
 
         Ok(Self {
             http_admission: document.http_admission.clone(),
+            memory_admission: document.memory_admission.clone(),
             max_concurrent_vm_starts: document.max_concurrent_vm_starts,
             vm_budgets: document.vm_budgets.clone(),
             max_apps,
@@ -844,6 +865,7 @@ impl HostConfig {
             metrics: None,
             filesystem: None,
             http_admission: None,
+            memory_admission: None,
             max_concurrent_vm_starts: None,
             vm_budgets: None,
             logs: LogsConfig::default(),
@@ -922,6 +944,10 @@ impl HostConfig {
                 apps: Default::default(),
             }),
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2),
+            memory_admission: Some(MemoryAdmission {
+                mode: MemoryAdmissionMode::Observe,
+                headroom_mib: std::num::NonZeroU32::new(1024).expect("positive headroom"),
+            }),
             vm_budgets: Some(VmBudgets {
                 default: VmBudget {
                     cpu_percent: std::num::NonZeroU16::new(100).expect("positive budget"),
@@ -1038,6 +1064,7 @@ impl HostConfig {
                 socket: text(&filesystem.socket),
             }),
             http_admission: self.http_admission.clone(),
+            memory_admission: self.memory_admission.clone(),
             max_concurrent_vm_starts: self.max_concurrent_vm_starts,
             vm_budgets: self.vm_budgets.clone(),
             logs: Some(file::Logs {

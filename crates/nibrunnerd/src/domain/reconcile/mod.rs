@@ -178,11 +178,7 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
     for desired in starts {
         let _transition = host.state.transition(&desired.app_id).await;
         let wanted = &desired.config.resources;
-        let _reservation = match host
-            .state
-            .reserve_memory(host.guest_memory_mib, &desired.app_id, *wanted)
-            .await
-        {
+        let _reservation = match host.reserve_memory(&desired.app_id, *wanted).await {
             Ok(reservation) => reservation,
             Err(shortfall_mib) => {
                 instances::wait_for_room(host, desired, shortfall_mib).await;
