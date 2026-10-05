@@ -149,9 +149,11 @@ simultaneous Firecracker boots and snapshot restores. Omit it to preserve the
 existing behavior. Values must be between 1 and 65535. Run `nibrunnerd start`
 after changing configuration.
 
-A full budget refuses a start immediately rather than queuing it. Reconciliation
-uses its existing retry path; callers waking an app receive the existing start
-failure. Requests for an app already being woken still share its single wake.
+A full budget queues a start for up to 30 seconds. A slot released during that
+window lets the waiting start proceed. After the timeout, reconciliation uses its
+existing retry path; callers waking an app receive the existing start failure.
+Cancelling a waiter releases its place in the queue. Requests for an app already
+being woken still share its single wake.
 The permit covers VM boot/restore work, not the app's entire health grace period,
 artifact preparation or volume attachment. HTTP request admission is separate.
 
