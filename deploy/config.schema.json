@@ -264,12 +264,33 @@
             "type": "string",
             "pattern": "^[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*/[0-9]{1,3}$"
           }
+        },
+        "host_tcp": {
+          "description": "Exact host TCP endpoints guests may call. Absent permits no guest-initiated host connections.",
+          "$ref": "#/$defs/network.host_tcp"
         }
       },
       "additionalProperties": false,
       "required": [
         "denied_egress_addresses_v4",
         "denied_egress_addresses_v6"
+      ]
+    },
+    "network.host_tcp": {
+      "description": "Named egress denies take precedence. Other host addresses and ports remain isolated.",
+      "type": "object",
+      "properties": {
+        "endpoints": {
+          "description": "Exact IP:port pairs, such as [\"203.0.113.10:443\", \"[2001:db8::10]:443\"].",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoints"
       ]
     },
     "paths": {

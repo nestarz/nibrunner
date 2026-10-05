@@ -22,7 +22,7 @@ the key and the reason.
   is an error that names the key.
 - **Unknown keys are errors.** A typo is reported as an unknown key, not as a missing one.
 - **Only whole sections are optional.** `[proxy.http.tls]`, `[proxy.raw]`, `[metrics]` and
-  `[logs]` can be omitted. If present, they must be complete.
+  `[logs]` and `[network.host_tcp]` can be omitted. If present, they must be complete.
 
 Example errors:
 
@@ -66,6 +66,21 @@ shows every section filled in.
 Each app slot reserves eight consecutive ports starting at 21000. Every listener in `config.toml`
 must be outside the range `21000` to `21000 + 8 × max_apps − 1`. Port `0` is rejected.
 `metrics.port` must differ from `proxy.http.port`.
+
+## Calling a public endpoint on this host
+
+Guests cannot initiate connections to their host by default. To let an app call an HTTPS
+edge on the same host, name only its public address and port:
+
+```toml
+[network.host_tcp]
+endpoints = ["203.0.113.10:443", "[2001:db8::10]:443"]
+```
+
+Replace these example addresses with the host's public addresses. This allows TCP only to
+these exact endpoints. Other host ports and addresses, including management services, remain
+blocked. Named egress denies still take precedence. Removing an endpoint also blocks existing
+guest-initiated connections to it. Run `nibrunnerd start` to apply the change.
 
 ## Environment variables
 

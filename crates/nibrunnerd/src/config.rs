@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 pub const DEFAULT_CONFIG_FILE: &str = "/etc/nibrunner/config.toml";
@@ -230,6 +230,7 @@ pub struct HostConfig {
     pub artifact_store_url: String,
     pub storage_prefix: String,
     pub volumes: VolumeBackend,
+    pub allowed_host_tcp_endpoints: Vec<SocketAddr>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
     pub proxy: ProxyConfig,
@@ -478,12 +479,24 @@ mod file {
     #[serde(deny_unknown_fields)]
     #[schemars(rename = "network")]
     pub(super) struct Network {
+        /// Exact host TCP endpoints guests may call. Absent permits no guest-initiated host connections.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) host_tcp: Option<HostTcp>,
         /// Each `a.b.c.d/n`, `n` at most 32.
         #[schemars(inner(pattern(CIDR_V4)))]
         pub(super) denied_egress_addresses_v4: Option<Vec<String>>,
         /// Each `addr/n`, `n` at most 128.
         #[schemars(inner(pattern(CIDR_V6)))]
         pub(super) denied_egress_addresses_v6: Option<Vec<String>>,
+    }
+
+    /// Named egress denies take precedence. Other host addresses and ports remain isolated.
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    #[schemars(rename = "network.host_tcp")]
+    pub(super) struct HostTcp {
+        /// Exact IP:port pairs, such as ["203.0.113.10:443", "[2001:db8::10]:443"].
+        pub(super) endpoints: Option<Vec<String>>,
     }
 
     /// Every way in. Each section under here is absent or complete, and each binds an address of
@@ -739,6 +752,14 @@ impl HostConfig {
                 required_str("volumes.storage_prefix", &volumes.storage_prefix)?,
             )?,
             volumes: backend,
+            allowed_host_tcp_endpoints: network
+                .host_tcp
+                .as_ref()
+                .map(|tcp| {
+                    host_tcp_endpoints(required("network.host_tcp.endpoints", tcp.endpoints.as_ref())?)
+                })
+                .transpose()?
+                .unwrap_or_default(),
             denied_egress_addresses_v4: cidrs(
                 "network.denied_egress_addresses_v4",
                 required(
@@ -814,6 +835,7 @@ impl HostConfig {
             artifact_store_url: state_dir.join("artifact-store").display().to_string(),
             storage_prefix: "volumes".to_string(),
             volumes: VolumeBackend::LocalFile,
+            allowed_host_tcp_endpoints: vec![],
             denied_egress_addresses_v4: vec![],
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig::default(),
@@ -866,6 +888,7 @@ impl HostConfig {
                 checkpoint_config_file: PathBuf::from("/etc/zerofs/checkpoint.toml"),
                 checkpoint_cache_dir: PathBuf::from("/data/zerofs-checkpoint"),
             })),
+            allowed_host_tcp_endpoints: vec![],
             denied_egress_addresses_v4: vec![],
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig {
@@ -974,6 +997,14 @@ impl HostConfig {
                 staging_dir: text(&self.export_staging_dir),
             }),
             network: Some(file::Network {
+                host_tcp: (!self.allowed_host_tcp_endpoints.is_empty()).then(|| file::HostTcp {
+                    endpoints: Some(
+                        self.allowed_host_tcp_endpoints
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                    ),
+                }),
                 denied_egress_addresses_v4: Some(self.denied_egress_addresses_v4.clone()),
                 denied_egress_addresses_v6: Some(self.denied_egress_addresses_v6.clone()),
             }),
@@ -1286,6 +1317,28 @@ enum Family {
     V6,
 }
 
+fn host_tcp_endpoints(values: &[String]) -> Result<Vec<SocketAddr>, ConfigError> {
+    let invalid = || {
+        ConfigError::invalid(
+            "network.host_tcp.endpoints",
+            "IP:port pairs with a nonzero port and a unicast address",
+        )
+    };
+    let mut endpoints = values
+        .iter()
+        .map(|value| {
+            let endpoint: SocketAddr = value.parse().map_err(|_| invalid())?;
+            if endpoint.port() == 0 || endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() {
+                return Err(invalid());
+            }
+            Ok(endpoint)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    Ok(endpoints)
+}
+
 fn cidrs(field: &str, values: &[String], family: Family) -> Result<Vec<String>, ConfigError> {
     values
         .iter()
@@ -1417,6 +1470,39 @@ staging_dir = "/var/lib/nibrunner/exports"
 denied_egress_addresses_v4 = []
 denied_egress_addresses_v6 = []
 "#;
+
+    #[test]
+    fn host_tcp_endpoints_are_exact_validated_and_optional() {
+        assert!(host_tcp_endpoints(&[]).unwrap().is_empty());
+        assert!(parsed(WHOLE).allowed_host_tcp_endpoints.is_empty());
+        assert!(refused(&format!("{WHOLE}\n[network.host_tcp]\n")).contains("network.host_tcp.endpoints"));
+        let config = parsed(&format!(
+            "{WHOLE}\n[network.host_tcp]\nendpoints = [\"203.0.113.10:443\"]\n"
+        ));
+        assert_eq!(
+            config.allowed_host_tcp_endpoints,
+            vec!["203.0.113.10:443".parse::<SocketAddr>().unwrap()]
+        );
+
+        let valid = vec![
+            "203.0.113.10:443".to_string(),
+            "[2001:db8::10]:443".to_string(),
+            "203.0.113.10:443".to_string(),
+        ];
+        assert_eq!(host_tcp_endpoints(&valid).unwrap().len(), 2);
+        for invalid in [
+            "example.com:443",
+            "203.0.113.0/24:443",
+            "0.0.0.0:443",
+            "[::]:443",
+            "203.0.113.10:0",
+            "224.0.0.1:443",
+            "[ff02::1]:443",
+            "203.0.113.10:443; accept",
+        ] {
+            assert!(host_tcp_endpoints(&[invalid.to_string()]).is_err(), "{invalid}");
+        }
+    }
 
     /// A key as the refusals name it: `section.key`, or the bare key above the first section.
     fn field_of(section: &str, key: &str) -> String {

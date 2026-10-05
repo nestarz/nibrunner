@@ -138,6 +138,10 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
             host_ipv4: protocol::Ipv4Address::parse("10.201.0.1").unwrap(),
             guest_ipv4: protocol::Ipv4Address::parse("10.201.0.2").unwrap(),
         }],
+        allowed_host_tcp_endpoints: vec![
+            "203.0.113.10:443".parse().unwrap(),
+            "[2001:db8::10]:443".parse().unwrap(),
+        ],
         denied_egress_addresses_v4: vec!["10.43.0.0/16".into()],
         denied_egress_addresses_v6: vec!["2600:1f18:abcd::/56".into()],
     };
@@ -155,6 +159,8 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(held.contains("reject comment \"instance metadata endpoint\""));
     assert!(held.contains("reject comment \"guest to guest\""));
     assert!(held.contains("reject comment \"guest to host\""));
+    assert!(held.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
+    assert!(held.contains("ct direction reply ct state established,related accept"));
     assert!(held.contains("dnat to 10.201.0.2:3000"));
     assert!(held.contains("masquerade"));
     assert!(held.contains("hook output"));
@@ -166,6 +172,7 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
         ]))
         .await
         .expect("the kernel names the v6 table");
+    assert!(v6.contains("ip6 daddr 2001:db8::10 tcp dport 443 accept"));
     assert!(v6.contains("fe80::/10"));
     assert!(v6.contains("2600:1f18:abcd::/56"));
 
