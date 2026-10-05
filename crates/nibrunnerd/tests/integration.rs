@@ -161,6 +161,8 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(held.contains("reject comment \"guest to host\""));
     assert!(held.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
     assert!(held.contains("ct direction reply ct state established,related accept"));
+    assert!(held.contains("ct direction original counter name work_app-1"));
+    assert!(held.contains("counter name rx_app-1"));
     assert!(held.contains("dnat to 10.201.0.2:3000"));
     assert!(held.contains("masquerade"));
     assert!(held.contains("hook output"));

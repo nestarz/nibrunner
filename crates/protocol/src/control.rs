@@ -365,6 +365,8 @@ pub struct ReportedInstance {
     pub deployment_id: DeploymentId,
     pub state: InstanceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<ReportedMemory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_port: Option<HostPort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_ipv4: Option<Ipv4Address>,
@@ -394,6 +396,20 @@ pub struct ReportedInstance {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedMemory {
+    pub measured_at: Timestamp,
+    pub current_bytes: u64,
+    pub peak_bytes: Option<u64>,
+    pub swap_bytes: u64,
+    pub high_events: u64,
+    pub oom_kills: u64,
+    pub pressure_some_us: u64,
+    pub pressure_full_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

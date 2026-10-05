@@ -11,6 +11,7 @@ pub fn to_reported_instance(record: &InstanceRecord, last_active_at_ms: Option<i
         app_id: record.app_id.clone(),
         deployment_id: record.deployment_id.clone(),
         state: record.state,
+        memory: None,
         host_port: Some(record.host_port),
         guest_ipv4: Some(record.guest_ipv4.clone()),
         layer_digests: record.layer_digests.clone(),
