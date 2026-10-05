@@ -39,6 +39,10 @@
       "maximum": 65535,
       "minimum": 1
     },
+    "memory_admission": {
+      "description": "Absent retains ceiling-based admission. Observe reports measured decisions without applying them.\nChanges require a daemon restart.",
+      "$ref": "#/$defs/MemoryAdmission"
+    },
     "metrics": {
       "description": "Absent is a host that scrapes nothing.",
       "$ref": "#/$defs/metrics"
@@ -109,6 +113,32 @@
       "required": [
         "host_concurrent",
         "app_concurrent"
+      ]
+    },
+    "MemoryAdmission": {
+      "type": "object",
+      "properties": {
+        "headroom_mib": {
+          "description": "Physical memory held back for the host and bursts; swap never increases this capacity.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "mode": {
+          "$ref": "#/$defs/MemoryAdmissionMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "headroom_mib"
+      ]
+    },
+    "MemoryAdmissionMode": {
+      "type": "string",
+      "enum": [
+        "observe",
+        "adaptive"
       ]
     },
     "MemoryPolicy": {

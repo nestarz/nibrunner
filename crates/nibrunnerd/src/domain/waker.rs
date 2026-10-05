@@ -39,8 +39,7 @@ impl AppWaker {
         wanted: &protocol::InstanceResources,
     ) -> Result<crate::state::MemoryReservation, WakeRefusal> {
         self.host
-            .state
-            .reserve_memory(self.host.guest_memory_mib, app_id, *wanted)
+            .reserve_memory(app_id, *wanted)
             .await
             .map_err(|shortfall_mib| WakeRefusal::NoRoom { shortfall_mib })
     }

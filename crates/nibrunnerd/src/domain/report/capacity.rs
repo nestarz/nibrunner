@@ -44,7 +44,7 @@ const HOLDS_NOTHING: [InstanceState; 4] = [
 /// A record holds what it was given while there is a microVM behind it or one on its way. A
 /// boot in flight is pending with its attempt spent; a record pending with none spent is one
 /// waiting for room, with nothing behind it yet.
-fn holds_something(record: &InstanceRecord) -> bool {
+pub(crate) fn holds_something(record: &InstanceRecord) -> bool {
     !HOLDS_NOTHING.contains(&record.state)
         && !(record.state == InstanceState::Pending && record.start_attempts == NO_START_ATTEMPTS)
 }

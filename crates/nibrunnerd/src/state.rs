@@ -52,7 +52,13 @@ pub struct HostSnapshot {
 pub type SharedState = Arc<HostState>;
 
 type Transitions = BTreeMap<AppId, Arc<tokio::sync::Mutex<()>>>;
-type MemoryReservations = Arc<Mutex<BTreeMap<AppId, protocol::InstanceResources>>>;
+#[derive(Clone, Copy)]
+struct ReservedMemory {
+    resources: protocol::InstanceResources,
+    bytes: u64,
+}
+
+type MemoryReservations = Arc<Mutex<BTreeMap<AppId, ReservedMemory>>>;
 
 pub(crate) struct MemoryReservation {
     app_id: AppId,
@@ -97,6 +103,20 @@ impl HostState {
         app_id: &AppId,
         wanted: protocol::InstanceResources,
     ) -> Result<MemoryReservation, u64> {
+        self.reserve_with_readings(capacity_mib, app_id, wanted, None)
+            .await
+    }
+
+    pub(crate) async fn reserve_with_readings(
+        &self,
+        capacity_mib: u64,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+        measured: Option<(
+            crate::config::MemoryAdmissionMode,
+            crate::domain::memory_admission::MemoryReadings,
+        )>,
+    ) -> Result<MemoryReservation, u64> {
         let snapshot = self.snapshot.read().await;
         let mut reservations = self
             .memory_reservations
@@ -109,13 +129,35 @@ impl HostState {
             .cloned()
             .collect();
         let mut committed = crate::domain::report::capacity::committed_resources(&records);
-        committed.extend(reservations.values().copied());
-        let shortfall =
+        committed.extend(reservations.values().map(|reserved| reserved.resources));
+        let strict_shortfall =
             crate::domain::report::capacity::memory_shortfall_mib(capacity_mib, &committed, &wanted);
+        let mut shortfall = strict_shortfall;
+        let mut bytes = (u64::from(wanted.memory_mib) + 64) * 1_048_576;
+        if let Some((mode, readings)) =
+            measured.filter(|(_, readings)| readings.is_fresh(crate::clock::now_ms()))
+        {
+            bytes = readings.ceiling(app_id, wanted);
+            let reserved_bytes = reservations
+                .values()
+                .fold(0u64, |total, held| total.saturating_add(held.bytes));
+            let measured_shortfall = readings.shortfall_mib(capacity_mib, &records, reserved_bytes, bytes);
+            tracing::info!(%app_id, ?mode, strict_shortfall_mib = strict_shortfall,
+                measured_shortfall_mib = measured_shortfall, "memory admission evaluated");
+            if mode == crate::config::MemoryAdmissionMode::Adaptive {
+                shortfall = measured_shortfall;
+            }
+        }
         if shortfall > 0 {
             return Err(shortfall);
         }
-        reservations.insert(app_id.clone(), wanted);
+        reservations.insert(
+            app_id.clone(),
+            ReservedMemory {
+                resources: wanted,
+                bytes,
+            },
+        );
         Ok(MemoryReservation {
             app_id: app_id.clone(),
             reservations: self.memory_reservations.clone(),
@@ -282,6 +324,65 @@ mod tests {
     use super::*;
     use crate::test_support::{app_id, instance_record, volume_id};
     use protocol::{InstanceState, VolumeState};
+
+    fn measured(
+        mode: crate::config::MemoryAdmissionMode,
+        available_mib: u64,
+    ) -> Option<(
+        crate::config::MemoryAdmissionMode,
+        crate::domain::memory_admission::MemoryReadings,
+    )> {
+        Some((
+            mode,
+            crate::domain::memory_admission::MemoryReadings {
+                available_bytes: available_mib * 1_048_576,
+                headroom_bytes: 1024 * 1_048_576,
+                measured_at_ms: crate::clock::now_ms(),
+                apps: BTreeMap::new(),
+                ceilings: BTreeMap::new(),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn measured_starts_reserve_headroom_atomically_and_release_cancelled_capacity() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        let wanted = protocol::DEFAULT_INSTANCE_RESOURCES;
+        let available = 1024 + u64::from(wanted.memory_mib) + 64;
+        let first_id = app_id();
+        let second_id = AppId::parse("app-2").unwrap();
+        let (first, second) = tokio::join!(
+            state.reserve_with_readings(8192, &first_id, wanted, measured(Adaptive, available)),
+            state.reserve_with_readings(8192, &second_id, wanted, measured(Adaptive, available))
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        drop(first);
+        drop(second);
+        assert!(state
+            .reserve_with_readings(8192, &second_id, wanted, measured(Adaptive, available))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn observation_preserves_strict_admission_even_when_the_host_measurement_disagrees() {
+        use crate::config::MemoryAdmissionMode::{Adaptive, Observe};
+        let state = HostState::shared();
+        let wanted = protocol::DEFAULT_INSTANCE_RESOURCES;
+        assert!(state
+            .reserve_with_readings(8192, &app_id(), wanted, measured(Observe, 0))
+            .await
+            .is_ok());
+        assert!(state
+            .reserve_with_readings(8192, &app_id(), wanted, measured(Adaptive, 0))
+            .await
+            .is_err());
+        assert!(state
+            .reserve_with_readings(0, &app_id(), wanted, measured(Observe, 8192))
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn simultaneous_starts_and_wakes_cannot_reserve_the_same_capacity() {

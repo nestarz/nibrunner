@@ -3,6 +3,7 @@ pub mod backoff;
 pub mod exports;
 pub mod filesystem;
 pub mod health;
+pub(crate) mod memory_admission;
 pub mod meters;
 pub mod metrics;
 pub mod reconcile;

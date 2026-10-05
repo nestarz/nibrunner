@@ -52,7 +52,7 @@ Reclaim runs before the sleep deadline to give page reporting time to complete.
 
 This can reduce resident memory and improve snapshot compressibility. Full snapshots still read
 all guest memory, and guests may allocate their full limit again. Admission therefore continues
-to reserve the configured limit. Reporting is not a promise that more guests fit concurrently.
+to reserve the configured limit by default. Reporting is not a promise that more guests fit concurrently.
 
 ### The memory limit is enforced
 
@@ -60,7 +60,7 @@ Each reported instance can include a `memory` reading from its host cgroup: curr
 bytes, swap bytes, memory pressure totals, high-limit events and OOM kills. An absent reading
 means that the cgroup could not be measured, not that the VM uses no memory. The peak is optional
 on kernels that do not expose it. Regular readings travel with the report heartbeat; a new OOM
-is reported immediately. These observations do not change admission or increase a VM's limit.
+is reported immediately. These observations do not increase a VM's limit.
 
 A reconcile pass boots an app only if its memory fits alongside every app that is up or starting,
 including the ones started earlier in the same pass. An app that does not fit stays `pending`,
@@ -71,6 +71,32 @@ a host that runs 240 at once, 240 boot and the rest follow as the first ones sle
 does not fit is refused the same way, and its request gets a 503. The number of waiting starts
 is logged once per pass and counted in
 `nibrunner_start_refusals_total{reason="no_room"}`.
+
+### Measured admission
+
+Start with observation mode. It logs the strict and measured shortfalls for each start or wake,
+while enforcing the existing strict decision:
+
+```toml
+[memory_admission]
+mode = "observe"
+headroom_mib = 1024
+```
+
+Restart the daemon after changing this section. Omit it to retain strict admission without
+additional sampling. Set `mode = "adaptive"` to enforce the measured decision after validation.
+
+A running VM reserves its observed peak, including swapped pages, plus the greater of 25 percent
+or 64 MiB, up to its enforced ceiling. Without a kernel peak, the current reading is used.
+New and starting VMs reserve their full host memory budget. Missing, old, unbounded or
+previous-process samples also reserve the full budget. Samples must be at most five seconds old.
+Targets must fit the host's guest-memory budget; expected growth and concurrent startup
+reservations must also fit `MemAvailable` after the configured headroom. Swap capacity is not
+added to this budget. If host memory cannot be read, the strict policy applies.
+
+Adaptive admission can admit guests whose combined ceilings exceed physical RAM. It does not yet
+reclaim idle guests under pressure, coordinate external builds, or guarantee capacity for
+simultaneous growth. Keep observation mode until the workload and pressure handling are validated.
 
 ## Changing it
 
