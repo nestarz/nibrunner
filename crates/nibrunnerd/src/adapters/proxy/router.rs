@@ -289,6 +289,9 @@ impl Router {
                 Some(route),
             );
         };
+        if self.state.is_snapshotting(&route.app_id).await {
+            drop(self.state.transition(&route.app_id).await);
+        }
         let upstream = self.upstreams.to(&route.app_id).await;
         let response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
         let reached = response.extensions().get::<Unreachable>().is_none();
