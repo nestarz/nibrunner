@@ -131,7 +131,6 @@ impl VmProcesses {
             .arg(format!("--property=MemoryHigh={}", memory.high))
             .arg(format!("--property=MemoryMax={}", memory.max))
             .arg(format!("--property=MemorySwapMax={}", memory.swap))
-            .arg("--property=MemoryOOMGroup=yes")
             .arg("--")
             .arg(binary);
         command

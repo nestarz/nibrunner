@@ -21,6 +21,78 @@ fn commands() -> Arc<dyn CommandRunner> {
     Arc::new(nibrunnerd::adapters::exec::HostCommands)
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use nibrunnerd::adapters::vm::process::VmProcesses;
+    use nibrunnerd::config::{VmBudget, VmBudgets};
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("helper.sh");
+    std::fs::write(&helper, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for priority in [
+        protocol::MemoryPriority::Production,
+        protocol::MemoryPriority::Preview,
+    ] {
+        let processes = VmProcesses::with_budgets(
+            directory.path().join("run"),
+            Some(VmBudgets {
+                default: VmBudget {
+                    cpu_percent: 100.try_into().unwrap(),
+                    memory_mib: 128.try_into().unwrap(),
+                    memory: Some(protocol::MemoryPolicy {
+                        target_mib: 32.try_into().unwrap(),
+                        swap_mib: 64,
+                        priority,
+                    }),
+                },
+                apps: Default::default(),
+            }),
+        );
+        let app = protocol::AppId::parse("scope-check").unwrap();
+        processes
+            .spawn(&app, &helper, directory.path(), None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let observed = loop {
+            let memory = processes.memory(&app);
+            if memory
+                .as_ref()
+                .and_then(|m| m.limits.as_ref())
+                .is_some_and(|l| l.max_bytes == Some(128 * 1024 * 1024))
+            {
+                break memory;
+            }
+            if tokio::time::Instant::now() >= deadline || processes.status(&app).exit.is_some() {
+                break None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let console = std::fs::read_to_string(processes.console_path(&app)).unwrap_or_default();
+        processes.stop(&app).await;
+        let limits = observed
+            .and_then(|m| m.limits)
+            .unwrap_or_else(|| panic!("the scope did not start: {console}"));
+        let production = priority == protocol::MemoryPriority::Production;
+        assert_eq!(limits.low_bytes, if production { 32 * 1024 * 1024 } else { 0 });
+        assert_eq!(
+            limits.high_bytes,
+            Some(if production {
+                128 * 1024 * 1024
+            } else {
+                32 * 1024 * 1024
+            })
+        );
+        assert_eq!(limits.swap_max_bytes, Some(64 * 1024 * 1024));
+    }
+}
+
 /// Volumes as files under `directory`, over a store holding `archive` for whichever volume asks.
 fn local_volumes(
     directory: &std::path::Path,
