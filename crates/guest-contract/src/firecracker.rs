@@ -10,7 +10,7 @@ pub fn layer_drive_id(index: usize) -> String {
     format!("layer{index}")
 }
 
-const BASE_KERNEL_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd clocksource=kvm-clock root=/dev/vda ro init=/init";
+const BASE_KERNEL_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd clocksource=kvm-clock page_reporting.page_reporting_order=4 root=/dev/vda ro init=/init";
 
 pub fn netmask_for(prefix_length: u8) -> String {
     let mask: u32 = if prefix_length == 0 {
@@ -277,6 +277,7 @@ mod tests {
             assert!(args.contains(flag));
         }
         assert!(args.contains("clocksource=kvm-clock"));
+        assert!(args.contains("page_reporting.page_reporting_order=4"));
         assert!(!args.contains("i8042.nopnp"));
         assert!(args.contains("ip=10.201.0.14::10.201.0.13:255.255.255.252::eth0:off"));
         assert!(args.contains("root=/dev/vda ro init=/init"));

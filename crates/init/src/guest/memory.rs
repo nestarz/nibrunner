@@ -96,3 +96,18 @@ pub(crate) fn read() -> Option<Reading> {
         oom_kills: field(&value("memory.events")?, "oom_kill")?,
     })
 }
+
+pub(crate) fn reclaim(reclaimer: &mut crate::reclaim::Reclaimer) -> std::io::Result<()> {
+    let stat = std::fs::read_to_string(format!("{TENANT_CGROUP}/memory.stat"))?;
+    let bytes = field(&stat, "file")
+        .unwrap_or(0)
+        .saturating_sub(field(&stat, "shmem").unwrap_or(0));
+    let bytes = bytes.min(64 * 1024 * 1024);
+    if bytes == 0 {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("{TENANT_CGROUP}/memory.reclaim"))?;
+    reclaimer.reclaim(file, bytes, std::time::Duration::from_millis(500))
+}

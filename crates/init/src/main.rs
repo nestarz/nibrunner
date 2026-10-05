@@ -12,8 +12,19 @@ mod ceiling;
 )]
 mod supervise;
 
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod reclaim;
+
 #[cfg(target_os = "linux")]
 mod guest;
+
+#[cfg(test)]
+fn child_process_guard() -> std::sync::MutexGuard<'static, ()> {
+    // PID 1's supervisor tests reap every child, including helpers from other tests.
+    static CHILDREN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CHILDREN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]

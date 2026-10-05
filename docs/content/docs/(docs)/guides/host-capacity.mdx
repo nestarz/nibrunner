@@ -42,6 +42,14 @@ reclaim their physical memory without reducing the guest's configured memory lim
 target remains zero; no polling controller or forced inflation is used. The bundled kernel must
 enable `CONFIG_MEMORY_BALLOON`, `CONFIG_VIRTIO_BALLOON` and `CONFIG_PAGE_REPORTING`.
 
+For traffic-idle apps, the host requests one guest reclaim after half the idle timeout, with a
+minimum quiet period of 30 seconds. Open requests, stale activity readings and always-running
+apps prevent this request. The guest requests up to 64 MiB of file-backed cache reclaim per quiet
+period, with a 500 ms execution budget. The kernel can reclaim more or less than requested.
+A failed or partial reclaim does not stop the app.
+The kernel reports free blocks from 64 KiB, so smaller free regions can return to the host.
+Reclaim runs before the sleep deadline to give page reporting time to complete.
+
 This can reduce resident memory and improve snapshot compressibility. Full snapshots still read
 all guest memory, and guests may allocate their full limit again. Admission therefore continues
 to reserve the configured limit. Reporting is not a promise that more guests fit concurrently.
