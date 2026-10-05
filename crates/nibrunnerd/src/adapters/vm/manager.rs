@@ -380,6 +380,13 @@ impl Vmm for VmManager {
         self.processes.adopted_app_ids()
     }
 
+    async fn memory(&self, app_ids: &[AppId]) -> std::collections::BTreeMap<AppId, protocol::ReportedMemory> {
+        app_ids
+            .iter()
+            .filter_map(|id| self.processes.memory(id).map(|memory| (id.clone(), memory)))
+            .collect()
+    }
+
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
         // The deployment its output should be stamped with is the one the record remembers. A
         // guest this host holds no record of has nothing to attribute its lines to, so it is left

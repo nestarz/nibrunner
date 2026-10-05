@@ -206,6 +206,14 @@ impl VmProcesses {
         }
     }
 
+    pub fn memory(&self, app_id: &AppId) -> Option<protocol::ReportedMemory> {
+        let record = self.read_record(app_id)?;
+        if record.host_boot_id != self.boot_id || record.exit().is_some() || !is_alive(record.pid) {
+            return None;
+        }
+        super::memory::read_process(record.pid)
+    }
+
     pub async fn spawn(
         &self,
         app_id: &AppId,

@@ -417,6 +417,16 @@
             "$ref": "#/$defs/Sha256Digest"
           }
         },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportedMemory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "message": {
           "anyOf": [
             {
@@ -452,6 +462,61 @@
         "deploymentId",
         "state",
         "restartCount"
+      ]
+    },
+    "ReportedMemory": {
+      "type": "object",
+      "properties": {
+        "currentBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "highEvents": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "measuredAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "oomKills": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "peakBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pressureFullUs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pressureSomeUs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "swapBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "measuredAt",
+        "currentBytes",
+        "swapBytes",
+        "highEvents",
+        "oomKills",
+        "pressureSomeUs",
+        "pressureFullUs"
       ]
     },
     "ReportedRestart": {

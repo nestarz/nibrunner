@@ -32,7 +32,7 @@ after how long, is set per instance in `desired.json`.
 
 | `sleepWhen` | The microVM is suspended when |
 | --- | --- |
-| `{ "kind": "traffic-idle", "timeoutMs": N }` | Nothing has been sent to it for `N` ms. A request or stream the proxy is still carrying counts as traffic, however quiet it is. |
+| `{ "kind": "traffic-idle", "timeoutMs": N }` | No client-initiated traffic for `N` ms. A request or stream the proxy is still carrying counts as activity, however quiet it is. Replies to the guest's own outbound connections do not renew activity. |
 | `{ "kind": "max-lifetime", "ttlMs": N }` | It has been up for `N` ms, busy or not. A request still open at that point is given up to 30 s more to finish. |
 | `{ "kind": "never" }` | Never. Only `desired.json` takes it down. |
 

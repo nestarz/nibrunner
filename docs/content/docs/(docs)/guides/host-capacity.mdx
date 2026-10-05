@@ -48,6 +48,12 @@ to reserve the configured limit. Reporting is not a promise that more guests fit
 
 ### The memory limit is enforced
 
+Each reported instance can include a `memory` reading from its host cgroup: current and peak
+bytes, swap bytes, memory pressure totals, high-limit events and OOM kills. An absent reading
+means that the cgroup could not be measured, not that the VM uses no memory. The peak is optional
+on kernels that do not expose it. Regular readings travel with the report heartbeat; a new OOM
+is reported immediately. These observations do not change admission or increase a VM's limit.
+
 A reconcile pass boots an app only if its memory fits alongside every app that is up or starting,
 including the ones started earlier in the same pass. An app that does not fit stays `pending`,
 with the shortfall on its record

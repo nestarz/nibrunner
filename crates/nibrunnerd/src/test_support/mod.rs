@@ -205,6 +205,7 @@ pub fn desired_export(edit: impl FnOnce(&mut DesiredExport)) -> DesiredExport {
 
 pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedInstance {
     let mut value = ReportedInstance {
+        memory: None,
         app_id: app_id(),
         deployment_id: deployment_id(),
         state: InstanceState::Running,

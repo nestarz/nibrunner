@@ -185,6 +185,9 @@ pub trait Vmm: Send + Sync {
     async fn delete_tap(&self, tap_name: &str) -> Result<(), VmError>;
     async fn tap_names(&self) -> Vec<String>;
     async fn statuses(&self, app_ids: &[AppId]) -> BTreeMap<AppId, VmStatus>;
+    async fn memory(&self, _app_ids: &[AppId]) -> BTreeMap<AppId, protocol::ReportedMemory> {
+        BTreeMap::new()
+    }
     async fn adopted_app_ids(&self) -> Vec<AppId>;
     /// Listen again for the log output of a microVM adopted from an earlier daemon run. The
     /// guest keeps its end of the socket across a daemon restart, but a fresh receiver never

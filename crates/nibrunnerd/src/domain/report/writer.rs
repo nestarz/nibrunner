@@ -26,7 +26,7 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
     };
     let allocatable = allocatable_capacity(&capacity, &committed_resources(&records), space.available_bytes);
 
-    build_reported_state(ReportInputs {
+    let mut report = build_reported_state(ReportInputs {
         host_id: host_id_of(host).await,
         reported_at: now_timestamp(),
         state: if snapshot.converged {
@@ -45,7 +45,16 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
         accepted_digest: snapshot.accepted_digest.clone(),
         accepted_revision: snapshot.accepted_revision.clone(),
         message: snapshot.desired_refusal.clone(),
-    })
+    });
+    let ids = records
+        .iter()
+        .map(|record| record.app_id.clone())
+        .collect::<Vec<_>>();
+    let mut memory = host.vms.memory(&ids).await;
+    for instance in &mut report.instances {
+        instance.memory = memory.remove(&instance.app_id);
+    }
+    report
 }
 
 /// Whether a report says what the one before it said.
@@ -56,11 +65,26 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
 /// is compared without being remembered here. What this excuses is carried by the heartbeat the
 /// reporter writes on anyway, which is why free space can be up to that far behind.
 pub fn says_the_same(held: &HostReportedState, built: &HostReportedState) -> bool {
+    let mut instances = built.instances.clone();
+    for instance in &mut instances {
+        if let Some(previous) = held
+            .instances
+            .iter()
+            .find(|previous| previous.app_id == instance.app_id)
+        {
+            if let (Some(memory), Some(previous)) = (&mut instance.memory, &previous.memory) {
+                let oom_kills = memory.oom_kills;
+                *memory = previous.clone();
+                memory.oom_kills = oom_kills;
+            }
+        }
+    }
     *held
         == HostReportedState {
             reported_at: held.reported_at.clone(),
             capacity: held.capacity,
             allocatable: held.allocatable,
+            instances,
             ..built.clone()
         }
 }
@@ -87,6 +111,32 @@ mod tests {
 
     fn versions() -> HostVersions {
         crate::domain::report::versions::compiled_versions("v1.16.1", "6.1.180-test")
+    }
+
+    #[tokio::test]
+    async fn memory_samples_use_the_heartbeat_but_a_new_oom_is_reported_immediately() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let mut previous = build(&host, versions()).await;
+        previous.instances[0].memory = Some(protocol::ReportedMemory {
+            measured_at: now_timestamp(),
+            current_bytes: 256 << 20,
+            peak_bytes: Some(300 << 20),
+            swap_bytes: 0,
+            high_events: 0,
+            oom_kills: 0,
+            pressure_some_us: 0,
+            pressure_full_us: 0,
+        });
+        let mut next = previous.clone();
+        let memory = next.instances[0].memory.as_mut().unwrap();
+        memory.current_bytes += 4096;
+        memory.pressure_some_us += 100;
+        assert!(says_the_same(&previous, &next));
+        next.instances[0].memory.as_mut().unwrap().oom_kills += 1;
+        assert!(!says_the_same(&previous, &next));
+        next.instances[0].memory = None;
+        assert!(!says_the_same(&previous, &next));
     }
 
     #[tokio::test]

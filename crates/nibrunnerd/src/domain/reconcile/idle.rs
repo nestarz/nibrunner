@@ -64,10 +64,8 @@ pub fn activity_after(
     for (app_id, after) in taken {
         let before = previous_traffic.get(&app_id);
         let recorded = previous_moments.get(&app_id).copied();
-        // Inbound only. What a guest sends of its own accord — a poll outward, a heartbeat to
-        // something else — is metered but is not somebody asking for the app, and reading it as
-        // activity would keep an app that talks to itself awake for ever.
-        if before.is_some_and(|before| after.received.bytes > before.received.bytes) {
+        // Replies to guest-initiated connections remain bandwidth, not incoming work.
+        if before.is_some_and(|before| after.activity.bytes > before.activity.bytes) {
             moved.insert(app_id.clone());
         }
         let moment = if moved.contains(&app_id) {
@@ -372,6 +370,7 @@ mod activity_tests {
         AppTraffic {
             received: Counted { packets: 1, bytes },
             sent: Counted::default(),
+            activity: Counted { packets: 1, bytes },
         }
     }
 
@@ -396,6 +395,26 @@ mod activity_tests {
 
     fn measured(at: i64) -> BTreeMap<AppId, i64> {
         BTreeMap::from([(app_id(), at)])
+    }
+
+    #[test]
+    fn replies_to_background_polling_do_not_renew_activity() {
+        let (traffic, moments) = previously(1024, EARLIER);
+        let mut taken = reading(1024);
+        let poll = taken.get_mut(&app_id()).unwrap();
+        poll.received.bytes += 4096;
+        poll.sent.bytes += 512;
+        let after = activity_after(
+            taken,
+            &traffic,
+            &moments,
+            &measured(EARLIER),
+            &nobody_answering(),
+            NOW,
+        );
+        assert!(after.moved.is_empty());
+        assert_eq!(after.last_active_at_ms[&app_id()], EARLIER);
+        assert_eq!(after.traffic[&app_id()].received.bytes, 5120);
     }
 
     #[test]

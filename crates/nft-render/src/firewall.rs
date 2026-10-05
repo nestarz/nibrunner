@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use protocol::{AppId, GuestPort, HostPort, Ipv4Address};
 
 use crate::slot::{GUEST_NETWORK_CIDR, TAP_NAME_PREFIX};
@@ -37,10 +39,15 @@ pub fn app_sent_counter_name(app_id: &AppId) -> String {
     format!("{APP_SENT_COUNTER_PREFIX}{app_id}")
 }
 
+pub fn app_activity_counter_name(app_id: &AppId) -> String {
+    format!("{APP_ACTIVITY_COUNTER_PREFIX}{app_id}")
+}
+
 // Which way a counter faces is in its name rather than in where it is used, because what reads
 // them back is handed a flat list of counters and their names are all it has to go on.
 pub const APP_RECEIVED_COUNTER_PREFIX: &str = "rx_";
 pub const APP_SENT_COUNTER_PREFIX: &str = "tx_";
+pub const APP_ACTIVITY_COUNTER_PREFIX: &str = "work_";
 
 /// One host port carried to one guest port. Nothing forwards a port no document named.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,7 @@ pub struct ForwardedInstance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FirewallState {
+    pub allowed_host_tcp_endpoints: Vec<SocketAddr>,
     pub instances: Vec<ForwardedInstance>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
@@ -93,6 +101,7 @@ fn counter_objects(state: &FirewallState) -> Vec<String> {
             [
                 app_received_counter_name(&instance.app_id),
                 app_sent_counter_name(&instance.app_id),
+                app_activity_counter_name(&instance.app_id),
             ]
         })
         .flat_map(|name| {
@@ -129,7 +138,7 @@ pub fn render_ruleset(state: &FirewallState) -> String {
     let mut v4_body = counter_objects(state);
     v4_body.extend(forward_chain_v4(state));
     v4_body.push(String::new());
-    v4_body.extend(input_chain_v4());
+    v4_body.extend(input_chain_v4(state));
     v4_body.push(String::new());
     v4_body.extend(nat_chains_v4(state));
     v4_body.push(String::new());
@@ -138,7 +147,7 @@ pub fn render_ruleset(state: &FirewallState) -> String {
     lines.push(String::new());
     let mut v6_body = forward_chain_v6(state);
     v6_body.push(String::new());
-    v6_body.extend(input_chain_v6());
+    v6_body.extend(input_chain_v6(state));
     lines.extend(table("ip6", v6_body));
     format!("{}\n", lines.join("\n"))
 }
@@ -149,12 +158,19 @@ fn traffic_chains_v4(state: &FirewallState) -> Vec<String> {
     }
     let tap = tap_match();
     let mut output_rules = vec!["type filter hook output priority filter; policy accept;".to_string()];
-    output_rules.extend(state.instances.iter().map(|instance| {
-        format!(
-            "ip saddr 127.0.0.0/8 ip daddr {} counter name {}",
-            instance.guest_ipv4,
-            app_received_counter_name(&instance.app_id)
-        )
+    output_rules.extend(state.instances.iter().flat_map(|instance| {
+        [
+            format!(
+                "ip saddr 127.0.0.0/8 ip daddr {} counter name {}",
+                instance.guest_ipv4,
+                app_received_counter_name(&instance.app_id)
+            ),
+            format!(
+                "ip saddr 127.0.0.0/8 ip daddr {} ct direction original counter name {}",
+                instance.guest_ipv4,
+                app_activity_counter_name(&instance.app_id)
+            ),
+        ]
     }));
 
     // What a guest answers the proxy with is addressed to this host, so it is never forwarded and
@@ -181,6 +197,11 @@ fn traffic_chains_v4(state: &FirewallState) -> Vec<String> {
                 "iifname != {tap} oifname {tap} ip daddr {} counter name {}",
                 instance.guest_ipv4,
                 app_received_counter_name(&instance.app_id)
+            ),
+            format!(
+                "iifname != {tap} oifname {tap} ip daddr {} ct direction original counter name {}",
+                instance.guest_ipv4,
+                app_activity_counter_name(&instance.app_id)
             ),
             // Only what was let out. The forward chain at the priority above this one rejects a
             // guest reaching another guest, a private destination, or an address the host denies
@@ -241,16 +262,37 @@ fn forward_chain_v4(state: &FirewallState) -> Vec<String> {
     chain("forward {", &rules)
 }
 
-fn input_chain_v4() -> Vec<String> {
+fn input_chain_v4(state: &FirewallState) -> Vec<String> {
+    input_chain(state, true)
+}
+
+fn input_chain(state: &FirewallState, ipv4: bool) -> Vec<String> {
     let tap = tap_match();
-    chain(
-        "input {",
-        &[
-            "type filter hook input priority filter; policy accept;".to_string(),
-            format!("iifname {tap} ct state established,related accept"),
-            format!("iifname {tap} {DENY} comment \"guest to host\""),
-        ],
-    )
+    let (daddr, denied) = if ipv4 {
+        ("ip daddr", &state.denied_egress_addresses_v4)
+    } else {
+        ("ip6 daddr", &state.denied_egress_addresses_v6)
+    };
+    let mut rules = vec!["type filter hook input priority filter; policy accept;".to_string()];
+    // Only replies to host-initiated flows bypass the endpoint list, so removing an endpoint
+    // also closes guest-initiated connections that were already established.
+    rules.push(format!(
+        "iifname {tap} ct direction reply ct state established,related accept"
+    ));
+    rules.extend(denied_egress_rules(&tap, daddr, denied));
+    for endpoint in state
+        .allowed_host_tcp_endpoints
+        .iter()
+        .filter(|e| e.is_ipv4() == ipv4)
+    {
+        rules.push(format!(
+            "iifname {tap} {daddr} {} tcp dport {} accept comment \"allowed host endpoint\"",
+            endpoint.ip(),
+            endpoint.port()
+        ));
+    }
+    rules.push(format!("iifname {tap} {DENY} comment \"guest to host\""));
+    chain("input {", &rules)
 }
 
 fn forward_chain_v6(state: &FirewallState) -> Vec<String> {
@@ -273,16 +315,8 @@ fn forward_chain_v6(state: &FirewallState) -> Vec<String> {
     chain("forward {", &rules)
 }
 
-fn input_chain_v6() -> Vec<String> {
-    let tap = tap_match();
-    chain(
-        "input {",
-        &[
-            "type filter hook input priority filter; policy accept;".to_string(),
-            format!("iifname {tap} ct state established,related accept"),
-            format!("iifname {tap} {DENY} comment \"guest to host\""),
-        ],
-    )
+fn input_chain_v6(state: &FirewallState) -> Vec<String> {
+    input_chain(state, false)
 }
 
 fn nat_chains_v4(state: &FirewallState) -> Vec<String> {
@@ -372,8 +406,51 @@ mod tests {
     fn state(instances: Vec<ForwardedInstance>, v4: &[&str], v6: &[&str]) -> FirewallState {
         FirewallState {
             instances,
+            allowed_host_tcp_endpoints: vec![],
             denied_egress_addresses_v4: v4.iter().map(|s| s.to_string()).collect(),
             denied_egress_addresses_v6: v6.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn only_named_host_tcp_endpoints_are_allowed_and_denies_take_precedence() {
+        let mut configured = state(vec![], &["203.0.113.0/24"], &["2001:db8::/32"]);
+        configured.allowed_host_tcp_endpoints = vec![
+            "203.0.113.10:443".parse().unwrap(),
+            "[2001:db8::10]:443".parse().unwrap(),
+        ];
+        for ipv4 in [true, false] {
+            let rules = input_chain(&configured, ipv4).join("\n");
+            let address = if ipv4 {
+                "ip daddr 203.0.113.10"
+            } else {
+                "ip6 daddr 2001:db8::10"
+            };
+            let allowed = format!("iifname \"nbr*\" {address} tcp dport 443 accept");
+            let allow_at = rules.find(&allowed).unwrap();
+            assert!(rules.find("denied egress").unwrap() < allow_at);
+            assert!(allow_at < rules.find("guest to host").unwrap());
+            assert!(rules.contains("ct direction reply ct state established,related accept"));
+            assert!(!rules.contains("tcp dport 22"));
+            assert!(!rules.contains("udp dport"));
+            assert_eq!(rules.matches("allowed host endpoint").count(), 1);
+        }
+    }
+
+    #[test]
+    fn removing_host_endpoints_revokes_guest_initiated_connections() {
+        for ipv4 in [true, false] {
+            let rules = input_chain(&FirewallState::default(), ipv4).join("\n");
+            assert!(!rules.contains("allowed host endpoint"));
+            assert_eq!(
+                rules
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with("iifname") && line.ends_with(" accept"))
+                    .count(),
+                1
+            );
+            assert!(rules.contains("ct direction reply ct state established,related accept"));
+            assert!(rules.contains("reject comment \"guest to host\""));
         }
     }
 
@@ -588,7 +665,11 @@ mod tests {
             .map(str::trim)
             .filter(|l| l.contains("ip saddr 127.0.0.0/8") && l.contains("counter name"))
             .collect();
-        assert_eq!(loopback.len(), 1, "one counter for the app, not one per port");
+        assert_eq!(
+            loopback.len(),
+            2,
+            "bandwidth and activity, independent of port count"
+        );
         assert!(
             !loopback[0].contains("dport"),
             "a counter that named a port would read an ssh session as an app gone quiet: {}",
@@ -622,7 +703,7 @@ mod tests {
             .map(str::trim)
             .filter(|l| l.contains("ip saddr 127.0.0.0/8") && l.contains("counter name"))
             .collect();
-        assert_eq!(loopback.len(), 1);
+        assert_eq!(loopback.len(), 2);
         assert!(loopback[0].contains("ip daddr 10.201.0.2"));
         assert!(loopback[0].contains(&received));
         let forwarded: Vec<&str> = ruleset
@@ -630,7 +711,7 @@ mod tests {
             .map(str::trim)
             .filter(|l| l.contains("oifname \"nbr*\" ip daddr") && l.contains("counter name"))
             .collect();
-        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded.len(), 2);
         assert!(ruleset.contains("type filter hook forward priority filter + 10;"));
         let empty = render_ruleset(&state(vec![], &[], &[]));
         assert!(!empty.contains("counter "));
@@ -661,7 +742,7 @@ mod tests {
 
         // What the guest is sent and what it sends are never added into one figure.
         let counted: Vec<&str> = ruleset.lines().filter(|l| l.contains("counter name")).collect();
-        assert_eq!(counted.len(), 4);
+        assert_eq!(counted.len(), 6);
         let received = app_received_counter_name(&instance().app_id);
         assert_eq!(
             counted.iter().filter(|l| l.contains(&received)).count(),
@@ -669,6 +750,23 @@ mod tests {
             "the proxy dialling it, and what is forwarded to it"
         );
         assert_eq!(counted.iter().filter(|l| l.contains(&sent)).count(), 2);
+    }
+
+    #[test]
+    fn activity_counts_only_client_initiated_traffic_without_changing_bandwidth() {
+        let ruleset = render_ruleset(&state(vec![instance()], &[], &[]));
+        let activity = app_activity_counter_name(&instance().app_id);
+        let rules: Vec<_> = ruleset
+            .lines()
+            .filter(|line| line.contains("counter name"))
+            .collect();
+        let work: Vec<_> = rules.iter().filter(|line| line.contains(&activity)).collect();
+        assert_eq!(work.len(), 2);
+        assert!(work.iter().all(|line| line.contains("ct direction original")));
+        assert!(rules
+            .iter()
+            .filter(|line| !line.contains(&activity))
+            .all(|line| !line.contains("ct direction")));
     }
 
     #[test]

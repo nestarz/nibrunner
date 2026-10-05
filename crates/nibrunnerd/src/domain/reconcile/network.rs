@@ -45,6 +45,7 @@ pub async fn forwarded_instances(host: &Host) -> Vec<ForwardedInstance> {
 pub async fn apply_network(host: &Host) {
     let state = FirewallState {
         instances: forwarded_instances(host).await,
+        allowed_host_tcp_endpoints: host.config.allowed_host_tcp_endpoints.clone(),
         denied_egress_addresses_v4: host.config.denied_egress_addresses_v4.clone(),
         denied_egress_addresses_v6: host.config.denied_egress_addresses_v6.clone(),
     };

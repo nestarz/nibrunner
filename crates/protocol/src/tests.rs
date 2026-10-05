@@ -179,6 +179,7 @@ fn identifiers_timestamps_and_addresses_are_checked() {
 #[test]
 fn a_report_omits_what_it_does_not_know() {
     let instance = ReportedInstance {
+        memory: None,
         app_id: AppId::parse("app-1").unwrap(),
         deployment_id: DeploymentId::parse("dep-1").unwrap(),
         state: InstanceState::Running,
@@ -557,6 +558,7 @@ mod schema {
                 message: Some(StateMessage::new("mounted")),
             }],
             instances: vec![ReportedInstance {
+        memory: None,
                 app_id: AppId::parse("app-1").unwrap(),
                 deployment_id: DeploymentId::parse("dep-1").unwrap(),
                 state: InstanceState::Running,
