@@ -399,8 +399,24 @@ impl HostState {
                 };
                 total.saturating_add(resident)
             });
+            let snapshot_outside_pool = operation
+                == crate::domain::memory_admission::MemoryOperation::Snapshot
+                && readings.pool.as_ref().is_some_and(|pool| {
+                    app_id
+                        .and_then(|app| readings.apps.get(app))
+                        .and_then(|memory| memory.cgroup.as_deref())
+                        .is_some_and(|group| !pool.contains(group))
+                });
+            // Legacy scopes must be able to drain even when their ceilings exceed the new pool.
+            if snapshot_outside_pool {
+                readings.pool = None;
+            }
             let measured_shortfall = readings.shortfall_mib(
-                capacity_mib,
+                if snapshot_outside_pool {
+                    u64::MAX
+                } else {
+                    capacity_mib
+                },
                 &records,
                 reserved_bytes,
                 resident_reserved_bytes,
@@ -415,11 +431,12 @@ impl HostState {
                 ?owner,
                 ?mode,
                 effective_adaptive,
+                snapshot_outside_pool,
                 strict_shortfall_mib = strict_shortfall,
                 measured_shortfall_mib = measured_shortfall,
                 "memory admission evaluated"
             );
-            if effective_adaptive {
+            if effective_adaptive || snapshot_outside_pool {
                 shortfall = measured_shortfall;
             } else if readings.pool.is_some() {
                 shortfall = strict_shortfall
@@ -739,6 +756,45 @@ mod tests {
                 )
                 .await;
             assert_eq!(result.is_ok(), allowed);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshots_can_drain_into_a_smaller_pool_but_still_need_physical_headroom() {
+        use crate::config::MemoryAdmissionMode::Observe;
+        use crate::domain::memory_admission::MemoryOperation::Snapshot;
+        let state = HostState::shared();
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(1));
+            }))
+            .await;
+        for (available, membership, allowed) in [
+            (8192, "/legacy.scope", true),
+            (1024, "/legacy.scope", false),
+            (8192, "/workloads.slice/app.scope", false),
+        ] {
+            let mut readings = frozen_readings(&state);
+            readings.available_bytes = available * 1_048_576;
+            readings.apps.get_mut(&app_id()).unwrap().cgroup = Some(membership.into());
+            readings.pool = Some(crate::domain::memory_admission::PoolMemory {
+                membership: "/workloads.slice".into(),
+                current_bytes: 1024 * 1_048_576,
+                high_bytes: 900 * 1_048_576,
+                max_bytes: 1024 * 1_048_576,
+                all_workloads_contained: false,
+            });
+            let result = state
+                .reserve_for_operation(
+                    1024,
+                    &app_id(),
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    Snapshot,
+                    Some((Observe, readings)),
+                )
+                .await;
+            assert_eq!(result.is_ok(), allowed, "{available}: {membership}");
         }
     }
 

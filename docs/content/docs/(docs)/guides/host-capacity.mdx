@@ -143,8 +143,9 @@ same quiet-app reclaim policy even while the host has free RAM elsewhere. Recove
 additional margin before reclaim stops.
 
 Existing VMs remain in their original scopes until they sleep and wake. While any live VM or
-external lease is outside the pool, admission reserves full host cgroup ceilings, including VM
-overhead, even in adaptive mode. Once all workloads are contained, adaptive admission can use
+external lease is outside the pool, starts reserve full host cgroup ceilings, including VM
+overhead, even in adaptive mode. A snapshot of a legacy VM outside the pool checks physical
+headroom without charging the new pool; otherwise a smaller pool could prevent migration. Once all workloads are contained, adaptive admission can use
 working-set estimates. Missing or stale pool readings refuse new reservations in both modes.
 The parent's hard limit contains combined spikes; it can still kill a workload if reclaim cannot
 keep up. Validate priorities and overload behavior before enabling adaptive admission.
