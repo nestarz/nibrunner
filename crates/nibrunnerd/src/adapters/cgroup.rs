@@ -87,10 +87,10 @@ impl Group {
     }
 
     pub(crate) async fn reclaim(&self, bytes: u64) -> io::Result<u64> {
-        if !self.frozen()? || bytes == 0 {
+        if bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "reclaim needs a frozen cgroup and a positive amount",
+                "reclaim needs a positive amount",
             ));
         }
         let current = || -> io::Result<u64> {
@@ -192,16 +192,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_is_bounded_and_refuses_a_running_group() {
+    async fn reclaim_is_bounded_and_works_without_a_host_freezer() {
         let directory = tempfile::tempdir().unwrap();
         let group = group(directory.path(), false);
         assert_eq!(
-            group.reclaim(u64::MAX).await.unwrap_err().kind(),
+            group.reclaim(0).await.unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
         assert!(!directory.path().join("memory.reclaim").exists());
-        std::fs::write(directory.path().join("cgroup.events"), "frozen 1\n").unwrap();
-        group.freeze().await.unwrap();
         assert_eq!(group.reclaim(u64::MAX).await.unwrap(), 0);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("memory.reclaim")).unwrap(),

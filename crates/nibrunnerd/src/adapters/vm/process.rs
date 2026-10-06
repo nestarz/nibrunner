@@ -257,6 +257,13 @@ impl VmProcesses {
     }
 
     pub async fn reclaim_frozen(&self, app_id: &AppId, bytes: u64) -> std::io::Result<u64> {
+        if !self.frozen(app_id)? {
+            return Err(std::io::Error::other("reclaim needs a frozen workload"));
+        }
+        self.reclaim_memory(app_id, bytes).await
+    }
+
+    pub async fn reclaim_memory(&self, app_id: &AppId, bytes: u64) -> std::io::Result<u64> {
         self.cgroup(app_id)?.reclaim(bytes).await
     }
 
