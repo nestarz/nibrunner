@@ -42,7 +42,7 @@ impl From<crate::domain::memory_admission::PoolMemory> for PoolPressure {
     fn from(pool: crate::domain::memory_admission::PoolMemory) -> Self {
         let low_bytes = pool.max_bytes.saturating_sub(pool.high_bytes);
         Self {
-            available_bytes: pool.max_bytes.saturating_sub(pool.current_bytes),
+            available_bytes: pool.max_bytes.saturating_sub(pool.working_set_bytes()),
             low_bytes,
             recovered_bytes: low_bytes
                 .saturating_add((low_bytes / 4).max(256 * BYTES_PER_MIB))
@@ -349,6 +349,7 @@ mod tests {
                 crate::domain::memory_admission::PoolMemory {
                     membership: "/workloads.slice".into(),
                     current_bytes: current_mib * BYTES_PER_MIB,
+                    reclaimable_file_bytes: 0,
                     high_bytes: 1800 * BYTES_PER_MIB,
                     max_bytes: 2048 * BYTES_PER_MIB,
                     all_workloads_contained: true,
@@ -360,6 +361,32 @@ mod tests {
         assert!(state.observe(read(1800), 1024));
         assert!(state.observe(read(1545), 1024));
         assert!(!state.observe(read(1544), 1024));
+    }
+
+    #[test]
+    fn clean_inactive_cache_does_not_suspend_apps_but_actual_stalls_still_do() {
+        let mut state = PressureState::default();
+        let pool = crate::domain::memory_admission::PoolMemory {
+            membership: "/workloads.slice".into(),
+            current_bytes: 2000 * BYTES_PER_MIB,
+            reclaimable_file_bytes: 600 * BYTES_PER_MIB,
+            high_bytes: 1800 * BYTES_PER_MIB,
+            max_bytes: 2048 * BYTES_PER_MIB,
+            all_workloads_contained: true,
+        };
+        let reading = Reading {
+            available_bytes: 4096 * BYTES_PER_MIB,
+            stalls: Some((0.0, 0.0)),
+            pool: Some(pool.into()),
+        };
+        assert!(!state.observe(reading, 1024));
+        assert!(state.observe(
+            Reading {
+                stalls: Some((10.0, 0.0)),
+                ..reading
+            },
+            1024
+        ));
     }
 
     #[test]

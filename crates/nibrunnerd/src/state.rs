@@ -743,6 +743,7 @@ mod tests {
             readings.pool = Some(crate::domain::memory_admission::PoolMemory {
                 membership: "/workloads.slice".into(),
                 current_bytes: 64 * 1_048_576,
+                reclaimable_file_bytes: 0,
                 high_bytes: 1800 * 1_048_576,
                 max_bytes: 2048 * 1_048_576,
                 all_workloads_contained: contained,
@@ -781,6 +782,7 @@ mod tests {
             readings.pool = Some(crate::domain::memory_admission::PoolMemory {
                 membership: "/workloads.slice".into(),
                 current_bytes: 1024 * 1_048_576,
+                reclaimable_file_bytes: 0,
                 high_bytes: 900 * 1_048_576,
                 max_bytes: 1024 * 1_048_576,
                 all_workloads_contained: false,
@@ -807,6 +809,7 @@ mod tests {
         readings.pool = Some(crate::domain::memory_admission::PoolMemory {
             membership: "/workloads.slice".into(),
             current_bytes: 0,
+            reclaimable_file_bytes: 0,
             high_bytes: 1800 * 1_048_576,
             max_bytes: 2048 * 1_048_576,
             all_workloads_contained: true,
