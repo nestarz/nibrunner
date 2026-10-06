@@ -85,34 +85,66 @@ fn memory_lease_client_process() {
         stream.read_exact(&mut bytes).unwrap();
         serde_json::from_slice(&bytes).unwrap()
     };
-    let acquire = Request::Acquire {
-        id: id.clone(),
-        unit: unit.clone(),
-        memory_mib: 32.try_into().unwrap(),
-    };
-    assert!(matches!(request(acquire.clone()), Reply::Granted { .. }));
-    assert!(matches!(request(acquire), Reply::Granted { .. }));
-    assert!(std::process::Command::new("systemd-run")
-        .args([
-            "--unit",
-            &unit,
-            "--collect",
-            "--property=MemoryMax=32M",
-            "--property=RuntimeMaxSec=20",
-            "/bin/sleep",
-            "20"
-        ])
-        .status()
-        .unwrap()
-        .success());
-    let busy = request(Request::Release { id: id.clone() });
-    let stopped = std::process::Command::new("systemctl")
-        .args(["stop", &unit])
-        .status()
-        .unwrap();
-    assert!(matches!(busy, Reply::Waiting { .. }), "{busy:?}");
-    assert!(stopped.success());
-    assert_eq!(request(Request::Release { id }), Reply::Released);
+    for slice in [
+        None,
+        Some(format!("nibrunnerbuild-{}.slice", id.replace('-', ""))),
+    ] {
+        let acquire = Request::Acquire {
+            minimum_mib: Some(32.try_into().unwrap()),
+            id: id.clone(),
+            unit: slice.clone().unwrap_or_else(|| unit.clone()),
+            memory_mib: u32::MAX.try_into().unwrap(),
+        };
+        let granted = request(acquire.clone());
+        let Reply::Granted { memory_mib } = granted else {
+            panic!("{granted:?}");
+        };
+        assert!((32..u32::MAX).contains(&memory_mib.get()));
+        assert_eq!(request(acquire), granted);
+        let start = |name: &str| {
+            let mut command = std::process::Command::new("systemd-run");
+            if let Some(slice) = &slice {
+                command.arg(format!("--slice={slice}"));
+            }
+            assert!(command
+                .args([
+                    "--unit",
+                    name,
+                    "--collect",
+                    &format!("--property=MemoryMax={}M", memory_mib.get()),
+                    "--property=RuntimeMaxSec=20",
+                    "/bin/sleep",
+                    "20",
+                ])
+                .status()
+                .unwrap()
+                .success());
+        };
+        let stop = |name: &str| {
+            assert!(std::process::Command::new("systemctl")
+                .args(["stop", name])
+                .status()
+                .unwrap()
+                .success());
+        };
+        start(&unit);
+        let sibling = format!("nibrunner-memory-sibling-{id}.service");
+        if slice.is_some() {
+            start(&sibling);
+        }
+        let busy = request(Request::Release { id: id.clone() });
+        assert!(matches!(busy, Reply::Waiting { .. }), "{busy:?}");
+        stop(&unit);
+        if slice.is_some() {
+            let busy = request(Request::Release { id: id.clone() });
+            assert!(
+                matches!(busy, Reply::Waiting { .. }),
+                "a sibling still holds the slice: {busy:?}"
+            );
+            stop(&sibling);
+        }
+        assert_eq!(request(Request::Release { id: id.clone() }), Reply::Released);
+    }
 }
 
 #[cfg(target_os = "linux")]

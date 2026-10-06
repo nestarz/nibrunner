@@ -75,6 +75,31 @@ struct Lease {
     owner: Owner,
     unit: String,
     memory_mib: NonZeroU32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    range: Option<MemoryRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRange {
+    minimum: NonZeroU32,
+    preferred: NonZeroU32,
+}
+
+impl Lease {
+    fn requested(&self) -> MemoryRange {
+        self.range.unwrap_or(MemoryRange {
+            minimum: self.memory_mib,
+            preferred: self.memory_mib,
+        })
+    }
+}
+
+fn smaller_budget(current: NonZeroU32, minimum: NonZeroU32, shortfall_mib: u64) -> Option<NonZeroU32> {
+    let reduced = u64::from(current.get()).checked_sub(shortfall_mib)?;
+    (reduced >= u64::from(minimum.get()) && reduced < u64::from(current.get()))
+        .then(|| u32::try_from(reduced).ok().and_then(NonZeroU32::new))
+        .flatten()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,7 +122,7 @@ fn valid_id(id: &str) -> bool {
 fn valid_unit(unit: &str) -> bool {
     unit.len() <= 200
         && unit.len() > ".service".len()
-        && unit.ends_with(".service")
+        && (unit.ends_with(".service") || unit.ends_with(".slice"))
         && unit.as_bytes()[0].is_ascii_alphanumeric()
         && unit
             .bytes()
@@ -130,6 +155,8 @@ impl MemoryService {
                 || !valid_unit(&lease.unit)
                 || lease.owner.pid <= 0
                 || isolated_group(&lease.owner.cgroup).is_none()
+                || lease.requested().minimum > lease.memory_mib
+                || lease.memory_mib > lease.requested().preferred
             {
                 return Err(io::Error::other("the memory lease ledger is invalid"));
             }
@@ -151,49 +178,57 @@ impl MemoryService {
     async fn handle(&self, owner: Owner, request: Request) -> io::Result<Reply> {
         let mut held = self.held.lock().await;
         match request {
-            Request::Acquire { id, unit, memory_mib } => {
+            Request::Acquire {
+                id,
+                unit,
+                memory_mib,
+                minimum_mib,
+            } => {
                 if !valid_id(&id) || !valid_unit(&unit) {
                     return Ok(Reply::Rejected {
-                        reason: "a lease needs a canonical UUID and a service unit name".into(),
+                        reason: "a lease needs a canonical UUID and a service or slice unit name".into(),
                     });
                 }
-                let lease = Lease {
+                if minimum_mib.is_some_and(|minimum| minimum > memory_mib) {
+                    return Ok(Reply::Rejected {
+                        reason: "the minimum memory exceeds the preferred budget".into(),
+                    });
+                }
+                let mut lease = Lease {
                     owner,
                     unit,
                     memory_mib,
+                    range: minimum_mib.map(|minimum| MemoryRange {
+                        minimum,
+                        preferred: memory_mib,
+                    }),
                 };
                 if let Some(existing) = held.leases.get(&id) {
-                    return Ok(if existing == &lease {
-                        Reply::Granted { memory_mib }
-                    } else {
-                        Reply::Rejected {
-                            reason: "that lease belongs to different work".into(),
-                        }
-                    });
+                    return Ok(
+                        if existing.owner == lease.owner
+                            && existing.unit == lease.unit
+                            && existing.requested() == lease.requested()
+                        {
+                            Reply::Granted {
+                                memory_mib: existing.memory_mib,
+                            }
+                        } else {
+                            Reply::Rejected {
+                                reason: "that lease belongs to different work".into(),
+                            }
+                        },
+                    );
                 }
                 if held.leases.values().any(|existing| existing.unit == lease.unit) {
                     return Ok(Reply::Waiting {
                         reason: "that service already holds a memory lease".into(),
                     });
                 }
-                let Some(readings) = self.host.memory_readings(None).await else {
-                    return Ok(Reply::Waiting {
-                        reason: "host memory cannot be measured".into(),
-                    });
+                let (reservation, memory_mib) = match self.reserve(&id, lease.requested()).await {
+                    Ok(granted) => granted,
+                    Err(reply) => return Ok(reply),
                 };
-                let reservation = match self
-                    .host
-                    .state
-                    .reserve_external(self.host.guest_memory_mib, &id, memory_mib, readings)
-                    .await
-                {
-                    Ok(reservation) => reservation,
-                    Err(shortfall_mib) => {
-                        return Ok(Reply::Waiting {
-                            reason: format!("memory admission needs {shortfall_mib} MiB more headroom"),
-                        })
-                    }
-                };
+                lease.memory_mib = memory_mib;
                 held.leases.insert(id.clone(), lease);
                 if let Err(error) = self.persist(&held) {
                     held.leases.remove(&id);
@@ -220,6 +255,40 @@ impl MemoryService {
                 Ok(Reply::Released)
             }
         }
+    }
+
+    async fn reserve(
+        &self,
+        id: &str,
+        range: MemoryRange,
+    ) -> Result<(crate::state::MemoryReservation, NonZeroU32), Reply> {
+        let mut memory_mib = range.preferred;
+        for _ in 0..4 {
+            let Some(readings) = self.host.memory_readings(None).await else {
+                return Err(Reply::Waiting {
+                    reason: "host memory cannot be measured".into(),
+                });
+            };
+            match self
+                .host
+                .state
+                .reserve_external(self.host.guest_memory_mib, id, memory_mib, readings)
+                .await
+            {
+                Ok(reservation) => return Ok((reservation, memory_mib)),
+                Err(shortfall_mib) => match smaller_budget(memory_mib, range.minimum, shortfall_mib) {
+                    Some(reduced) => memory_mib = reduced,
+                    None => {
+                        return Err(Reply::Waiting {
+                            reason: format!("memory admission needs {shortfall_mib} MiB more headroom"),
+                        })
+                    }
+                },
+            }
+        }
+        Err(Reply::Waiting {
+            reason: "host memory changed during admission; retry the reservation".into(),
+        })
     }
 
     fn release(&self, held: &mut Ledger, id: &str) -> io::Result<()> {
@@ -269,13 +338,15 @@ impl MemoryService {
             .collect();
         let value = |key| properties.get(key).copied();
         if !matches!(value("LoadState"), Some("loaded" | "not-found"))
-            || !matches!(value("ActiveState"), Some("inactive" | "failed"))
+            || !(matches!(value("ActiveState"), Some("inactive" | "failed"))
+                || (unit.ends_with(".slice") && value("ActiveState") == Some("active")))
             || value("Job") != Some("")
         {
             return Ok(false);
         }
         match value("ControlGroup") {
-            Some("") => Ok(response.code == 0 || value("LoadState") == Some("not-found")),
+            Some("") => Ok(value("ActiveState") != Some("active")
+                && (response.code == 0 || value("LoadState") == Some("not-found"))),
             Some(group) if response.code == 0 => {
                 let path = crate::adapters::cgroup::cgroup_path(&format!("0::{group}"))
                     .ok_or_else(|| io::Error::other("the service has an invalid cgroup"))?;
@@ -379,6 +450,17 @@ mod tests {
     const ID: &str = "03ae9139-c7fc-4ad4-a94b-6e3c81d3b406";
     const UNIT: &str = "mf-build-example-0123456789ab-sandbox.service";
 
+    #[test]
+    fn flexible_grants_shrink_by_the_shortfall_without_crossing_the_minimum() {
+        let preferred = 2048.try_into().unwrap();
+        let minimum = 512.try_into().unwrap();
+        assert_eq!(smaller_budget(preferred, minimum, 512).unwrap().get(), 1536);
+        assert_eq!(smaller_budget(preferred, minimum, 1536).unwrap().get(), 512);
+        for shortfall in [0, 1537, 2048, u64::MAX] {
+            assert!(smaller_budget(preferred, minimum, shortfall).is_none());
+        }
+    }
+
     fn owner() -> Owner {
         Owner {
             pid: i32::MAX,
@@ -396,6 +478,7 @@ mod tests {
                     owner: owner(),
                     unit: UNIT.into(),
                     memory_mib: 512.try_into().unwrap(),
+                    range: None,
                 },
             )]),
         }
@@ -441,6 +524,7 @@ mod tests {
         let service = MemoryService::restore_for_boot(host.arc().clone(), "boot-1".into()).unwrap();
         let generation = host.state.memory_generation();
         let request = Request::Acquire {
+            minimum_mib: None,
             id: ID.into(),
             unit: UNIT.into(),
             memory_mib: 512.try_into().unwrap(),
@@ -458,6 +542,7 @@ mod tests {
         ));
         for (unit, memory_mib) in [(UNIT, 256), ("different.service", 512)] {
             let request = Request::Acquire {
+                minimum_mib: None,
                 id: ID.into(),
                 unit: unit.into(),
                 memory_mib: memory_mib.try_into().unwrap(),
@@ -468,6 +553,7 @@ mod tests {
             ));
         }
         let duplicate = Request::Acquire {
+            minimum_mib: None,
             id: uuid::Uuid::new_v4().to_string(),
             unit: UNIT.into(),
             memory_mib: 512.try_into().unwrap(),
@@ -559,6 +645,7 @@ mod tests {
     #[test]
     fn unit_names_and_owner_groups_cannot_escape_into_paths_options_or_shared_slices() {
         assert!(valid_unit(UNIT));
+        assert!(valid_unit("mfbuild-0123456789abcdef.slice"));
         for invalid in [
             "-test.service",
             "../test.service",

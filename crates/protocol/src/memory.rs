@@ -14,6 +14,8 @@ pub enum Request {
         id: String,
         unit: String,
         memory_mib: NonZeroU32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum_mib: Option<NonZeroU32>,
     },
     Release {
         id: String,
