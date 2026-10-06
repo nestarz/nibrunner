@@ -76,6 +76,15 @@ async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
         };
         let console = std::fs::read_to_string(processes.console_path(&app)).unwrap_or_default();
         if observed.is_some() {
+            let record = processes.read_record(&app).unwrap();
+            let mut reused = record.clone();
+            reused.start_ticks = reused.start_ticks.map(|ticks| ticks + 1);
+            processes.write_record(&reused).unwrap();
+            assert!(
+                processes.memory(&app).is_none(),
+                "a reused PID must not supply another workload's memory"
+            );
+            processes.write_record(&record).unwrap();
             processes.freeze(&app).await.unwrap();
             assert!(processes.frozen(&app).unwrap());
             let _ = processes.reclaim_frozen(&app, 1024 * 1024).await;

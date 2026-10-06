@@ -215,10 +215,15 @@ impl VmProcesses {
 
     pub fn memory(&self, app_id: &AppId) -> Option<protocol::ReportedMemory> {
         let record = self.read_record(app_id)?;
-        if record.host_boot_id != self.boot_id || record.exit().is_some() || !is_alive(record.pid) {
+        let started = record.start_ticks?;
+        if record.host_boot_id != self.boot_id
+            || record.exit().is_some()
+            || process_start_ticks(record.pid) != Some(started)
+        {
             return None;
         }
-        super::memory::read_process(record.pid)
+        let memory = super::memory::read_process(record.pid)?;
+        (process_start_ticks(record.pid) == Some(started)).then_some(memory)
     }
 
     pub fn remember_frozen(&self, app_id: &AppId, frozen: bool) -> std::io::Result<()> {

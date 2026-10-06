@@ -97,6 +97,26 @@ pub async fn stop_instance(host: &Host, app_id: &AppId, reason: &str) {
 
 /// Puts the microVM to sleep and says how that went; nothing when there was no microVM to put
 /// down, or no slot for it to come back to and it was stopped instead.
+pub(super) async fn suspend_owned(
+    host: Arc<Host>,
+    app: AppId,
+    why: SleepReason,
+    transition: tokio::sync::OwnedMutexGuard<()>,
+) -> Option<SleepOutcome> {
+    // Cancelling a pass cannot cancel Firecracker's snapshot write or free its reserved memory.
+    tokio::spawn(async move {
+        let _transition = crate::state::InstanceTransition::new(host.state.clone(), app.clone(), transition);
+        let outcome = suspend_instance(&host, &app, why).await;
+        host.state.mark_snapshotting(&app, false).await;
+        outcome
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::error!(%error, "snapshot task did not complete");
+        None
+    })
+}
+
 pub async fn suspend_instance(host: &Host, app_id: &AppId, why: SleepReason) -> Option<SleepOutcome> {
     let reason = why.as_str();
     let record = host.state.record(app_id).await?;
@@ -106,6 +126,30 @@ pub async fn suspend_instance(host: &Host, app_id: &AppId, why: SleepReason) -> 
     let Some(slot) = host.slot_of(app_id).await else {
         stop_instance(host, app_id, reason).await;
         return None;
+    };
+
+    // Full snapshots fault in the guest's complete memory, even when its paused working set is small.
+    // Do not reclaim recursively: the caller may already be reclaiming another app's reservation.
+    let _memory = match host
+        .reserve_memory_once(
+            app_id,
+            record.resources,
+            crate::domain::memory_admission::MemoryOperation::Snapshot,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(shortfall_mib) => {
+            tracing::info!(%app_id, shortfall_mib, "snapshot waits for memory");
+            host.metrics.sleep_wake.slept(
+                app_id,
+                why,
+                SleepOutcome::Refused,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            );
+            return Some(SleepOutcome::Refused);
+        }
     };
 
     host.state.mark_snapshotting(app_id, true).await;
@@ -1191,6 +1235,82 @@ mod tests {
         suspend_instance(&host, &app_id(), SleepReason::Quiet).await;
 
         assert!(host.vms.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_without_memory_leaves_the_frozen_vm_and_its_routes_untouched() {
+        let mut host = test_host().await;
+        Arc::get_mut(&mut host.host).unwrap().config.memory_admission =
+            Some(crate::config::MemoryAdmission {
+                mode: crate::config::MemoryAdmissionMode::Adaptive,
+                headroom_mib: 1024.try_into().unwrap(),
+                reclaim: true,
+                freeze_after_ms: None,
+            });
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.resources.memory_mib = 1_000_000;
+            }))
+            .await;
+        for index in 0..4 {
+            host.state
+                .put_record(instance_record(|record| {
+                    record.app_id = AppId::parse(format!("neighbour-{index}")).unwrap();
+                }))
+                .await;
+        }
+        let outcome = suspend_instance(&host, &app_id(), SleepReason::MemoryPressure).await;
+        assert_eq!(outcome, Some(SleepOutcome::Refused));
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Frozen
+        );
+        assert!(!host.state.is_snapshotting(&app_id()).await);
+        assert!(host.vms.calls().is_empty());
+        assert!(host.commands.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_snapshot_caller_keeps_its_reservation_and_transition_until_completion() {
+        let _serial = crate::test_support::ONE_HOST_AT_A_TIME.lock().await;
+        let mut host = test_host().await;
+        let (held, _) = crate::test_support::mocks::vmm_holding_sleeps();
+        Arc::get_mut(&mut host.host).unwrap().vms = held.clone();
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.on_request = true;
+            }))
+            .await;
+        let transition = host.state.transition(&app_id()).await;
+        let running = host.host.clone();
+        let caller =
+            tokio::spawn(
+                async move { suspend_owned(running, app_id(), SleepReason::Quiet, transition).await },
+            );
+        held.held_up(1).await;
+        let reserved = host.state.memory_generation();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(host.state.memory_generation(), reserved);
+        assert!(host.state.try_transition(&app_id()).is_none());
+        assert!(host.state.is_snapshotting(&app_id()).await);
+        held.let_through(1);
+        let _next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            host.state.transition(&app_id()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(host.state.memory_generation(), reserved + 1);
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Idle
+        );
+        assert!(!host.state.is_snapshotting(&app_id()).await);
     }
 
     #[tokio::test]

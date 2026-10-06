@@ -64,7 +64,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
     }
 }
 
-async fn sync_desired(host: &Host, desired: &HostDesiredState) {
+async fn sync_desired(host: &Arc<Host>, desired: &HostDesiredState) {
     for wanted in &desired.instances {
         let _transition = host.state.transition(&wanted.app_id).await;
         let must_run = wanted.desired_state == DesiredInstanceState::Running
@@ -180,7 +180,7 @@ async fn apply_holds(host: &Host, plan: &ReconcilePlan) {
     }
 }
 
-async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
+async fn apply_starts(host: &Arc<Host>, plan: &ReconcilePlan) {
     let starts: Vec<_> = plan
         .instances
         .iter()
@@ -1147,7 +1147,7 @@ mod tests {
             })]
         });
 
-        sync_desired(&host, &desired).await;
+        sync_desired(host.arc(), &desired).await;
 
         let record = host.state.record(&app_id()).await.unwrap();
         assert!(record.on_request);
@@ -1165,7 +1165,7 @@ mod tests {
             })]
         });
 
-        sync_desired(&host, &desired).await;
+        sync_desired(host.arc(), &desired).await;
 
         let record = host.state.record(&app_id()).await.unwrap();
         assert!(!record.desired_running);
@@ -1176,7 +1176,7 @@ mod tests {
     #[tokio::test]
     async fn a_document_naming_an_app_this_host_has_no_record_for_writes_nothing_down() {
         let host = test_host().await;
-        sync_desired(&host, &running_app()).await;
+        sync_desired(host.arc(), &running_app()).await;
         assert!(host.state.record(&app_id()).await.is_none());
     }
 
@@ -1185,7 +1185,7 @@ mod tests {
         let host = test_host().await;
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
 
-        apply_starts(&host, &starting(desired_instance(|_| {}))).await;
+        apply_starts(host.arc(), &starting(desired_instance(|_| {}))).await;
 
         assert!(host.vms.calls().is_empty());
         assert!(host.state.record(&app_id()).await.is_none());
@@ -1197,7 +1197,7 @@ mod tests {
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
         host.state.modify(|snapshot| snapshot.isolated = true).await;
 
-        apply_starts(&host, &starting(desired_instance(|_| {}))).await;
+        apply_starts(host.arc(), &starting(desired_instance(|_| {}))).await;
 
         assert_eq!(host.vms.calls(), vec![VmCall::Boot]);
     }
@@ -1205,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn a_plan_with_nothing_to_start_asks_nothing_of_the_ruleset() {
         let host = test_host().await;
-        apply_starts(&host, &ReconcilePlan::default()).await;
+        apply_starts(host.arc(), &ReconcilePlan::default()).await;
         assert!(host.vms.calls().is_empty());
     }
 
@@ -1560,7 +1560,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_starts(&host, &plan).await;
+        apply_starts(host.arc(), &plan).await;
 
         assert_eq!(host.vms.calls(), vec![VmCall::Boot]);
     }
