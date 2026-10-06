@@ -154,6 +154,12 @@ strict and observation modes also enforce the configured host budget. They hold 
 grant until release. Existing build tools must connect to this API before adaptive admission
 can account for them.
 
+When the owner already runs inside the granted service or slice, admission tracks that cgroup's
+identity. Its resident anonymous memory is already absent from host available RAM, so only the
+remaining grant counts as future growth. The full grant still counts against the host budget.
+File cache and swap receive no discount. Missing, replaced, overlapping, or unbounded groups keep
+their full reservation. A service created after its grant also keeps the full reservation.
+
 ### Reclaim before refusing capacity
 
 `reclaim = true` enables reclaim independently of admission mode. Omit it or set it to `false`

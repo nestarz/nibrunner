@@ -54,10 +54,11 @@ pub struct HostSnapshot {
 pub type SharedState = Arc<HostState>;
 
 type Transitions = BTreeMap<AppId, Arc<tokio::sync::Mutex<()>>>;
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ReservedMemory {
     resources: protocol::InstanceResources,
     bytes: u64,
+    group: Option<crate::adapters::cgroup::MemoryGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -253,6 +254,7 @@ impl HostState {
                     vcpu_count: 0,
                 },
                 bytes: u64::from(memory_mib.get()) * 1_048_576,
+                group: None,
             },
         );
         reservations.generation = reservations.generation.wrapping_add(1);
@@ -270,6 +272,41 @@ impl HostState {
         {
             reservations.generation = reservations.generation.wrapping_add(1);
         }
+    }
+
+    pub(crate) fn track_external_group(&self, id: &str, group: crate::adapters::cgroup::MemoryGroup) {
+        let mut reservations = self.memory_reservations.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(held) = reservations.held.get_mut(&ReservationOwner::External(id.into())) {
+            held.group = Some(group);
+            reservations.generation = reservations.generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn external_resident_memory(&self) -> BTreeMap<String, u64> {
+        let held = self
+            .memory_reservations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .held
+            .clone();
+        held.iter()
+            .filter_map(|(owner, reservation)| {
+                let ReservationOwner::External(id) = owner else {
+                    return None;
+                };
+                let group = reservation.group.as_ref()?;
+                if held.iter().any(|(other, reservation)| {
+                    other != owner
+                        && reservation
+                            .group
+                            .as_ref()
+                            .is_some_and(|other| group.overlaps(other))
+                }) {
+                    return None;
+                }
+                Some((id.clone(), group.resident_bytes(reservation.bytes)?))
+            })
+            .collect()
     }
 
     async fn reserve_for_owner(
@@ -326,13 +363,32 @@ impl HostState {
             if readings.reservation_generation != reservations.generation {
                 // A completed allocation can outlive its guard. Old working sets cannot discount it.
                 readings.apps.clear();
+                readings.external_resident_bytes.clear();
             }
             bytes = app_id.map_or(bytes, |app| readings.ceiling(app, wanted));
             let reserved_bytes = reservations
                 .held
                 .values()
                 .fold(0u64, |total, held| total.saturating_add(held.bytes));
-            let measured_shortfall = readings.shortfall_mib(capacity_mib, &records, reserved_bytes, bytes);
+            let resident_reserved_bytes = reservations.held.iter().fold(0u64, |total, (owner, held)| {
+                let resident = match owner {
+                    ReservationOwner::External(id) => readings
+                        .external_resident_bytes
+                        .get(id)
+                        .copied()
+                        .unwrap_or(0)
+                        .min(held.bytes),
+                    ReservationOwner::App(_) => 0,
+                };
+                total.saturating_add(resident)
+            });
+            let measured_shortfall = readings.shortfall_mib(
+                capacity_mib,
+                &records,
+                reserved_bytes,
+                resident_reserved_bytes,
+                bytes,
+            );
             tracing::info!(
                 ?owner,
                 ?mode,
@@ -354,6 +410,7 @@ impl HostState {
             ReservedMemory {
                 resources: wanted,
                 bytes,
+                group: None,
             },
         );
         reservations.generation = reservations.generation.wrapping_add(1);
@@ -540,6 +597,7 @@ mod tests {
             mode,
             crate::domain::memory_admission::MemoryReadings {
                 reservation_generation: 0,
+                external_resident_bytes: BTreeMap::new(),
                 available_bytes: available_mib * 1_048_576,
                 headroom_bytes: 1024 * 1_048_576,
                 measured_at_ms: crate::clock::now_ms(),
@@ -593,6 +651,7 @@ mod tests {
         use protocol::{ReportedMemory, ReportedMemoryLimits};
         crate::domain::memory_admission::MemoryReadings {
             reservation_generation: state.memory_generation(),
+            external_resident_bytes: BTreeMap::new(),
             available_bytes: 1500 * 1_048_576,
             headroom_bytes: 1024 * 1_048_576,
             measured_at_ms: crate::clock::now_ms(),
@@ -681,6 +740,39 @@ mod tests {
             .reserve_external(8192, "build", memory, measured(Observe, 8192).unwrap())
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_or_unrelated_build_samples_cannot_discount_held_capacity() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        for case in 0..4 {
+            let state = HostState::shared();
+            state.restore_external("build", 1536.try_into().unwrap());
+            let mut readings = measured(Adaptive, 2048).unwrap();
+            readings.1.reservation_generation = state.memory_generation();
+            readings
+                .1
+                .external_resident_bytes
+                .insert(if case == 1 { "other" } else { "build" }.into(), 1024 * 1_048_576);
+            if case == 2 {
+                readings.1.reservation_generation = 0;
+            }
+            if case == 3 {
+                readings.1.measured_at_ms -= 5001;
+            }
+            let granted = state
+                .reserve_with_readings(
+                    8192,
+                    &app_id(),
+                    protocol::InstanceResources {
+                        memory_mib: 256,
+                        vcpu_count: 1,
+                    },
+                    Some(readings),
+                )
+                .await;
+            assert_eq!(granted.is_ok(), case == 0);
+        }
     }
 
     #[tokio::test]

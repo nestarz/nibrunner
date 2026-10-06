@@ -20,6 +20,7 @@ pub(crate) struct MemoryReadings {
     pub headroom_bytes: u64,
     pub measured_at_ms: i64,
     pub apps: BTreeMap<AppId, ReportedMemory>,
+    pub external_resident_bytes: BTreeMap<String, u64>,
     pub ceilings: BTreeMap<AppId, u64>,
 }
 
@@ -88,10 +89,13 @@ impl MemoryReadings {
         capacity_mib: u64,
         records: &[InstanceRecord],
         reserved_bytes: u64,
+        resident_reserved_bytes: u64,
         wanted_bytes: u64,
     ) -> u64 {
-        let mut future = reserved_bytes.saturating_add(wanted_bytes);
-        let mut targets = future;
+        let mut future = reserved_bytes
+            .saturating_sub(resident_reserved_bytes)
+            .saturating_add(wanted_bytes);
+        let mut targets = reserved_bytes.saturating_add(wanted_bytes);
         for record in records
             .iter()
             .filter(|record| super::report::capacity::holds_something(record))
@@ -120,6 +124,7 @@ mod tests {
     fn readings() -> MemoryReadings {
         MemoryReadings {
             reservation_generation: 0,
+            external_resident_bytes: BTreeMap::new(),
             available_bytes: 2048 * BYTES_PER_MIB,
             headroom_bytes: 1024 * BYTES_PER_MIB,
             measured_at_ms: 10_000,
@@ -156,15 +161,44 @@ mod tests {
     }
 
     #[test]
+    fn resident_build_memory_reduces_future_growth_but_not_the_reserved_budget() {
+        let observed = readings();
+        assert_eq!(
+            observed.shortfall_mib(8192, &[], 1536 * BYTES_PER_MIB, 0, 512 * BYTES_PER_MIB),
+            1024
+        );
+        assert_eq!(
+            observed.shortfall_mib(
+                8192,
+                &[],
+                1536 * BYTES_PER_MIB,
+                1024 * BYTES_PER_MIB,
+                512 * BYTES_PER_MIB
+            ),
+            0
+        );
+        assert_eq!(
+            observed.shortfall_mib(
+                1024,
+                &[],
+                1536 * BYTES_PER_MIB,
+                1024 * BYTES_PER_MIB,
+                512 * BYTES_PER_MIB
+            ),
+            1024
+        );
+    }
+
+    #[test]
     fn a_running_app_reserves_its_peak_margin_without_counting_resident_memory_twice() {
         let observed = readings();
         assert_eq!(observed.growth_bytes(&running()), 384 * BYTES_PER_MIB);
         assert_eq!(
-            observed.shortfall_mib(8192, &[running()], 0, 512 * BYTES_PER_MIB),
+            observed.shortfall_mib(8192, &[running()], 0, 0, 512 * BYTES_PER_MIB),
             0
         );
         assert_eq!(
-            observed.shortfall_mib(8192, &[running()], 0, 1024 * BYTES_PER_MIB),
+            observed.shortfall_mib(8192, &[running()], 0, 0, 1024 * BYTES_PER_MIB),
             384
         );
     }
@@ -175,7 +209,7 @@ mod tests {
         observed.apps.get_mut(&app_id()).unwrap().swap_bytes = 256 * BYTES_PER_MIB;
         assert_eq!(observed.growth_bytes(&running()), 704 * BYTES_PER_MIB);
         assert_eq!(
-            observed.shortfall_mib(8192, &[running()], 512 * BYTES_PER_MIB, 512 * BYTES_PER_MIB),
+            observed.shortfall_mib(8192, &[running()], 512 * BYTES_PER_MIB, 0, 512 * BYTES_PER_MIB),
             704
         );
     }
@@ -206,7 +240,7 @@ mod tests {
         assert_eq!(readings().growth_bytes(&record), 2048 * BYTES_PER_MIB);
         record.state = InstanceState::Idle;
         assert_eq!(
-            readings().shortfall_mib(8192, &[record], 0, 1024 * BYTES_PER_MIB),
+            readings().shortfall_mib(8192, &[record], 0, 0, 1024 * BYTES_PER_MIB),
             0
         );
     }
@@ -216,7 +250,7 @@ mod tests {
         let mut observed = readings();
         observed.available_bytes = 8192 * BYTES_PER_MIB;
         assert_eq!(
-            observed.shortfall_mib(1024, &[running()], 0, 512 * BYTES_PER_MIB),
+            observed.shortfall_mib(1024, &[running()], 0, 0, 512 * BYTES_PER_MIB),
             128
         );
     }
@@ -244,7 +278,7 @@ mod tests {
         observed.apps.get_mut(&app_id()).unwrap().swap_bytes = 1024 * BYTES_PER_MIB;
         assert_eq!(observed.growth_bytes(&record), 0);
         assert_eq!(
-            observed.shortfall_mib(8192, &[record.clone()], 0, 1024 * BYTES_PER_MIB),
+            observed.shortfall_mib(8192, &[record.clone()], 0, 0, 1024 * BYTES_PER_MIB),
             0
         );
         observed.apps.get_mut(&app_id()).unwrap().proportional_set_bytes = Some(512 * BYTES_PER_MIB);
