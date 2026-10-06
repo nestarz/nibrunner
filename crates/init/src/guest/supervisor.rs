@@ -51,9 +51,13 @@ fn signals_as_fd() -> Option<SignalFd> {
     }
 }
 
-pub(crate) fn supervise(config: &InstanceConfig, ceiling: &Ceiling) -> Ended {
+pub(crate) fn supervise(
+    config: &InstanceConfig,
+    ceiling: &Ceiling,
+    transport: guest_contract::channels::ChannelTransport,
+) -> Ended {
     let mut budget = Budget::default();
-    let mut forwarder = Forwarder::new();
+    let mut forwarder = Forwarder::new(transport);
     let signals = signals_as_fd();
     loop {
         let started = Instant::now();

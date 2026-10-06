@@ -1,3 +1,4 @@
+use guest_contract::channels::ChannelTransport;
 use nix::unistd::{ForkResult, Pid};
 
 use crate::guest::{control, filesystem, log};
@@ -7,10 +8,10 @@ pub(crate) struct Channels {
     files: Option<Pid>,
 }
 
-pub(crate) fn start() -> Channels {
+pub(crate) fn start(transport: ChannelTransport) -> Channels {
     Channels {
-        control: fork_channel("control", control::serve),
-        files: fork_channel("filesystem", filesystem::serve),
+        control: fork_channel("control", transport, control::serve),
+        files: fork_channel("filesystem", transport, filesystem::serve),
     }
 }
 
@@ -26,14 +27,18 @@ impl Channels {
     }
 }
 
-fn fork_channel(what: &'static str, serve: fn() -> !) -> Option<Pid> {
+fn fork_channel(
+    what: &'static str,
+    transport: ChannelTransport,
+    serve: fn(ChannelTransport) -> !,
+) -> Option<Pid> {
     match unsafe { nix::unistd::fork() } {
         Ok(ForkResult::Parent { child }) => Some(child),
         Ok(ForkResult::Child) => {
             // The guest blocks SIGTERM before forking us; left blocked, Channels::stop() would
             // SIGTERM this child and then waitpid on it forever, so the guest never reboots.
             let _ = nix::sys::signal::SigSet::all().thread_unblock();
-            serve()
+            serve(transport)
         }
         Err(error) => {
             log(&format!("the {what} channel could not be started: {error}"));

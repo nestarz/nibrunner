@@ -173,6 +173,8 @@ pub const NOWHERE_VM_DIR: &str = "/nowhere/vm";
 pub fn vmm() -> (Arc<MockVmm>, VmmSpy) {
     let spy = VmmSpy::default();
     let mut vms = MockVmm::new();
+    vms.expect_channel_transport()
+        .return_const(guest_contract::channels::ChannelTransport::Vsock);
 
     let (calls, on_boot) = (spy.calls.clone(), spy.on_boot.clone());
     vms.expect_boot().returning(move |_| {
@@ -365,6 +367,10 @@ pub fn vmm_holding_sleeps() -> (Arc<HeldSleeps>, VmmSpy) {
 
 #[async_trait::async_trait]
 impl Vmm for HeldSleeps {
+    fn channel_transport(&self) -> guest_contract::channels::ChannelTransport {
+        self.vms.channel_transport()
+    }
+
     async fn boot(&self, request: crate::ports::BootRequest) -> Result<(), VmError> {
         self.vms.boot(request).await
     }

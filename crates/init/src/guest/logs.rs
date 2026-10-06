@@ -1,12 +1,10 @@
 use std::io::Write;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
+use guest_contract::channels::{Channel, ChannelTransport};
 use guest_contract::logs::{encode_frame, encode_gap, encode_restart, kind_of, FRAME_HEADER_BYTES};
-use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
 use protocol::{TenantLogStream, TenantRestart};
-
-const CID_HOST: u32 = 2;
 
 /// What the first failed dial waits before the next, and what each failure after it doubles
 /// that to at most. A host daemon restarts in under half a second; one that is not listening at
@@ -26,8 +24,10 @@ pub(crate) struct Forwarder {
 }
 
 impl Forwarder {
-    pub(crate) fn new() -> Self {
-        Self::dialing(Box::new(dial))
+    pub(crate) fn new(transport: ChannelTransport) -> Self {
+        Self::dialing(Box::new(move || {
+            super::transport::dial(transport, Channel::Logs).ok()
+        }))
     }
 
     pub(crate) fn dialing(dial: Dial) -> Self {
@@ -119,22 +119,6 @@ impl Forwarder {
         self.dropped_bytes = 0;
         true
     }
-}
-
-fn dial() -> Option<OwnedFd> {
-    let socket = socket(
-        AddressFamily::Vsock,
-        SockType::Stream,
-        SockFlag::SOCK_CLOEXEC,
-        None,
-    )
-    .ok()?;
-    connect(
-        socket.as_raw_fd(),
-        &VsockAddr::new(CID_HOST, guest_contract::vsock::TENANT_LOG_VSOCK_PORT),
-    )
-    .ok()?;
-    Some(socket)
 }
 
 #[cfg(test)]
