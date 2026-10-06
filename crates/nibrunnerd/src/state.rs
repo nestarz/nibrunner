@@ -60,19 +60,58 @@ struct ReservedMemory {
     bytes: u64,
 }
 
-type MemoryReservations = Arc<Mutex<BTreeMap<AppId, ReservedMemory>>>;
+#[derive(Default)]
+struct MemoryReservations {
+    generation: u64,
+    held: BTreeMap<AppId, ReservedMemory>,
+}
+
+type SharedReservations = Arc<Mutex<MemoryReservations>>;
 
 pub(crate) struct MemoryReservation {
     app_id: AppId,
-    reservations: MemoryReservations,
+    reservations: SharedReservations,
 }
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
-        self.reservations
+        let mut reservations = self
+            .reservations
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.app_id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reservations.held.remove(&self.app_id);
+        reservations.generation = reservations.generation.wrapping_add(1);
+    }
+}
+
+pub(crate) struct InstanceTransition {
+    state: crate::state::SharedState,
+    app: AppId,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for InstanceTransition {
+    fn drop(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            let _held = held;
+            state.mark_snapshotting(&app, false).await;
+            state.signal_refresh();
+        });
+    }
+}
+
+impl InstanceTransition {
+    pub(crate) fn new(state: SharedState, app: AppId, held: OwnedMutexGuard<()>) -> Self {
+        Self {
+            state,
+            app,
+            held: Some(held),
+        }
     }
 }
 
@@ -81,12 +120,19 @@ pub struct HostState {
     refresh: Notify,
     report: Notify,
     transitions: Mutex<Transitions>,
-    memory_reservations: MemoryReservations,
+    memory_reservations: SharedReservations,
     pub(crate) persistence: tokio::sync::Mutex<()>,
     pub(crate) reclaim: tokio::sync::Mutex<()>,
 }
 
 impl HostState {
+    pub(crate) fn memory_generation(&self) -> u64 {
+        self.memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
     pub fn shared() -> SharedState {
         Arc::new(Self {
             snapshot: RwLock::new(HostSnapshot::default()),
@@ -101,6 +147,7 @@ impl HostState {
 
     /// Called under the app's transition lock. Starts and wakes share the reservation until
     /// their instance record accounts for the running process, including cancelled attempts.
+    #[cfg(test)]
     pub(crate) async fn reserve_memory(
         &self,
         capacity_mib: u64,
@@ -111,11 +158,33 @@ impl HostState {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reserve_with_readings(
         &self,
         capacity_mib: u64,
         app_id: &AppId,
         wanted: protocol::InstanceResources,
+        measured: Option<(
+            crate::config::MemoryAdmissionMode,
+            crate::domain::memory_admission::MemoryReadings,
+        )>,
+    ) -> Result<MemoryReservation, u64> {
+        self.reserve_for_operation(
+            capacity_mib,
+            app_id,
+            wanted,
+            crate::domain::memory_admission::MemoryOperation::Start,
+            measured,
+        )
+        .await
+    }
+
+    pub(crate) async fn reserve_for_operation(
+        &self,
+        capacity_mib: u64,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+        operation: crate::domain::memory_admission::MemoryOperation,
         measured: Option<(
             crate::config::MemoryAdmissionMode,
             crate::domain::memory_admission::MemoryReadings,
@@ -129,20 +198,36 @@ impl HostState {
         let records: Vec<_> = snapshot
             .records
             .values()
-            .filter(|record| &record.app_id != app_id && !reservations.contains_key(&record.app_id))
+            .filter(|record| &record.app_id != app_id && !reservations.held.contains_key(&record.app_id))
             .cloned()
             .collect();
         let mut committed = crate::domain::report::capacity::committed_resources(&records);
-        committed.extend(reservations.values().map(|reserved| reserved.resources));
-        let strict_shortfall =
-            crate::domain::report::capacity::memory_shortfall_mib(capacity_mib, &committed, &wanted);
+        committed.extend(reservations.held.values().map(|reserved| reserved.resources));
+        let strict_shortfall = match operation {
+            crate::domain::memory_admission::MemoryOperation::Start => {
+                crate::domain::report::capacity::memory_shortfall_mib(capacity_mib, &committed, &wanted)
+            }
+            // Strict admission already charged this VM's full budget. Sleeping it releases that budget.
+            crate::domain::memory_admission::MemoryOperation::Snapshot => 0,
+        };
         let mut shortfall = strict_shortfall;
         let mut bytes = (u64::from(wanted.memory_mib) + 64) * 1_048_576;
-        if let Some((mode, readings)) =
+        if measured.as_ref().is_some_and(|(mode, readings)| {
+            *mode == crate::config::MemoryAdmissionMode::Adaptive
+                && !readings.is_fresh(crate::clock::now_ms())
+        }) {
+            return Err(bytes.div_ceil(1_048_576));
+        }
+        if let Some((mode, mut readings)) =
             measured.filter(|(_, readings)| readings.is_fresh(crate::clock::now_ms()))
         {
+            if readings.reservation_generation != reservations.generation {
+                // A completed allocation can outlive its guard. Old working sets cannot discount it.
+                readings.apps.clear();
+            }
             bytes = readings.ceiling(app_id, wanted);
             let reserved_bytes = reservations
+                .held
                 .values()
                 .fold(0u64, |total, held| total.saturating_add(held.bytes));
             let measured_shortfall = readings.shortfall_mib(capacity_mib, &records, reserved_bytes, bytes);
@@ -155,13 +240,14 @@ impl HostState {
         if shortfall > 0 {
             return Err(shortfall);
         }
-        reservations.insert(
+        reservations.held.insert(
             app_id.clone(),
             ReservedMemory {
                 resources: wanted,
                 bytes,
             },
         );
+        reservations.generation = reservations.generation.wrapping_add(1);
         Ok(MemoryReservation {
             app_id: app_id.clone(),
             reservations: self.memory_reservations.clone(),
@@ -344,6 +430,7 @@ mod tests {
         Some((
             mode,
             crate::domain::memory_admission::MemoryReadings {
+                reservation_generation: 0,
                 available_bytes: available_mib * 1_048_576,
                 headroom_bytes: 1024 * 1_048_576,
                 measured_at_ms: crate::clock::now_ms(),
@@ -391,6 +478,107 @@ mod tests {
             .reserve_with_readings(0, &app_id(), wanted, measured(Observe, 8192))
             .await
             .is_err());
+    }
+
+    fn frozen_readings(state: &HostState) -> crate::domain::memory_admission::MemoryReadings {
+        use protocol::{ReportedMemory, ReportedMemoryLimits};
+        crate::domain::memory_admission::MemoryReadings {
+            reservation_generation: state.memory_generation(),
+            available_bytes: 1500 * 1_048_576,
+            headroom_bytes: 1024 * 1_048_576,
+            measured_at_ms: crate::clock::now_ms(),
+            ceilings: BTreeMap::from([(app_id(), 2048 * 1_048_576)]),
+            apps: BTreeMap::from([(
+                app_id(),
+                ReportedMemory {
+                    measured_at: crate::clock::now_timestamp(),
+                    cgroup: Some("/test.scope".into()),
+                    proportional_set_bytes: Some(64 * 1_048_576),
+                    current_bytes: 64 * 1_048_576,
+                    peak_bytes: Some(2048 * 1_048_576),
+                    swap_bytes: 1024 * 1_048_576,
+                    high_events: 0,
+                    oom_kills: 0,
+                    pressure_some_us: 0,
+                    pressure_full_us: 0,
+                    limits: Some(ReportedMemoryLimits {
+                        low_bytes: 0,
+                        high_bytes: None,
+                        max_bytes: Some(2048 * 1_048_576),
+                        swap_max_bytes: None,
+                    }),
+                },
+            )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completed_allocation_invalidates_samples_taken_before_its_reservation() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(crate::clock::now_ms() - 1000));
+            }))
+            .await;
+        let old = frozen_readings(&state);
+        let wanted = protocol::DEFAULT_INSTANCE_RESOURCES;
+        let other = AppId::parse("app-2").unwrap();
+        drop(state.reserve_memory(8192, &other, wanted).await.unwrap());
+        assert!(state
+            .reserve_with_readings(8192, &other, wanted, Some((Adaptive, old)))
+            .await
+            .is_err());
+        assert!(state
+            .reserve_with_readings(8192, &other, wanted, Some((Adaptive, frozen_readings(&state))))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reservation_keeps_a_frozen_apps_full_budget_until_it_releases() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(crate::clock::now_ms() - 1000));
+            }))
+            .await;
+        let wanted = protocol::DEFAULT_INSTANCE_RESOURCES;
+        let other = AppId::parse("app-2").unwrap();
+        let snapshot = state.reserve_memory(8192, &app_id(), wanted).await.unwrap();
+        assert!(state
+            .reserve_with_readings(8192, &other, wanted, Some((Adaptive, frozen_readings(&state))))
+            .await
+            .is_err());
+        drop(snapshot);
+        assert!(state
+            .reserve_with_readings(8192, &other, wanted, Some((Adaptive, frozen_readings(&state))))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn adaptive_snapshots_and_starts_cannot_fall_back_to_strict_when_readings_expire() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        use crate::domain::memory_admission::MemoryOperation;
+        let state = HostState::shared();
+        for operation in [MemoryOperation::Start, MemoryOperation::Snapshot] {
+            let mut old = measured(Adaptive, 8192).unwrap();
+            old.1.measured_at_ms = crate::clock::now_ms() - 5001;
+            assert!(state
+                .reserve_for_operation(
+                    8192,
+                    &app_id(),
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    operation,
+                    Some(old)
+                )
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]

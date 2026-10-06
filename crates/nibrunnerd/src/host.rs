@@ -16,6 +16,7 @@ use crate::config::HostConfig;
 use crate::desired::{AcceptedDocument, DesiredStateCache};
 use crate::domain::exports::reader::CheckpointServers;
 use crate::domain::exports::store::ExportStore;
+use crate::domain::memory_admission::MemoryOperation;
 use crate::domain::metrics::HostMetrics;
 use crate::ports::{ArtifactStore, CommandRunner, PayloadBuilder, Vmm};
 use crate::state::SharedState;
@@ -59,12 +60,14 @@ pub struct Host {
 
 impl Host {
     pub(crate) async fn reserve_memory(
-        &self,
+        self: &Arc<Self>,
         app_id: &AppId,
         wanted: protocol::InstanceResources,
         purpose: crate::domain::reconcile::pressure::ReclaimPurpose,
     ) -> Result<crate::state::MemoryReservation, u64> {
-        let first = self.reserve_memory_once(app_id, wanted).await;
+        let first = self
+            .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+            .await;
         if first.is_ok()
             || !self
                 .config
@@ -79,29 +82,35 @@ impl Host {
         else {
             return first;
         };
-        let mut result = self.reserve_memory_once(app_id, wanted).await;
+        let mut result = self
+            .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+            .await;
         for _ in 0..4 {
             if result.is_ok()
                 || !crate::domain::reconcile::pressure::reclaim_one(self, purpose, Some(app_id)).await
             {
                 return result;
             }
-            result = self.reserve_memory_once(app_id, wanted).await;
+            result = self
+                .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+                .await;
         }
         result
     }
 
-    async fn reserve_memory_once(
+    pub(crate) async fn reserve_memory_once(
         &self,
         app_id: &AppId,
         wanted: protocol::InstanceResources,
+        operation: MemoryOperation,
     ) -> Result<crate::state::MemoryReservation, u64> {
         let Some(policy) = &self.config.memory_admission else {
             return self
                 .state
-                .reserve_memory(self.guest_memory_mib, app_id, wanted)
+                .reserve_for_operation(self.guest_memory_mib, app_id, wanted, operation, None)
                 .await;
         };
+        let reservation_generation = self.state.memory_generation();
         let records = self.state.records().await;
         let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
         let apps = self.vms.memory(&ids).await;
@@ -119,6 +128,7 @@ impl Host {
                 (
                     policy.mode,
                     crate::domain::memory_admission::MemoryReadings {
+                        reservation_generation,
                         available_bytes,
                         headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
                         measured_at_ms: crate::clock::now_ms(),
@@ -127,8 +137,12 @@ impl Host {
                     },
                 )
             });
+        if measured.is_none() && policy.mode == crate::config::MemoryAdmissionMode::Adaptive {
+            tracing::warn!(%app_id, "memory admission waits for a host memory reading");
+            return Err(u64::from(wanted.memory_mib));
+        }
         self.state
-            .reserve_with_readings(self.guest_memory_mib, app_id, wanted, measured)
+            .reserve_for_operation(self.guest_memory_mib, app_id, wanted, operation, measured)
             .await
     }
 

@@ -118,6 +118,12 @@ pub async fn record_activity(host: &Host) {
                     snapshot
                         .last_measured_at_ms
                         .get(&record.app_id)
+                        .filter(|at| {
+                            record
+                                .started_at
+                                .as_ref()
+                                .is_none_or(|started| **at >= started.epoch_ms())
+                        })
                         .map(|at| (record.app_id.clone(), *at))
                 })
                 .collect();
@@ -282,8 +288,8 @@ fn left_up(
 }
 
 /// Puts the app to sleep if it is still due, and says whether it went.
-async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bool {
-    let _transition = host.state.transition(app_id).await;
+async fn let_sleep(host: &std::sync::Arc<Host>, app_id: &AppId, policy: &ActivationPolicy) -> bool {
+    let transition = host.state.transition(app_id).await;
     let now = crate::clock::now_ms();
     let mut snapshot = host.state.locked_snapshot().await;
     let Some(record) = snapshot.records.get(app_id) else {
@@ -309,8 +315,13 @@ async fn let_sleep(host: &Host, app_id: &AppId, policy: &ActivationPolicy) -> bo
         late_ms = due.late_ms,
         "letting an app sleep"
     );
-    let outcome = crate::domain::reconcile::instances::suspend_instance(host, app_id, due.reason).await;
-    host.state.mark_snapshotting(app_id, false).await;
+    let outcome = crate::domain::reconcile::instances::suspend_owned(
+        host.clone(),
+        app_id.clone(),
+        due.reason,
+        transition,
+    )
+    .await;
     outcome == Some(SleepOutcome::Slept)
 }
 
@@ -809,6 +820,30 @@ mod activity_tests {
                 .await;
             record_activity(&host).await;
         }
+        assert!(!said
+            .lines()
+            .iter()
+            .any(|line| line == "WARN app traffic had gone unread"));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_app_does_not_count_its_sleep_as_a_monitoring_gap() {
+        let (said, _listening) = Said::listening();
+        let host = test_host().await;
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.started_at = Some(crate::clock::now_timestamp());
+            }))
+            .await;
+        host.state
+            .modify(|snapshot| {
+                snapshot
+                    .last_measured_at_ms
+                    .insert(app_id(), crate::clock::now_ms() - MAX_ACTIVITY_AGE_MS - 1);
+            })
+            .await;
+        record_activity(&host).await;
         assert!(!said
             .lines()
             .iter()

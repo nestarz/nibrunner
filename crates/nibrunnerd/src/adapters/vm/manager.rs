@@ -329,9 +329,17 @@ impl Vmm for VmManager {
         let control = self
             .working_dir_for(&request.app_id)
             .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        // Readoption must not route requests to a tenant paused by an interrupted snapshot.
+        self.processes
+            .remember_frozen(&request.app_id, true)
+            .map_err(|error| VmError::Host(error.to_string()))?;
         if let Err(error) = time_sync::freeze_tenant(&control).await {
             if let Err(recovery) = time_sync::wake(&control).await {
                 tracing::warn!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after sleep refusal");
+            } else {
+                self.processes
+                    .remember_frozen(&request.app_id, false)
+                    .map_err(|error| VmError::Host(error.to_string()))?;
             }
             return Err(error);
         }
@@ -341,6 +349,10 @@ impl Vmm for VmManager {
             if let Err(recovery) = time_sync::wake(&control).await {
                 tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after pause refusal");
                 self.processes.stop(&request.app_id).await;
+            } else {
+                self.processes
+                    .remember_frozen(&request.app_id, false)
+                    .map_err(|error| VmError::Host(error.to_string()))?;
             }
             return Err(error);
         }
@@ -349,6 +361,10 @@ impl Vmm for VmManager {
             if let Err(recovery) = time_sync::wake(&control).await {
                 tracing::error!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after snapshot refusal");
                 self.processes.stop(&request.app_id).await;
+            } else {
+                self.processes
+                    .remember_frozen(&request.app_id, false)
+                    .map_err(|error| VmError::Host(error.to_string()))?;
             }
             return Err(error);
         }
@@ -784,6 +800,85 @@ mod tests {
             .put_record(instance_record(|record| record.health.ever_healthy = true))
             .await;
         calls
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_snapshot_keeps_its_pause_intent_for_readoption() {
+        let mut fixture = fixture();
+        running_fake_vm(&mut fixture, false).await;
+        let control = fixture
+            .manager
+            .working_dir_for(&app_id())
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        std::fs::remove_file(&control).unwrap();
+        let listener = UnixListener::bind(control).unwrap();
+        let (paused, reached) = tokio::sync::oneshot::channel();
+        let guest = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut wire = BufReader::new(stream);
+            let mut line = String::new();
+            wire.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "CONNECT 51001\n");
+            wire.get_mut().write_all(b"OK 1234\n").await.unwrap();
+            line.clear();
+            wire.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), guest_contract::control::TENANT_FREEZE_REQUEST);
+            paused.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let request = SuspendRequest {
+            app_id: app_id(),
+            deployment_id: deployment_id(),
+            slot: nft_render::describe_slot(0, app_id()),
+        };
+        let mut interrupted = Box::pin(fixture.manager.sleep(request));
+        tokio::select! {
+            outcome = &mut interrupted => panic!("snapshot finished before its guest paused: {outcome:?}"),
+            result = reached => result.unwrap(),
+        }
+        drop(interrupted);
+
+        let readopted = VmProcesses::new(fixture._directory.path().join("run"));
+        assert!(readopted.status(&app_id()).active);
+        assert!(readopted.status(&app_id()).frozen);
+        guest.abort();
+        fixture.manager.processes.stop(&app_id()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_snapshot_clears_its_pause_intent_only_after_guest_recovery() {
+        let mut fixture = fixture();
+        let calls = running_fake_vm(&mut fixture, false).await;
+        let control = fixture
+            .manager
+            .working_dir_for(&app_id())
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        std::fs::remove_file(&control).unwrap();
+        let listener = UnixListener::bind(control).unwrap();
+        let guest = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut wire = BufReader::new(stream);
+            let mut line = String::new();
+            wire.read_line(&mut line).await.unwrap();
+            wire.get_mut().write_all(b"OK 1234\n").await.unwrap();
+            line.clear();
+            wire.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), guest_contract::control::TENANT_FREEZE_REQUEST);
+            drop(wire);
+            fake_guest_control(listener, calls, false).await;
+        });
+        let request = SuspendRequest {
+            app_id: app_id(),
+            deployment_id: deployment_id(),
+            slot: nft_render::describe_slot(0, app_id()),
+        };
+        assert!(fixture.manager.sleep(request).await.is_err());
+        assert!(fixture.manager.processes.status(&app_id()).active);
+        assert!(!fixture.manager.processes.status(&app_id()).frozen);
+        guest.abort();
+        fixture.manager.processes.stop(&app_id()).await;
     }
 
     #[cfg(unix)]

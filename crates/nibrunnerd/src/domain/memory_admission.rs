@@ -8,7 +8,14 @@ const BYTES_PER_MIB: u64 = 1_048_576;
 const MAX_SAMPLE_AGE_MS: i64 = 5_000;
 const MIN_MARGIN_BYTES: u64 = 64 * BYTES_PER_MIB;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryOperation {
+    Start,
+    Snapshot,
+}
+
 pub(crate) struct MemoryReadings {
+    pub reservation_generation: u64,
     pub available_bytes: u64,
     pub headroom_bytes: u64,
     pub measured_at_ms: i64,
@@ -30,8 +37,8 @@ impl MemoryReadings {
             .unwrap_or_else(|| (u64::from(resources.memory_mib) + 64) * BYTES_PER_MIB)
     }
 
-    fn running_memory(&self, record: &InstanceRecord) -> Option<&ReportedMemory> {
-        if record.state != InstanceState::Running {
+    fn resident_memory(&self, record: &InstanceRecord) -> Option<&ReportedMemory> {
+        if !matches!(record.state, InstanceState::Running | InstanceState::Frozen) {
             return None;
         }
         let memory = self.apps.get(&record.app_id)?;
@@ -48,9 +55,16 @@ impl MemoryReadings {
 
     fn growth_bytes(&self, record: &InstanceRecord) -> u64 {
         let ceiling = self.ceiling(&record.app_id, record.resources);
-        let Some(memory) = self.running_memory(record) else {
+        let Some(memory) = self.resident_memory(record) else {
             return ceiling;
         };
+        if record.state == InstanceState::Frozen {
+            // A paused VM cannot fault its swapped pages back in until wake or snapshot reserves them.
+            return memory
+                .proportional_set_bytes
+                .unwrap_or(0)
+                .saturating_sub(memory.current_bytes);
+        }
         let ceiling = ceiling.max(
             memory
                 .limits
@@ -85,7 +99,7 @@ impl MemoryReadings {
             let growth = self.growth_bytes(record);
             future = future.saturating_add(growth);
             targets = targets.saturating_add(growth).saturating_add(
-                self.running_memory(record)
+                self.resident_memory(record)
                     .map_or(0, |memory| memory.current_bytes),
             );
         }
@@ -105,6 +119,7 @@ mod tests {
 
     fn readings() -> MemoryReadings {
         MemoryReadings {
+            reservation_generation: 0,
             available_bytes: 2048 * BYTES_PER_MIB,
             headroom_bytes: 1024 * BYTES_PER_MIB,
             measured_at_ms: 10_000,
@@ -219,6 +234,23 @@ mod tests {
         assert!(observed.is_fresh(15_000));
         assert!(!observed.is_fresh(15_001));
         assert!(!observed.is_fresh(9_999));
+    }
+
+    #[test]
+    fn frozen_working_sets_do_not_reserve_swapped_pages_until_a_wake_or_snapshot() {
+        let mut observed = readings();
+        let mut record = running();
+        record.state = InstanceState::Frozen;
+        observed.apps.get_mut(&app_id()).unwrap().swap_bytes = 1024 * BYTES_PER_MIB;
+        assert_eq!(observed.growth_bytes(&record), 0);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record.clone()], 0, 1024 * BYTES_PER_MIB),
+            0
+        );
+        observed.apps.get_mut(&app_id()).unwrap().proportional_set_bytes = Some(512 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&record), 256 * BYTES_PER_MIB);
+        observed.apps.clear();
+        assert_eq!(observed.growth_bytes(&record), 2048 * BYTES_PER_MIB);
     }
 
     #[test]

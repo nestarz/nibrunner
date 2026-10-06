@@ -94,9 +94,20 @@ snapshot mappings that can be charged to another cgroup. Without a kernel peak, 
 New and starting VMs reserve their full host memory budget. Missing, old, unbounded or
 previous-process samples also reserve the full budget, as do readings without PSS.
 Samples must be at most five seconds old.
+If another reservation starts or ends while samples are collected, the decision discards working-set
+discounts and counts full ceilings. Adaptive admission waits when host readings are missing or stale.
 Targets must fit the host's guest-memory budget; expected growth and concurrent startup
 reservations must also fit `MemAvailable` after the configured headroom. Swap capacity is not
-added to this budget. If host memory cannot be read, the strict policy applies.
+added to this budget.
+
+A measured frozen VM reserves its resident footprint. Its swapped pages do not count as expected
+growth while it remains paused. A wake or snapshot must reserve its full budget before resuming it.
+Full snapshots fault in guest memory even when the paused footprint is small. Their reservations
+share the start/wake pool and remain held until the operation finishes. Under strict admission,
+snapshotting reuses the VM's existing full budget so an overcommitted host can still drain.
+Cancelling the caller leaves the snapshot task running with its reservation and per-app transition
+lock until it completes. Memory samples also verify the VM's process start time before and after
+reading the cgroup and PSS, so a reused PID cannot supply another process's working set.
 
 Adaptive admission can admit guests whose combined ceilings exceed physical RAM. It does not yet
 coordinate external builds or guarantee capacity for simultaneous growth. Keep observation mode

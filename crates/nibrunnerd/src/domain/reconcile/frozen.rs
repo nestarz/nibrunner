@@ -8,27 +8,6 @@ const MIN_QUIET_MS: i64 = 30_000;
 const COOLDOWN_MS: i64 = 60_000;
 const FREEZES_PER_PASS: usize = 4;
 
-struct Transition {
-    state: crate::state::SharedState,
-    app: AppId,
-    held: Option<tokio::sync::OwnedMutexGuard<()>>,
-}
-
-impl Drop for Transition {
-    fn drop(&mut self) {
-        let Some(held) = self.held.take() else {
-            return;
-        };
-        let state = self.state.clone();
-        let app = self.app.clone();
-        tokio::spawn(async move {
-            let _held = held;
-            state.mark_snapshotting(&app, false).await;
-            state.signal_refresh();
-        });
-    }
-}
-
 fn eligible(
     record: &InstanceRecord,
     policy: &ActivationPolicy,
@@ -89,11 +68,7 @@ async fn freeze_one(host: &Host, app: &AppId, after_ms: i64) -> bool {
     snapshot.freeze_attempted_at_ms.insert(app.clone(), now);
     snapshot.snapshotting.insert(app.clone());
     drop(snapshot);
-    let _transition = Transition {
-        state: host.state.clone(),
-        app: app.clone(),
-        held: Some(held),
-    };
+    let _transition = crate::state::InstanceTransition::new(host.state.clone(), app.clone(), held);
     super::network::apply_network(host).await;
     if !host.state.snapshot().await.isolated {
         tracing::warn!(%app, "freeze waits until incoming traffic can reach the activator");
@@ -280,11 +255,11 @@ mod tests {
         let host = quiet_host().await;
         let held = host.state.transition(&app_id()).await;
         host.state.mark_snapshotting(&app_id(), true).await;
-        drop(Transition {
-            state: host.state.clone(),
-            app: app_id(),
-            held: Some(held),
-        });
+        drop(crate::state::InstanceTransition::new(
+            host.state.clone(),
+            app_id(),
+            held,
+        ));
         let _next = host.state.transition(&app_id()).await;
         assert!(!host.state.is_snapshotting(&app_id()).await);
     }
@@ -376,7 +351,7 @@ mod tests {
                 });
             })];
         });
-        super::super::sync_desired(&host, &desired).await;
+        super::super::sync_desired(host.arc(), &desired).await;
         assert_eq!(host.vms.calls(), vec![VmCall::Freeze, VmCall::Thaw]);
         assert_eq!(
             host.state.record(&app_id()).await.unwrap().state,

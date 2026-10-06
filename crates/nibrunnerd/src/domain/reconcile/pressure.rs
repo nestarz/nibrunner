@@ -119,7 +119,11 @@ fn eviction_order(priority: MemoryPriority) -> u8 {
 
 /// The caller holds the host reclaim lock. App locks are tried, never waited on, so a start
 /// holding its own transition cannot deadlock with another start asking to reclaim capacity.
-pub(crate) async fn reclaim_one(host: &Host, purpose: ReclaimPurpose, exclude: Option<&AppId>) -> bool {
+pub(crate) async fn reclaim_one(
+    host: &std::sync::Arc<Host>,
+    purpose: ReclaimPurpose,
+    exclude: Option<&AppId>,
+) -> bool {
     let policies: BTreeMap<_, _> = host
         .cache
         .lock()
@@ -167,7 +171,7 @@ pub(crate) async fn reclaim_one(host: &Host, purpose: ReclaimPurpose, exclude: O
         .collect();
     candidates.sort();
     for (_, _, _, app) in candidates {
-        let Some(_transition) = host.state.try_transition(&app) else {
+        let Some(transition) = host.state.try_transition(&app) else {
             continue;
         };
         let policy = host.cache.lock().await.latest().and_then(|desired| {
@@ -206,8 +210,13 @@ pub(crate) async fn reclaim_one(host: &Host, purpose: ReclaimPurpose, exclude: O
         host.metrics
             .sleep_wake
             .sleep_due(SleepReason::MemoryPressure, std::time::Duration::ZERO);
-        let outcome = super::instances::suspend_instance(host, &app, SleepReason::MemoryPressure).await;
-        host.state.mark_snapshotting(&app, false).await;
+        let outcome = super::instances::suspend_owned(
+            host.clone(),
+            app.clone(),
+            SleepReason::MemoryPressure,
+            transition,
+        )
+        .await;
         if outcome == Some(SleepOutcome::Slept) {
             return true;
         }
@@ -215,7 +224,7 @@ pub(crate) async fn reclaim_one(host: &Host, purpose: ReclaimPurpose, exclude: O
     false
 }
 
-pub(crate) async fn apply(host: &Host) {
+pub(crate) async fn apply(host: &std::sync::Arc<Host>) {
     let Some(config) = host
         .config
         .memory_admission
@@ -446,7 +455,7 @@ mod tests {
     async fn pressure_sleeps_a_preview_before_an_equally_idle_production_app() {
         let host = workloads().await;
         let _reclaiming = host.state.reclaim.lock().await;
-        assert!(reclaim_one(&host, ReclaimPurpose::Pressure, None).await);
+        assert!(reclaim_one(host.arc(), ReclaimPurpose::Pressure, None).await);
         assert_eq!(
             host.state
                 .record(&AppId::parse("preview").unwrap())
@@ -463,7 +472,7 @@ mod tests {
                 .state,
             InstanceState::Running
         );
-        assert!(!reclaim_one(&host, ReclaimPurpose::Deployment, None).await);
+        assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
     }
 
     #[tokio::test]
@@ -474,7 +483,7 @@ mod tests {
         let _reclaiming = host.state.reclaim.lock().await;
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            reclaim_one(&host, ReclaimPurpose::Deployment, None),
+            reclaim_one(host.arc(), ReclaimPurpose::Deployment, None),
         )
         .await;
         assert!(!result.expect("the held transition must not block reclamation"));
@@ -487,10 +496,10 @@ mod tests {
         let preview = AppId::parse("preview").unwrap();
         let request = host.metrics.proxy.open(&preview);
         let _reclaiming = host.state.reclaim.lock().await;
-        assert!(!reclaim_one(&host, ReclaimPurpose::Deployment, None).await);
+        assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
         assert!(host.vms.calls().is_empty());
         drop(request);
-        assert!(reclaim_one(&host, ReclaimPurpose::Deployment, None).await);
+        assert!(reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
     }
 
     #[tokio::test]
@@ -507,6 +516,7 @@ mod tests {
         let candidate = AppId::parse("candidate").unwrap();
         let _transition = host.state.transition(&candidate).await;
         let reservation = host
+            .host
             .reserve_memory(
                 &candidate,
                 protocol::DEFAULT_INSTANCE_RESOURCES,
@@ -531,6 +541,7 @@ mod tests {
             InstanceState::Running
         );
         assert!(host
+            .host
             .reserve_memory(
                 &AppId::parse("another").unwrap(),
                 protocol::DEFAULT_INSTANCE_RESOURCES,
