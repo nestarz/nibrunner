@@ -64,6 +64,8 @@ freeze_after_ms = 60000
 Only `on-request` apps with a `traffic-idle` policy qualify. The threshold must precede the
 snapshot deadline; values below 30 seconds use 30 seconds. Open requests, recent wakes,
 missing activity readings and declared background work prevent freezing.
+Apps with raw ports also remain running until their normal sleep deadline: established raw
+connections can bypass the proxy's open-request accounting, so they cannot yet enter this tier.
 
 | Reported state | Memory and wake behavior |
 | --- | --- |

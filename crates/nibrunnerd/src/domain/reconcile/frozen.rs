@@ -44,6 +44,8 @@ fn eligible(
         && record.desired_running
         && record.expired_at_ms.is_none()
         && record.state == InstanceState::Running
+        // Established raw flows bypass proxy request accounting and cannot be safely paused yet.
+        && record.ports.is_empty()
         && signals.requests_open == 0
         && after_ms < deadline
         && signals.measured_lately(now)
@@ -346,6 +348,14 @@ mod tests {
             assert!(!eligible(&record, &policy, &signals, 60_000, now), "{signals:?}");
         }
         assert!(!eligible(&record, &policy, &quiet, i64::MAX, now));
+        let mut raw = record;
+        raw.ports
+            .push(crate::domain::report::instance_record::RecordPort {
+                name: protocol::PortName::parse("ssh").unwrap(),
+                host_port: protocol::HostPort::new(21_001).unwrap(),
+                guest_port: protocol::GuestPort::new(22).unwrap(),
+            });
+        assert!(!eligible(&raw, &policy, &quiet, 60_000, now));
     }
 
     #[tokio::test]
