@@ -106,17 +106,56 @@ pub fn layer_image_path(cache_dir: &Path, layer: &DesiredLayer) -> PathBuf {
 pub struct LayerImages {
     store: Arc<dyn ArtifactStore>,
     cache_dir: PathBuf,
+    access: tokio::sync::RwLock<()>,
 }
 
 impl LayerImages {
     pub fn new(store: Arc<dyn ArtifactStore>, cache_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Self { store, cache_dir })
+        Arc::new(Self {
+            store,
+            cache_dir,
+            access: tokio::sync::RwLock::new(()),
+        })
     }
 }
 
 #[async_trait]
 impl PayloadBuilder for LayerImages {
+    async fn retain(&self, digests: &std::collections::BTreeSet<Sha256Digest>) -> Result<(), ArtifactError> {
+        let _access = self.access.write().await;
+        let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ArtifactError::Transfer(error.to_string())),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| ArtifactError::Transfer(e.to_string()))?
+        {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(digest) = Sha256Digest::parse(name) else {
+                continue;
+            };
+            if !digests.contains(&digest) {
+                let kind = entry
+                    .file_type()
+                    .await
+                    .map_err(|e| ArtifactError::Transfer(e.to_string()))?;
+                let result = if kind.is_dir() {
+                    tokio::fs::remove_dir_all(entry.path()).await
+                } else {
+                    tokio::fs::remove_file(entry.path()).await
+                };
+                result.map_err(|e| ArtifactError::Transfer(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
     async fn prepare(&self, layers: &[DesiredLayer]) -> Result<PreparedPayload, ArtifactError> {
+        let _access = self.access.read().await;
         let mut layer_image_paths = Vec::with_capacity(layers.len());
         let mut fetched_bytes = 0;
         for layer in layers {
@@ -305,6 +344,34 @@ mod tests {
         let mut bytes = Vec::new();
         filesystem.file(file).reader().read_to_end(&mut bytes).unwrap();
         bytes
+    }
+
+    #[tokio::test]
+    async fn unused_images_are_removed_and_recreated_from_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let builder = LayerImages::new(store(artifact_bytes()), directory.path().to_owned());
+        let layer = layer(|_| {});
+        let path = builder
+            .prepare(std::slice::from_ref(&layer))
+            .await
+            .unwrap()
+            .layer_image_paths[0]
+            .clone();
+        let retained = [layer.digest().clone()].into();
+        builder.retain(&retained).await.unwrap();
+        assert!(
+            path.exists(),
+            "a desired or live instance protects its shared layer"
+        );
+        std::fs::write(directory.path().join("unrelated"), b"keep").unwrap();
+        builder.retain(&Default::default()).await.unwrap();
+        assert!(!path.parent().unwrap().exists());
+        assert!(directory.path().join("unrelated").exists());
+        let restored = builder.prepare(std::slice::from_ref(&layer)).await.unwrap();
+        assert_eq!(restored.fetched_bytes, ARTIFACT_BYTES.len() as u64);
+        assert!(path.exists());
+        builder.retain(&Default::default()).await.unwrap();
+        builder.retain(&Default::default()).await.unwrap();
     }
 
     #[tokio::test]

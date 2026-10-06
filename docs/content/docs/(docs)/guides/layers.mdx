@@ -48,7 +48,9 @@ A download larger than 512 MiB is refused. The guest never needs network access 
 does the fetching.
 
 A layer is downloaded once per host and cached by digest. Ten apps on the same base image share
-one copy.
+one copy. Reconciliation removes cached images once neither the desired document nor an instance
+record references their digest. Sleeping instances keep their layers. A later deployment fetches
+an evicted layer from the artifact store again; collection never deletes the stored object.
 
 ## The volume
 
