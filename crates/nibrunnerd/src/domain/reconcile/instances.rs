@@ -65,7 +65,7 @@ fn record_fields(desired: &DesiredInstance, slot: &nft_render::AppSlot) -> Recor
         restart_policy: desired.config.restart_policy.clone(),
         desired_running: desired.desired_state != DesiredInstanceState::Stopped,
         on_request: desired.desired_state == DesiredInstanceState::OnRequest,
-        expiry: desired.expiry,
+        expiry: desired.expiry.clone(),
     }
 }
 

@@ -531,6 +531,17 @@
     "ExpiryPolicy": {
       "type": "object",
       "properties": {
+        "deadline": {
+          "description": "Stop new requests at this instant, then expire after admitted requests finish.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "idleMs": {
           "$ref": "#/$defs/ExpiryIdleMs"
         }
@@ -956,6 +967,11 @@
       "description": "Handed to the app as is, except that `${NAME}` and `$NAME` are filled in for NAME in NIBRUN_HOSTNAME, NIBRUN_HTTP_PORT; any other `$NIBRUN_` reference is refused.",
       "type": "string",
       "maxLength": 32768
+    },
+    "Timestamp": {
+      "description": "an ISO 8601 instant with an offset",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"
     },
     "VolumeId": {
       "description": "an identifier",

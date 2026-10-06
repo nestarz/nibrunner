@@ -96,6 +96,23 @@ them. Omit `freeze_after_ms` to disable new automatic freezes; requests still wa
 Snapshots record their Firecracker version. An older or unknown snapshot format falls back to
 a cold start with the existing volume; upgrades do not attempt to load an incompatible snapshot.
 
+## Revision retention
+
+An `on-request` instance can set an `expiry` policy with `idleMs` and an optional ISO 8601
+`deadline`. The idle interval restarts with admitted traffic. The absolute deadline does not:
+new requests are refused at that instant, including while an earlier request is still open.
+The host lets admitted requests finish before stopping the instance and deleting its snapshot.
+An indefinitely open stream can therefore delay deletion, but cannot admit more work.
+Production should omit `expiry`; removing the policy makes a retained instance available again.
+The control plane must remove an expired instance from desired state before its volume is deleted.
+
+```json
+"expiry": {
+  "idleMs": 86400000,
+  "deadline": "2026-11-01T00:00:00Z"
+}
+```
+
 ## What wakes it
 
 Any inbound traffic: an HTTP request on one of its hostnames, or anything on a
