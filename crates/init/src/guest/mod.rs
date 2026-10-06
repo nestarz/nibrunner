@@ -9,30 +9,36 @@ mod transport;
 
 use std::process::ExitCode;
 
+use crate::boot::Boot;
+
 use guest_contract::instance_env::{parse_instance_env, InstanceConfig, CONFIG_MAX_BYTES};
 use guest_contract::paths;
 
 const TENANT_UMASK: libc::mode_t = 0o022;
 
-pub(crate) fn run() -> ExitCode {
-    if mounts::dev().is_err() {
-        return shutdown(None);
+pub(crate) fn run(boot_mode: Boot) -> ExitCode {
+    if boot_mode == Boot::VirtualMachine {
+        if mounts::dev().is_err() {
+            return shutdown(boot_mode, None, ExitCode::FAILURE);
+        }
+        adopt_console();
     }
-    adopt_console();
-    log("guest runtime starting");
+    log("runtime starting");
 
     supervisor::block_signals();
-    route_ctrl_alt_del_here();
+    if boot_mode == Boot::VirtualMachine {
+        route_ctrl_alt_del_here();
+    }
 
-    let (config, ceiling) = match boot() {
+    let (config, ceiling) = match boot(boot_mode) {
         Ok(booted) => booted,
         Err(reason) => {
             log(&reason);
-            return shutdown(None);
+            return shutdown(boot_mode, None, ExitCode::FAILURE);
         }
     };
 
-    let transport = guest_contract::channels::ChannelTransport::Vsock;
+    let transport = boot_mode.transport();
     let channels = channels::start(transport);
 
     log(&format!(
@@ -42,28 +48,65 @@ pub(crate) fn run() -> ExitCode {
         config.working_directory,
         crate::ceiling::mib(ceiling.limit_bytes)
     ));
-    match supervisor::supervise(&config, &ceiling, transport) {
-        supervisor::Ended::ShutdownRequested => log("the tenant has stopped; shutting the guest down"),
-        supervisor::Ended::RestartBudgetExhausted => log(&format!(
-            "the tenant used its {} restarts without staying up; shutting the guest down",
-            config.max_restarts
-        )),
-        supervisor::Ended::SpawnFailed => {
-            log("the tenant could not be started at all; shutting the guest down")
+    let result = match supervisor::supervise(&config, &ceiling, transport) {
+        supervisor::Ended::ShutdownRequested => {
+            log("the tenant has stopped; shutting the runtime down");
+            ExitCode::SUCCESS
         }
-    }
-    shutdown(Some(&channels))
+        supervisor::Ended::RestartBudgetExhausted => {
+            log(&format!(
+                "the tenant used its {} restarts without staying up; shutting the runtime down",
+                config.max_restarts
+            ));
+            ExitCode::FAILURE
+        }
+        supervisor::Ended::SpawnFailed => {
+            log("the tenant could not be started at all; shutting the runtime down");
+            ExitCode::FAILURE
+        }
+    };
+    shutdown(boot_mode, Some(&channels), result)
 }
 
-fn boot() -> Result<(InstanceConfig, memory::Ceiling), String> {
+fn boot(boot_mode: Boot) -> Result<(InstanceConfig, memory::Ceiling), String> {
     unsafe { libc::umask(TENANT_UMASK) };
-    mounts::pseudo_filesystems().map_err(|error| error.to_string())?;
-    memory::mount().map_err(|error| error.to_string())?;
-    let ceiling = memory::prepare(guest_memory_bytes())?;
-    let config = read_instance_config()?;
-    stack_root(&config)?;
-    write_resolv_conf(&config)?;
-    Ok((config, ceiling))
+    match boot_mode {
+        Boot::VirtualMachine => {
+            mounts::pseudo_filesystems().map_err(|error| error.to_string())?;
+            memory::mount().map_err(|error| error.to_string())?;
+            let ceiling = memory::prepare(guest_memory_bytes())?;
+            mounts::config(paths::CONFIG_DEVICE, paths::CONFIG_MOUNT).map_err(|error| error.to_string())?;
+            let config = read_instance_config()?;
+            nix::mount::umount(paths::CONFIG_MOUNT)
+                .map_err(|error| format!("{} could not be unmounted: {error}", paths::CONFIG_MOUNT))?;
+            stack_root(&config)?;
+            write_resolv_conf(&config)?;
+            Ok((config, ceiling))
+        }
+        Boot::PreparedRoot => {
+            let ceiling = memory::adopt()?;
+            let config = read_instance_config()?;
+            validate_prepared_mounts()?;
+            Ok((config, ceiling))
+        }
+    }
+}
+
+fn validate_prepared_mounts() -> Result<(), String> {
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").map_err(|error| error.to_string())?;
+    for required in [
+        paths::ROOT_MOUNT,
+        paths::VOLUME_MOUNT,
+        guest_contract::channels::PROCESS_CHANNEL_DIRECTORY,
+    ] {
+        if !mounts
+            .lines()
+            .any(|line| line.split_whitespace().nth(4) == Some(required))
+        {
+            return Err(format!("the runtime did not prepare the mount at {required}"));
+        }
+    }
+    Ok(())
 }
 
 fn guest_memory_bytes() -> u64 {
@@ -72,7 +115,6 @@ fn guest_memory_bytes() -> u64 {
 }
 
 fn read_instance_config() -> Result<InstanceConfig, String> {
-    mounts::config(paths::CONFIG_DEVICE, paths::CONFIG_MOUNT).map_err(|error| error.to_string())?;
     let text = std::fs::read_to_string(paths::CONFIG_FILE)
         .map_err(|error| format!("{} could not be read: {error}", paths::CONFIG_FILE))?;
     if text.len() > CONFIG_MAX_BYTES {
@@ -82,8 +124,6 @@ fn read_instance_config() -> Result<InstanceConfig, String> {
         ));
     }
     let config = parse_instance_env(&text).map_err(|error| error.to_string())?;
-    nix::mount::umount(paths::CONFIG_MOUNT)
-        .map_err(|error| format!("{} could not be unmounted: {error}", paths::CONFIG_MOUNT))?;
     log(&format!(
         "instance configured: port {}, {} environment variables, {} nameservers",
         config.http_port,
@@ -159,9 +199,12 @@ fn in_root(path: &str) -> String {
     format!("{}{path}", paths::ROOT_MOUNT)
 }
 
-fn shutdown(channels: Option<&channels::Channels>) -> ExitCode {
+fn shutdown(boot_mode: Boot, channels: Option<&channels::Channels>, result: ExitCode) -> ExitCode {
     if let Some(channels) = channels {
         channels.stop();
+    }
+    if boot_mode == Boot::PreparedRoot {
+        return result;
     }
     // The stacked root holds the volume busy, so it goes first; both lazily, because a program
     // that has just been killed may still be letting go of what it had open.

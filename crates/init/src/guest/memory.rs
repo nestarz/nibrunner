@@ -64,6 +64,28 @@ pub(crate) fn prepare(guest_total_bytes: u64) -> Result<Ceiling, String> {
     })
 }
 
+pub(crate) fn adopt() -> Result<Ceiling, String> {
+    let filesystem = nix::sys::statfs::statfs(CGROUP_ROOT).map_err(|error| error.to_string())?;
+    if filesystem.filesystem_type() != nix::sys::statfs::CGROUP2_SUPER_MAGIC {
+        return Err("the runtime did not provide a cgroup v2 hierarchy".into());
+    }
+    let read_limit = |path: &str| -> Result<u64, String> {
+        let value = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+        bounded_limit(&value).ok_or_else(|| format!("{path} is not a positive finite memory limit"))
+    };
+    let parent = read_limit(&format!("{CGROUP_ROOT}/memory.max"))?;
+    let tenant = read_limit(&format!("{TENANT_CGROUP}/memory.max"))?;
+    Ok(Ceiling {
+        limit_bytes: parent.min(tenant),
+        procs_file: CString::new(format!("{TENANT_CGROUP}/cgroup.procs"))
+            .map_err(|_| "the cgroup path holds a nul byte".to_string())?,
+    })
+}
+
+fn bounded_limit(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|limit| *limit > 0)
+}
+
 /// Puts the calling process into the tenant's cgroup. Called by the forked child before it
 /// execs, so it uses nothing that allocates: the path was made into a C string before the fork
 /// and the pid is formatted on the stack.
@@ -117,4 +139,17 @@ pub(crate) fn reclaim(reclaimer: &mut crate::reclaim::Reclaimer) -> std::io::Res
         .write(true)
         .open(format!("{TENANT_CGROUP}/memory.reclaim"))?;
     reclaimer.reclaim(file, bytes, std::time::Duration::from_millis(500))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_prepared_runtime_must_have_finite_kernel_limits() {
+        assert_eq!(bounded_limit("104857600\n"), Some(104857600));
+        for value in ["max", "0", "-1", "", "104857600M", "18446744073709551616"] {
+            assert_eq!(bounded_limit(value), None);
+        }
+    }
 }

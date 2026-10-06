@@ -16,6 +16,9 @@ mod supervise;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod reclaim;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod boot;
+
 #[cfg(target_os = "linux")]
 mod guest;
 
@@ -29,7 +32,18 @@ fn child_process_guard() -> std::sync::MutexGuard<'static, ()> {
 fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
     {
-        guest::run()
+        let boot = match boot::Boot::parse(std::env::args().skip(1)) {
+            Ok(boot) => boot,
+            Err(message) => {
+                eprintln!("{message}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        if nix::unistd::getpid().as_raw() != 1 {
+            eprintln!("nibrunner-init must run as PID 1 in its runtime namespace");
+            return std::process::ExitCode::FAILURE;
+        }
+        guest::run(boot)
     }
     #[cfg(not(target_os = "linux"))]
     {

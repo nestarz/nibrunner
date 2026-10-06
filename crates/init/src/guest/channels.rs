@@ -6,12 +6,14 @@ use crate::guest::{control, filesystem, log};
 pub(crate) struct Channels {
     control: Option<Pid>,
     files: Option<Pid>,
+    transport: ChannelTransport,
 }
 
 pub(crate) fn start(transport: ChannelTransport) -> Channels {
     Channels {
         control: fork_channel("control", transport, control::serve),
         files: fork_channel("filesystem", transport, filesystem::serve),
+        transport,
     }
 }
 
@@ -20,7 +22,9 @@ impl Channels {
         for pid in [self.control, self.files].into_iter().flatten() {
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
         }
-        control::thaw_quietly();
+        if self.transport == ChannelTransport::Vsock {
+            control::thaw_quietly();
+        }
         for pid in [self.control, self.files].into_iter().flatten() {
             let _ = nix::sys::wait::waitpid(pid, None);
         }

@@ -26,13 +26,17 @@ pub(crate) fn serve(channel_transport: ChannelTransport) -> ! {
     };
     loop {
         match transport::accept_one(&listener) {
-            Ok(connection) => answer(connection, &mut reclaimer),
+            Ok(connection) => answer(connection, &mut reclaimer, channel_transport),
             Err(_) => std::thread::sleep(POLL_INTERVAL),
         }
     }
 }
 
-fn answer(connection: OwnedFd, reclaimer: &mut crate::reclaim::Reclaimer) {
+fn answer(
+    connection: OwnedFd,
+    reclaimer: &mut crate::reclaim::Reclaimer,
+    channel_transport: ChannelTransport,
+) {
     let mut wire = BufReader::new(std::fs::File::from(connection));
     let mut request = String::new();
     if wire.read_line(&mut request).is_err() {
@@ -61,6 +65,10 @@ fn answer(connection: OwnedFd, reclaimer: &mut crate::reclaim::Reclaimer) {
         .trim()
         .strip_prefix(guest_contract::control::TENANT_CLOCK_REQUEST)
     {
+        if channel_transport != ChannelTransport::Vsock {
+            let _ = wire.get_mut().write_all(b"REFUSED\n");
+            return;
+        }
         let result = synchronize_clock(nanos, &mut wire);
         if let Err(error) = result {
             log(&format!("the tenant's clock could not be synchronized: {error}"));
@@ -69,6 +77,12 @@ fn answer(connection: OwnedFd, reclaimer: &mut crate::reclaim::Reclaimer) {
         return;
     }
     if request.trim() != FREEZE_REQUEST {
+        return;
+    }
+    // A prepared volume can be a bind mount on the host filesystem. FIFREEZE would stop
+    // writes to every app on that filesystem, not just this runtime's volume.
+    if channel_transport != ChannelTransport::Vsock {
+        let _ = wire.get_mut().write_all(b"REFUSED\n");
         return;
     }
     if let Err(error) = freeze(paths::VOLUME_MOUNT) {
