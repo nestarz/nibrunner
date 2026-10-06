@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use protocol::{AppId, GuestPort, HostPort, Ipv4Address};
 
-use crate::slot::{GUEST_NETWORK_CIDR, TAP_NAME_PREFIX};
+use crate::slot::{GUEST_NETWORK_CIDR, INTERFACE_NAME_PREFIX};
 
 pub const NFTABLES_TABLE: &str = "nibrun";
 
@@ -85,8 +85,8 @@ pub struct FirewallState {
     pub denied_egress_addresses_v6: Vec<String>,
 }
 
-fn tap_match() -> String {
-    format!("\"{TAP_NAME_PREFIX}*\"")
+fn interface_match() -> String {
+    format!("\"{INTERFACE_NAME_PREFIX}*\"")
 }
 
 fn set(values: &[&str]) -> String {
@@ -156,7 +156,7 @@ fn traffic_chains_v4(state: &FirewallState) -> Vec<String> {
     if state.instances.is_empty() {
         return Vec::new();
     }
-    let tap = tap_match();
+    let tap = interface_match();
     let mut output_rules = vec!["type filter hook output priority filter; policy accept;".to_string()];
     output_rules.extend(state.instances.iter().flat_map(|instance| {
         [
@@ -242,7 +242,7 @@ fn denied_egress_rules(tap: &str, daddr: &str, cidrs: &[String]) -> Vec<String> 
 }
 
 fn forward_chain_v4(state: &FirewallState) -> Vec<String> {
-    let tap = tap_match();
+    let tap = interface_match();
     let mut rules = vec!["type filter hook forward priority filter; policy accept;".to_string()];
     rules.extend(denied_egress_rules(
         &tap,
@@ -267,7 +267,7 @@ fn input_chain_v4(state: &FirewallState) -> Vec<String> {
 }
 
 fn input_chain(state: &FirewallState, ipv4: bool) -> Vec<String> {
-    let tap = tap_match();
+    let tap = interface_match();
     let (daddr, denied) = if ipv4 {
         ("ip daddr", &state.denied_egress_addresses_v4)
     } else {
@@ -296,7 +296,7 @@ fn input_chain(state: &FirewallState, ipv4: bool) -> Vec<String> {
 }
 
 fn forward_chain_v6(state: &FirewallState) -> Vec<String> {
-    let tap = tap_match();
+    let tap = interface_match();
     let mut rules = vec!["type filter hook forward priority filter; policy accept;".to_string()];
     rules.extend(denied_egress_rules(
         &tap,
@@ -320,7 +320,7 @@ fn input_chain_v6(state: &FirewallState) -> Vec<String> {
 }
 
 fn nat_chains_v4(state: &FirewallState) -> Vec<String> {
-    let tap = tap_match();
+    let tap = interface_match();
     let mut prerouting = vec!["type nat hook prerouting priority dstnat; policy accept;".to_string()];
     prerouting.extend(state.instances.iter().flat_map(|instance| {
         let tap = tap.clone();

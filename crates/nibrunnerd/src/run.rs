@@ -9,8 +9,8 @@ use crate::adapters::exec::HostCommands;
 use crate::adapters::logs::receiver::TenantLogReceiver;
 use crate::adapters::logs::FileLogSink;
 use crate::adapters::net::allocator::SlotAllocator;
+use crate::adapters::net::attachment::HostNetwork;
 use crate::adapters::net::firewall::HostFirewall;
-use crate::adapters::net::tap::HostNetwork;
 use crate::adapters::proxy::access::AccessLog;
 use crate::adapters::proxy::activator::AppActivator;
 use crate::adapters::proxy::{router, Router};
@@ -91,7 +91,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     };
     let payloads = LayerImages::new(artifacts.clone(), config.artifact_cache_dir());
     let metrics = Arc::new(crate::domain::metrics::HostMetrics::new());
-    let network = open_network()?;
+    let network = open_network(config.runtime_dir.join("network"))?;
     let logs = TenantLogReceiver::new();
     let files = Arc::new(FileLogSink::new(
         config.logs_dir(),
@@ -246,14 +246,14 @@ impl crate::ports::Waker for DeferredWaker {
 }
 
 #[cfg(target_os = "linux")]
-fn open_network() -> Result<Arc<dyn HostNetwork>, StartupError> {
-    crate::adapters::net::tap::KernelNetwork::open()
+fn open_network(namespace_dir: std::path::PathBuf) -> Result<Arc<dyn HostNetwork>, StartupError> {
+    crate::adapters::net::attachment::KernelNetwork::open(namespace_dir)
         .map(|network| Arc::new(network) as Arc<dyn HostNetwork>)
         .map_err(|error| StartupError::Unusable(error.message()))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_network() -> Result<Arc<dyn HostNetwork>, StartupError> {
+fn open_network(_namespace_dir: std::path::PathBuf) -> Result<Arc<dyn HostNetwork>, StartupError> {
     Err(StartupError::Unusable(
         "a microVM needs a Linux kernel with /dev/kvm".into(),
     ))

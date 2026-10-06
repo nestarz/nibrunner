@@ -63,7 +63,7 @@ backhand.workspace = true
 sha2.workspace = true
 hex.workspace = true
 libc.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["mount", "sched"] }
 uuid.workspace = true
 async-trait = "0.1"
 mockall = { workspace = true, optional = true }

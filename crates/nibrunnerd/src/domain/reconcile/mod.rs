@@ -701,7 +701,7 @@ mod tests {
         host.vms.set_status(stopped_vm());
         reconcile(host.arc(), &desired_state(|_| {}), Trigger::Change).await;
         assert!(host.slot_of(&app_id()).await.is_none());
-        assert_eq!(host.vms.removed_taps(), vec!["nbr0".to_string()]);
+        assert_eq!(host.vms.removed_attachments(), vec!["nbr0".to_string()]);
         assert!(host.repositories.slots.all().await.unwrap().is_empty());
         let snapshot = host.state.snapshot().await;
         assert_eq!(snapshot.volume_reports[0].state, protocol::VolumeState::Detached);

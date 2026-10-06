@@ -193,8 +193,8 @@ pub trait Vmm: Send + Sync {
     }
     async fn stop(&self, app_id: &AppId) -> Result<(), VmError>;
     async fn discard(&self, app_id: &AppId) -> Result<(), VmError>;
-    async fn delete_tap(&self, tap_name: &str) -> Result<(), VmError>;
-    async fn tap_names(&self) -> Vec<String>;
+    async fn delete_attachment(&self, interface_name: &str) -> Result<(), VmError>;
+    async fn attachment_names(&self) -> Vec<String>;
     async fn statuses(&self, app_ids: &[AppId]) -> BTreeMap<AppId, VmStatus>;
     async fn memory(&self, _app_ids: &[AppId]) -> BTreeMap<AppId, protocol::ReportedMemory> {
         BTreeMap::new()
@@ -371,7 +371,7 @@ pub enum VmCall {
     Wake,
     Stop,
     Discard,
-    DeleteTap,
+    DeleteAttachment,
 }
 
 #[cfg(test)]

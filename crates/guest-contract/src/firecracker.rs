@@ -23,7 +23,7 @@ pub fn netmask_for(prefix_length: u8) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmNetwork {
-    pub tap_name: String,
+    pub interface_name: String,
     pub guest_mac: String,
     pub guest_ipv4: Ipv4Address,
     pub host_ipv4: Ipv4Address,
@@ -182,7 +182,7 @@ pub fn render_firecracker_config(
         },
         network_interfaces: vec![NetworkInterface {
             iface_id: NETWORK_INTERFACE_ID.to_string(),
-            host_dev_name: network.tap_name.clone(),
+            host_dev_name: network.interface_name.clone(),
             guest_mac: network.guest_mac.clone(),
         }],
         vsock: VsockDevice {
@@ -199,7 +199,7 @@ mod tests {
 
     fn network() -> VmNetwork {
         VmNetwork {
-            tap_name: "nbr3".into(),
+            interface_name: "nbr3".into(),
             guest_mac: "02:00:0a:c9:00:0e".into(),
             guest_ipv4: Ipv4Address::parse("10.201.0.14").unwrap(),
             host_ipv4: Ipv4Address::parse("10.201.0.13").unwrap(),
