@@ -110,33 +110,7 @@ impl Host {
                 .reserve_for_operation(self.guest_memory_mib, app_id, wanted, operation, None)
                 .await;
         };
-        let reservation_generation = self.state.memory_generation();
-        let records = self.state.records().await;
-        let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
-        let apps = self.vms.memory(&ids).await;
-        let ceilings = ids
-            .iter()
-            .chain(std::iter::once(app_id))
-            .filter_map(|app| {
-                self.runtime_policy
-                    .vm_budget(app)
-                    .map(|budget| (app.clone(), u64::from(budget.memory_mib.get()) * 1_048_576))
-            })
-            .collect();
-        let measured =
-            crate::domain::report::capacity::read_memory_available_bytes().map(|available_bytes| {
-                (
-                    policy.mode,
-                    crate::domain::memory_admission::MemoryReadings {
-                        reservation_generation,
-                        available_bytes,
-                        headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
-                        measured_at_ms: crate::clock::now_ms(),
-                        apps,
-                        ceilings,
-                    },
-                )
-            });
+        let measured = self.memory_readings(Some(app_id)).await;
         if measured.is_none() && policy.mode == crate::config::MemoryAdmissionMode::Adaptive {
             tracing::warn!(%app_id, "memory admission waits for a host memory reading");
             return Err(u64::from(wanted.memory_mib));
@@ -144,6 +118,41 @@ impl Host {
         self.state
             .reserve_for_operation(self.guest_memory_mib, app_id, wanted, operation, measured)
             .await
+    }
+
+    pub(crate) async fn memory_readings(
+        &self,
+        additional_app: Option<&AppId>,
+    ) -> Option<(
+        crate::config::MemoryAdmissionMode,
+        crate::domain::memory_admission::MemoryReadings,
+    )> {
+        let reservation_generation = self.state.memory_generation();
+        let records = self.state.records().await;
+        let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
+        let apps = self.vms.memory(&ids).await;
+        let ceilings = ids
+            .iter()
+            .chain(additional_app)
+            .filter_map(|app| {
+                self.runtime_policy
+                    .vm_budget(app)
+                    .map(|budget| (app.clone(), u64::from(budget.memory_mib.get()) * 1_048_576))
+            })
+            .collect();
+        let policy = self.config.memory_admission.as_ref();
+        Some((
+            policy.map_or(crate::config::MemoryAdmissionMode::Observe, |policy| policy.mode),
+            crate::domain::memory_admission::MemoryReadings {
+                reservation_generation,
+                available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
+                headroom_bytes: u64::from(policy.map_or(1024, |policy| policy.headroom_mib.get()))
+                    * 1_048_576,
+                measured_at_ms: crate::clock::now_ms(),
+                apps,
+                ceilings,
+            },
+        ))
     }
 
     pub async fn slot_for(

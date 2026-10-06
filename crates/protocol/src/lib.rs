@@ -4,6 +4,7 @@
 mod wire;
 mod control;
 mod domain;
+pub mod memory;
 #[cfg(feature = "schema")]
 pub mod schema;
 

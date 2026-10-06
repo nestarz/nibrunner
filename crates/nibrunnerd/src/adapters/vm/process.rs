@@ -400,7 +400,7 @@ impl VmProcesses {
     }
 }
 
-fn process_start_ticks(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_ticks(pid: i32) -> Option<u64> {
     start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
