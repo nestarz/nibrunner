@@ -37,27 +37,45 @@ async fn real_build_services_hold_memory_until_their_work_has_exited() {
     let socket = host.config.runtime_dir.join(protocol::memory::SOCKET_NAME);
     let unit = format!("nibrunner-memory-client-{id}");
     let executable = std::env::current_exe().unwrap();
-    let result = commands()
-        .run(nibrunnerd::ports::CommandRequest::new(&[
-            "systemd-run",
-            "--wait",
-            "--pipe",
-            "--collect",
-            "--unit",
-            &unit,
-            "--property=RuntimeMaxSec=30",
-            "--setenv=NIBRUNNER_INTEGRATION=1",
-            &format!("--setenv=NIBRUNNER_MEMORY_TEST_SOCKET={}", socket.display()),
-            &format!("--setenv=NIBRUNNER_MEMORY_TEST_ID={id}"),
-            executable.to_str().unwrap(),
-            "--exact",
-            "memory_lease_client_process",
-            "--nocapture",
-        ]))
-        .await
-        .unwrap();
+    let runner = commands();
+    let request = nibrunnerd::ports::CommandRequest::new(&[
+        "systemd-run",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--unit",
+        &unit,
+        "--property=RuntimeMaxSec=60",
+        "--setenv=NIBRUNNER_INTEGRATION=1",
+        &format!("--setenv=NIBRUNNER_MEMORY_TEST_SOCKET={}", socket.display()),
+        &format!("--setenv=NIBRUNNER_MEMORY_TEST_ID={id}"),
+        executable.to_str().unwrap(),
+        "--exact",
+        "memory_lease_client_process",
+        "--nocapture",
+    ]);
+    let observed = async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+        while tokio::time::Instant::now() < deadline {
+            if nibrunnerd::test_support::external_resident_memory(&host.state)
+                .get(&id)
+                .is_some_and(|bytes| *bytes >= 16 * 1_048_576)
+            {
+                std::fs::write(socket.with_extension("measured"), b"").unwrap();
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    };
+    let (result, observed) = tokio::join!(runner.run(request), observed);
+    let result = result.unwrap();
     server.abort();
     assert_eq!(result.code, 0, "{}\n{}", result.stdout, result.stderr);
+    assert!(
+        observed,
+        "a live bounded build must expose its resident anonymous memory"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -145,6 +163,34 @@ fn memory_lease_client_process() {
         }
         assert_eq!(request(Request::Release { id: id.clone() }), Reply::Released);
     }
+    let own_unit = format!("nibrunner-memory-client-{id}.service");
+    assert!(std::process::Command::new("systemctl")
+        .args(["set-property", "--runtime", &own_unit, "MemoryMax=256M"])
+        .status()
+        .unwrap()
+        .success());
+    let granted = request(Request::Acquire {
+        id,
+        unit: own_unit,
+        memory_mib: 256.try_into().unwrap(),
+        minimum_mib: None,
+    });
+    assert!(matches!(granted, Reply::Granted { .. }), "{granted:?}");
+    let mut allocation = vec![0u8; 32 * 1_048_576];
+    for page in allocation.chunks_mut(4096) {
+        page[0] = 1;
+    }
+    std::hint::black_box(&allocation);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let measured = std::path::Path::new(&socket).with_extension("measured");
+    while !measured.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the broker did not measure its build"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::hint::black_box(&allocation);
 }
 
 #[cfg(target_os = "linux")]

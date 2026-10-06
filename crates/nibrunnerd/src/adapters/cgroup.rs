@@ -1,4 +1,5 @@
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -18,6 +19,84 @@ pub(crate) fn cgroup_path(membership: &str) -> Option<PathBuf> {
         return None;
     }
     Some(Path::new("/sys/fs/cgroup").join(path))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemoryGroup {
+    membership: String,
+    device: u64,
+    inode: u64,
+}
+
+impl MemoryGroup {
+    pub(crate) fn capture(owner: &str, unit: &str) -> Option<Self> {
+        let owner = cgroup_path(&format!("0::{owner}"))?;
+        let path = owner
+            .ancestors()
+            .find(|path| path.file_name().is_some_and(|name| name == unit))?;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            membership: format!("/{}", path.strip_prefix("/sys/fs/cgroup").ok()?.to_str()?),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    pub(crate) fn belongs_to(&self, owner: &str, unit: &str) -> bool {
+        let Some(path) = cgroup_path(&format!("0::{}", self.membership)) else {
+            return false;
+        };
+        path.file_name().is_some_and(|name| name == unit)
+            && cgroup_path(&format!("0::{owner}")).is_some_and(|owner| owner.starts_with(path))
+    }
+
+    pub(crate) fn resident_bytes(&self, grant: u64) -> Option<u64> {
+        self.resident_at(&cgroup_path(&format!("0::{}", self.membership))?, grant)
+    }
+
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        let path = Path::new(&self.membership);
+        let other = Path::new(&other.membership);
+        path.starts_with(other) || other.starts_with(path)
+    }
+
+    fn resident_at(&self, path: &Path, grant: u64) -> Option<u64> {
+        let same_group = || {
+            std::fs::metadata(path)
+                .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        };
+        if !same_group() {
+            return None;
+        }
+        let read = |name| {
+            std::fs::read_to_string(path.join(name))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        let limit = read("memory.max")?;
+        if limit > grant {
+            return None;
+        }
+        let stat = std::fs::read_to_string(path.join("memory.stat")).ok()?;
+        let counter = |name| {
+            stat.lines().find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.parse::<u64>().ok()).flatten()
+            })
+        };
+        let anonymous_lru = counter("active_anon")?
+            .saturating_add(counter("inactive_anon")?)
+            .saturating_sub(counter("shmem")?);
+        // File-LRU pages, including MADV_FREE, are already credited by MemAvailable. Swap is future growth.
+        let resident = counter("anon")?
+            .min(anonymous_lru)
+            .min(read("memory.current")?)
+            .min(limit);
+        same_group().then_some(resident)
+    }
 }
 
 pub(crate) struct Group {
@@ -128,6 +207,55 @@ impl Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_resident_anonymous_memory_in_the_original_bounded_group_is_discounted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("build.slice");
+        std::fs::create_dir(&path).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let group = MemoryGroup {
+            membership: "/build.slice".into(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        std::fs::write(path.join("memory.current"), "800").unwrap();
+        std::fs::write(
+            path.join("memory.stat"),
+            "file 600\nanon 250\nactive_anon 180\ninactive_anon 60\nshmem 40\n",
+        )
+        .unwrap();
+        std::fs::write(path.join("memory.swap.current"), "400").unwrap();
+        for (limit, expected) in [("1024", Some(200)), ("2048", None), ("max", None)] {
+            std::fs::write(path.join("memory.max"), limit).unwrap();
+            assert_eq!(group.resident_at(&path, 1024), expected);
+        }
+        std::fs::write(path.join("memory.max"), "1024").unwrap();
+        std::fs::rename(&path, directory.path().join("old.slice")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for name in ["memory.current", "memory.stat", "memory.max"] {
+            std::fs::copy(directory.path().join("old.slice").join(name), path.join(name)).unwrap();
+        }
+        assert_eq!(group.resident_at(&path, 1024), None);
+    }
+
+    #[test]
+    fn a_tracked_budget_must_contain_its_owner_and_overlap_uses_path_components() {
+        let group = MemoryGroup {
+            membership: "/build.slice".into(),
+            device: 0,
+            inode: 1,
+        };
+        assert!(group.belongs_to("/build.slice/parent.service", "build.slice"));
+        assert!(!group.belongs_to("/build.slice-other/parent.service", "build.slice"));
+        assert!(!group.belongs_to("/build.slice/parent.service", "other.slice"));
+        let mut other = group.clone();
+        assert!(group.overlaps(&other));
+        other.membership = "/build.slice/child.service".into();
+        assert!(group.overlaps(&other));
+        other.membership = "/build.slice-other".into();
+        assert!(!group.overlaps(&other));
+    }
 
     fn group(directory: &Path, frozen: bool) -> Group {
         std::fs::write(

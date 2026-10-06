@@ -48,6 +48,10 @@ pub fn app_id() -> AppId {
     AppId::parse("app-1").unwrap()
 }
 
+pub fn external_resident_memory(state: &crate::state::HostState) -> std::collections::BTreeMap<String, u64> {
+    state.external_resident_memory()
+}
+
 pub fn volume_id() -> VolumeId {
     VolumeId::parse("vol-1").unwrap()
 }

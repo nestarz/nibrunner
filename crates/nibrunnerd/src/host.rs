@@ -131,6 +131,7 @@ impl Host {
         let records = self.state.records().await;
         let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
         let apps = self.vms.memory(&ids).await;
+        let external_resident_bytes = self.state.external_resident_memory();
         let ceilings = ids
             .iter()
             .chain(additional_app)
@@ -150,6 +151,7 @@ impl Host {
                     * 1_048_576,
                 measured_at_ms: crate::clock::now_ms(),
                 apps,
+                external_resident_bytes,
                 ceilings,
             },
         ))

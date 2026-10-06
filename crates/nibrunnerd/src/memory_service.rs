@@ -77,6 +77,8 @@ struct Lease {
     memory_mib: NonZeroU32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     range: Option<MemoryRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<crate::adapters::cgroup::MemoryGroup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,12 +159,19 @@ impl MemoryService {
                 || isolated_group(&lease.owner.cgroup).is_none()
                 || lease.requested().minimum > lease.memory_mib
                 || lease.memory_mib > lease.requested().preferred
+                || lease
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| !group.belongs_to(&lease.owner.cgroup, &lease.unit))
             {
                 return Err(io::Error::other("the memory lease ledger is invalid"));
             }
         }
         for (id, lease) in &ledger.leases {
             host.state.restore_external(id, lease.memory_mib);
+            if let Some(group) = &lease.group {
+                host.state.track_external_group(id, group.clone());
+            }
         }
         Ok(Arc::new(Self {
             host,
@@ -195,6 +204,7 @@ impl MemoryService {
                     });
                 }
                 let mut lease = Lease {
+                    group: crate::adapters::cgroup::MemoryGroup::capture(&owner.cgroup, &unit),
                     owner,
                     unit,
                     memory_mib,
@@ -229,12 +239,16 @@ impl MemoryService {
                     Err(reply) => return Ok(reply),
                 };
                 lease.memory_mib = memory_mib;
+                let group = lease.group.clone();
                 held.leases.insert(id.clone(), lease);
                 if let Err(error) = self.persist(&held) {
                     held.leases.remove(&id);
                     return Err(error);
                 }
                 reservation.retain();
+                if let Some(group) = group {
+                    self.host.state.track_external_group(&id, group);
+                }
                 Ok(Reply::Granted { memory_mib })
             }
             Request::Release { id } => {
@@ -479,6 +493,7 @@ mod tests {
                     unit: UNIT.into(),
                     memory_mib: 512.try_into().unwrap(),
                     range: None,
+                    group: None,
                 },
             )]),
         }
