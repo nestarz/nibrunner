@@ -407,16 +407,16 @@ async fn a_shared_workload_pool_contains_a_spike_and_prefers_production_over_pre
     }
     let parent = std::path::Path::new("/sys/fs/cgroup").join(&slice.0);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let killed = loop {
+    let parent_ooms = loop {
         let events = std::fs::read_to_string(parent.join("memory.events.local")).unwrap();
-        let killed = events
+        let parent_ooms = events
             .lines()
-            .find_map(|line| line.strip_prefix("oom_kill "))
+            .find_map(|line| line.strip_prefix("oom "))
             .unwrap()
             .parse::<u64>()
             .unwrap();
-        if killed > 0 || tokio::time::Instant::now() >= deadline {
-            break killed;
+        if parent_ooms > 0 || tokio::time::Instant::now() >= deadline {
+            break parent_ooms;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     };
@@ -429,7 +429,10 @@ async fn a_shared_workload_pool_contains_a_spike_and_prefers_production_over_pre
     let preview_active = processes.status(&preview).active;
     processes.stop(&production).await;
     processes.stop(&preview).await;
-    assert!(killed > 0, "the combined allocations must reach the parent limit");
+    assert!(
+        parent_ooms > 0,
+        "the combined allocations must reach the parent limit"
+    );
     assert!(
         production_active,
         "the production process must survive the preview spike"
