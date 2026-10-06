@@ -1164,9 +1164,15 @@ async fn every_browse_verb_answers_from_a_running_guest() {
 
     let app_id = protocol::AppId::parse("browse").unwrap();
     let socket = std::path::PathBuf::from(socket);
-    let mut guest = GuestFilesystem::dial(&app_id, &socket)
-        .await
-        .expect("a guest answers on its control socket");
+    let mut guest = GuestFilesystem::dial(
+        &app_id,
+        &guest_contract::channels::ChannelEndpoint {
+            path: socket,
+            vsock_port: Some(guest_contract::vsock::GUEST_FILESYSTEM_VSOCK_PORT),
+        },
+    )
+    .await
+    .expect("a guest answers on its control socket");
 
     // Every path a guest is asked for is resolved inside the volume its own app owns, so the
     // root here is the tenant's data directory rather than the guest's filesystem.

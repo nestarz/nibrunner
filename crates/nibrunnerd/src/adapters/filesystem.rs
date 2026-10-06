@@ -349,7 +349,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(refusal.to_string().contains("no microVM is running"), "{refusal}");
+        assert!(refusal.to_string().contains("no runtime is running"), "{refusal}");
     }
 
     async fn asked_over(socket_path: &Path, uri: &str) -> (StatusCode, serde_json::Value) {

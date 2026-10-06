@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use guest_contract::paths;
 
-use crate::guest::{log, vsock};
+use crate::guest::{log, transport};
+use guest_contract::channels::{Channel, ChannelTransport};
 
 const FREEZE_REQUEST: &str = "FREEZE";
 const FREEZE_HELD: &str = "OK";
@@ -15,16 +16,16 @@ const MAX_HOLD: Duration = Duration::from_secs(900);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub(crate) fn serve() -> ! {
+pub(crate) fn serve(channel_transport: ChannelTransport) -> ! {
     let mut reclaimer = crate::reclaim::Reclaimer::default();
-    let Ok(listener) = vsock::listener(guest_contract::vsock::GUEST_CONTROL_VSOCK_PORT) else {
+    let Ok(listener) = transport::listener(channel_transport, Channel::Control) else {
         log("the control port could not be opened; no export can freeze this tenant");
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
     };
     loop {
-        match vsock::accept_one(&listener) {
+        match transport::accept_one(&listener) {
             Ok(connection) => answer(connection, &mut reclaimer),
             Err(_) => std::thread::sleep(POLL_INTERVAL),
         }

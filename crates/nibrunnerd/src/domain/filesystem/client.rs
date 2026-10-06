@@ -1,6 +1,6 @@
-use std::path::Path;
 use std::time::Duration;
 
+use guest_contract::channels::ChannelEndpoint;
 use guest_contract::filesystem::{
     decode_compute, decode_details, decode_header, decode_listing, decode_usage, decode_written,
     encode_request, fits_one_request, is_refusal, refusal_for, FilesystemDetails, GuestFilesystemRequest,
@@ -14,7 +14,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum GuestFilesystemError {
-    #[error("no microVM is running on this host for {app_id}, so its files cannot be reached")]
+    #[error("no runtime is running on this host for {app_id}, so its files cannot be reached")]
     Unreachable { app_id: AppId },
     #[error("the guest running {app_id} took a request about its files and never answered")]
     Silent { app_id: AppId },
@@ -38,21 +38,24 @@ pub struct GuestFilesystem {
 }
 
 impl GuestFilesystem {
-    pub async fn dial(app_id: &AppId, vsock_path: &Path) -> Result<Self, GuestFilesystemError> {
+    pub async fn dial(app_id: &AppId, endpoint: &ChannelEndpoint) -> Result<Self, GuestFilesystemError> {
         let unreachable = || GuestFilesystemError::Unreachable {
             app_id: app_id.clone(),
         };
-        let stream = UnixStream::connect(vsock_path).await.map_err(|_| unreachable())?;
+        let stream = UnixStream::connect(&endpoint.path)
+            .await
+            .map_err(|_| unreachable())?;
         let mut client = Self {
             app_id: app_id.clone(),
             wire: BufReader::new(stream),
         };
-        let port = guest_contract::vsock::GUEST_FILESYSTEM_VSOCK_PORT;
-        client
-            .send(guest_contract::vsock::connect_request(port).as_bytes())
-            .await?;
-        let reply = client.receive_line().await?;
-        guest_contract::vsock::read_connect_reply(&reply, port).map_err(|_| unreachable())?;
+        if let Some(port) = endpoint.vsock_port {
+            client
+                .send(guest_contract::vsock::connect_request(port).as_bytes())
+                .await?;
+            let reply = client.receive_line().await?;
+            guest_contract::vsock::read_connect_reply(&reply, port).map_err(|_| unreachable())?;
+        }
         Ok(client)
     }
 
@@ -199,6 +202,14 @@ impl GuestFilesystem {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    fn endpoint(path: &Path) -> guest_contract::channels::ChannelEndpoint {
+        guest_contract::channels::ChannelEndpoint {
+            path: path.into(),
+            vsock_port: Some(guest_contract::vsock::GUEST_FILESYSTEM_VSOCK_PORT),
+        }
+    }
+
     use super::*;
     use crate::test_support::app_id;
     use guest_contract::filesystem::FRAME_MAGIC;
@@ -318,9 +329,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_unix_runtime_uses_the_same_framed_filesystem_protocol_without_a_vsock_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = guest_contract::channels::ChannelTransport::Unix
+            .endpoint(directory.path(), guest_contract::channels::Channel::Filesystem);
+        let listener = tokio::net::UnixListener::bind(&endpoint.path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut wire, _) = listener.accept().await.unwrap();
+            let expected = encode_request(&GuestFilesystemRequest::Usage);
+            let mut request = vec![0; expected.len()];
+            wire.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, expected);
+            wire.write_all(&guest_contract::filesystem::encode_usage(&MeasuredBytes {
+                total_bytes: 4096,
+                used_bytes: 1024,
+            }))
+            .await
+            .unwrap();
+        });
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint).await.unwrap();
+        let usage = client.usage().await.unwrap();
+        assert_eq!(
+            usage,
+            MeasuredBytes {
+                total_bytes: 4096,
+                used_bytes: 1024
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_guest_that_is_not_running_cannot_be_browsed() {
         let directory = tempfile::tempdir().unwrap();
-        let Err(error) = GuestFilesystem::dial(&app_id(), &directory.path().join("nothing.vsock")).await
+        let Err(error) =
+            GuestFilesystem::dial(&app_id(), &endpoint(&directory.path().join("nothing.vsock"))).await
         else {
             panic!("a guest that is not there is not browsable");
         };
@@ -336,7 +379,7 @@ mod tests {
         let body = listing_body(&[(awkward, 1, 42, 1_760_000_000)], false);
         let (_directory, path) = guest_answering(vec![(0, body)]).await;
 
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let listing = client.list(&GuestPath::parse("/").unwrap()).await.unwrap();
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].name, awkward);
@@ -354,7 +397,7 @@ mod tests {
         ])
         .await;
 
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let root = client.list(&GuestPath::parse("/").unwrap()).await.unwrap();
         assert_eq!(
             root.entries
@@ -374,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_reads_as_a_sentence_and_never_names_the_path() {
         let (_directory, path) = guest_answering(vec![(1, Vec::new())]).await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let Err(error) = client.list(&GuestPath::parse("/secrets").unwrap()).await else {
             panic!("a refusal is not a listing");
         };
@@ -388,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn more_than_one_frame_carries_is_refused_before_the_connection_pays_for_it() {
         let (_directory, path) = guest_answering(vec![(0, usage_body(1_000, 400))]).await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let Err(error) = client
             .write(
                 &GuestPath::parse("/big").unwrap(),
@@ -414,7 +457,7 @@ mod tests {
         ])
         .await;
 
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         assert_eq!(
             client
                 .list(&GuestPath::parse("/one").unwrap())
@@ -446,7 +489,7 @@ mod tests {
         }
         .start()
         .await;
-        let Err(error) = GuestFilesystem::dial(&app_id(), &path).await else {
+        let Err(error) = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await else {
             panic!("a guest that refused the handshake is not browsable");
         };
         assert!(
@@ -463,7 +506,7 @@ mod tests {
         }
         .start()
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let Err(error) = client.usage().await else {
             panic!("a guest that hung up did not measure anything");
         };
@@ -479,7 +522,7 @@ mod tests {
             (0, Vec::new()),
         ])
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
 
         for outcome in [
             client.usage().await.err(),
@@ -498,7 +541,7 @@ mod tests {
             (0, details_body(1, 4_096, 1_760_000_000)),
         ])
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
 
         let directory = client.stat(&GuestPath::parse("/data").unwrap()).await.unwrap();
         assert_eq!(directory.kind, FilesystemEntryKind::Directory);
@@ -517,7 +560,7 @@ mod tests {
     async fn what_a_guest_says_about_its_own_load_comes_back_whole() {
         let readings = [1_031_012_352u64, 412_401_664, 900_000, 162_000];
         let (_directory, path) = guest_answering(vec![(0, compute_body(readings))]).await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let measured = client.compute().await.unwrap();
         assert_eq!(measured.memory_total_bytes, readings[0]);
         assert_eq!(measured.memory_used_bytes, readings[1]);
@@ -533,7 +576,7 @@ mod tests {
         }
         .start()
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let wanted = GuestPath::parse("/big").unwrap();
         assert_eq!(client.read(&wanted, 12, u32::MAX).await.unwrap(), vec![7u8; 4]);
 
@@ -555,7 +598,7 @@ mod tests {
         }
         .start()
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let wanted = GuestPath::parse("/notes.txt").unwrap();
         let written = client
             .write(&wanted, 3, b"tenant data".to_vec(), true)
@@ -582,7 +625,7 @@ mod tests {
         }
         .start()
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let made = GuestPath::parse("/data/new").unwrap();
         let gone = GuestPath::parse("/data/old").unwrap();
         let moved = GuestPath::parse("/data/renamed").unwrap();
@@ -614,7 +657,7 @@ mod tests {
             (200, Vec::new()),
         ])
         .await;
-        let mut client = GuestFilesystem::dial(&app_id(), &path).await.unwrap();
+        let mut client = GuestFilesystem::dial(&app_id(), &endpoint(&path)).await.unwrap();
         let somewhere = GuestPath::parse("/data/thing").unwrap();
 
         for (attempt, expected) in [

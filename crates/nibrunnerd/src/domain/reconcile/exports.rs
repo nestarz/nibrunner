@@ -107,12 +107,11 @@ async fn write_inner(
     checkpoint_id: &CheckpointId,
     staging_dir: &std::path::Path,
 ) -> Result<u64, String> {
-    let vsock_path = host
-        .config
-        .vm_dir()
-        .join(desired.app_id.as_str())
-        .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
-    let lease = frozen(&desired.app_id, &vsock_path)
+    let endpoint = host.vms.channel_transport().endpoint(
+        &host.config.vm_dir().join(desired.app_id.as_str()),
+        guest_contract::channels::Channel::Control,
+    );
+    let lease = frozen(&desired.app_id, &endpoint)
         .await
         .map_err(|error| error.message())?;
     // A checkpoint is of what the store holds, and what the store holds trails what the guest has

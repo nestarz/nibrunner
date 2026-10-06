@@ -179,6 +179,10 @@ impl WakeOutcome {
 #[cfg_attr(any(test, feature = "testing"), mockall::automock)]
 #[async_trait]
 pub trait Vmm: Send + Sync {
+    fn channel_transport(&self) -> guest_contract::channels::ChannelTransport {
+        guest_contract::channels::ChannelTransport::Vsock
+    }
+
     async fn boot(&self, request: BootRequest) -> Result<(), VmError>;
     async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError>;
     async fn wake(&self, request: SuspendRequest) -> Result<(), VmError>;
