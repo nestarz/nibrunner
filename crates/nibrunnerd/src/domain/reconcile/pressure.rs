@@ -244,6 +244,9 @@ pub(crate) async fn reclaim_one(
                 .as_ref()
                 .is_some_and(|policy| policy.freeze_after_ms.is_some());
         snapshot.memory_pressure.attempted_at.insert(app.clone(), now);
+        if freeze_first {
+            snapshot.freeze_attempted_at_ms.insert(app.clone(), now);
+        }
         snapshot.snapshotting.insert(app.clone());
         drop(snapshot);
         tracing::info!(app_id = %app, ?purpose, "reclaiming a quiet workload's memory");
