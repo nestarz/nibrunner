@@ -6,6 +6,11 @@ on:
     branches:
       - main
 
+# Each hosted job consumes runner minutes; cancel work superseded by newer commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build:required

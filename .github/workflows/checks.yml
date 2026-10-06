@@ -6,8 +6,14 @@ on:
     branches:
       - main
 
+# Each hosted job consumes runner minutes; cancel work superseded by newer commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  codestyle:
+  # Hosted CI is costly: share setup and compilation across these checks.
+  verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -15,51 +21,18 @@ jobs:
 
       - uses: ./.github/actions/prepare
         with:
-          cache: disabled
+          cache: enabled
           prepare-for-build: disabled
+          shared-cache-key: verify
 
       - name: Check Codestyle
         run: just fmt --check
 
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: ./.github/actions/prepare
-        with:
-          cache: enabled
-          prepare-for-build: disabled
-
       - name: Lint
         run: just lint
 
-  tests:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: ./.github/actions/prepare
-        with:
-          cache: enabled
-          prepare-for-build: disabled
-
       - name: Run Tests
         run: just test
-
-  # Every file in the tree that is written from the code rather than by hand.
-  generated:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: ./.github/actions/prepare
-        with:
-          cache: enabled
-          prepare-for-build: disabled
 
       - name: Check the schemas are current
         run: just check-schema
@@ -83,6 +56,7 @@ jobs:
         with:
           cache: enabled
           prepare-for-build: enabled
+          prepare-docs: disabled
 
       - name: Check the machine can host
         run: ls -l /dev/net/tun /dev/kvm
@@ -101,13 +75,13 @@ jobs:
   checks-passed:
     if: always()
     name: checks:required
-    needs: [codestyle, lint, tests, generated, integration]
+    needs: [verify, integration]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs passed
         run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" || "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "Some jobs failed or were cancelled"
+          if [[ "${{ needs.verify.result }}" != "success" || "${{ needs.integration.result }}" != "success" ]]; then
+            echo "Verification and integration must both pass"
             exit 1
           fi
           echo "All CI jobs passed"
