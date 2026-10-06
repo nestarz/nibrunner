@@ -128,6 +128,9 @@ pub enum MemoryAdmissionMode {
 #[serde(deny_unknown_fields)]
 pub struct MemoryAdmission {
     pub mode: MemoryAdmissionMode,
+    /// Suspend eligible quiet workloads before refusing starts and when physical memory is low.
+    #[serde(default)]
+    pub reclaim: bool,
     /// Physical memory held back for the host and bursts; swap never increases this capacity.
     pub headroom_mib: std::num::NonZeroU32,
 }
@@ -946,6 +949,7 @@ impl HostConfig {
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2),
             memory_admission: Some(MemoryAdmission {
                 mode: MemoryAdmissionMode::Observe,
+                reclaim: false,
                 headroom_mib: std::num::NonZeroU32::new(1024).expect("positive headroom"),
             }),
             vm_budgets: Some(VmBudgets {

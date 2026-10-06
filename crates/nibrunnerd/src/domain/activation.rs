@@ -22,6 +22,7 @@ pub const MAX_ACTIVITY_AGE_MS: i64 = 15_000;
 pub enum SleepReason {
     Quiet,
     LivedLongEnough,
+    MemoryPressure,
 }
 
 impl SleepReason {
@@ -29,6 +30,7 @@ impl SleepReason {
         match self {
             SleepReason::Quiet => "idle",
             SleepReason::LivedLongEnough => "max-lifetime",
+            SleepReason::MemoryPressure => "memory-pressure",
         }
     }
 }
@@ -47,8 +49,9 @@ pub struct ActivitySignals {
 impl ActivitySignals {
     /// Whether what this host last read of the app's traffic still stands for what it is doing.
     pub fn measured_lately(&self, now_ms: i64) -> bool {
-        self.measured_at_ms
-            .is_some_and(|measured_at| now_ms - measured_at <= MAX_ACTIVITY_AGE_MS)
+        self.measured_at_ms.is_some_and(|measured_at| {
+            (0..=MAX_ACTIVITY_AGE_MS).contains(&now_ms.saturating_sub(measured_at))
+        })
     }
 }
 

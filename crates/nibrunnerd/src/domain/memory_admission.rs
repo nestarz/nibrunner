@@ -39,6 +39,7 @@ impl MemoryReadings {
         if !(0..=MAX_SAMPLE_AGE_MS).contains(&age)
             || memory.measured_at.epoch_ms() < record.started_at.as_ref()?.epoch_ms()
             || memory.limits.as_ref()?.max_bytes.is_none()
+            || memory.proportional_set_bytes.is_none()
         {
             return None;
         }
@@ -62,6 +63,7 @@ impl MemoryReadings {
             .peak_bytes
             .unwrap_or(memory.current_bytes)
             .max(memory.current_bytes)
+            .max(memory.proportional_set_bytes.unwrap_or(0))
             .saturating_add(memory.swap_bytes);
         let target = peak.saturating_add((peak / 4).max(MIN_MARGIN_BYTES)).min(ceiling);
         target.saturating_sub(memory.current_bytes)
@@ -109,6 +111,8 @@ mod tests {
             apps: BTreeMap::from([(
                 app_id(),
                 ReportedMemory {
+                    cgroup: None,
+                    proportional_set_bytes: Some(256 * BYTES_PER_MIB),
                     measured_at: Timestamp::from_epoch_ms(10_000),
                     limits: Some(ReportedMemoryLimits {
                         low_bytes: 0,
@@ -163,7 +167,7 @@ mod tests {
 
     #[test]
     fn absent_stale_future_unbounded_or_previous_process_samples_reserve_the_ceiling() {
-        for case in 0..5 {
+        for case in 0..6 {
             let mut observed = readings();
             let memory = observed.apps.get_mut(&app_id()).unwrap();
             match case {
@@ -173,6 +177,7 @@ mod tests {
                 1 => memory.measured_at = Timestamp::from_epoch_ms(4999),
                 2 => memory.measured_at = Timestamp::from_epoch_ms(10_001),
                 3 => memory.limits = None,
+                4 => memory.proportional_set_bytes = None,
                 _ => memory.measured_at = Timestamp::from_epoch_ms(999),
             }
             assert_eq!(observed.growth_bytes(&running()), 2048 * BYTES_PER_MIB);
@@ -214,5 +219,12 @@ mod tests {
         assert!(observed.is_fresh(15_000));
         assert!(!observed.is_fresh(15_001));
         assert!(!observed.is_fresh(9_999));
+    }
+
+    #[test]
+    fn snapshot_mappings_charged_elsewhere_still_reserve_their_resident_working_set() {
+        let mut observed = readings();
+        observed.apps.get_mut(&app_id()).unwrap().proportional_set_bytes = Some(1024 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&running()), 1024 * BYTES_PER_MIB);
     }
 }

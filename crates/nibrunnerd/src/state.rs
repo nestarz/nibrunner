@@ -30,6 +30,7 @@ pub struct HostSnapshot {
     // an app quiet.
     pub last_measured_at_ms: BTreeMap<AppId, i64>,
     pub reclaimed_at_ms: BTreeMap<AppId, i64>,
+    pub(crate) memory_pressure: crate::domain::reconcile::pressure::PressureState,
     pub volume_usage: BTreeMap<AppId, FilesystemUsage>,
     pub compute_usage: BTreeMap<AppId, ComputeUsage>,
     pub compute_ticks: BTreeMap<AppId, guest_contract::filesystem::MeasuredCompute>,
@@ -81,6 +82,7 @@ pub struct HostState {
     transitions: Mutex<Transitions>,
     memory_reservations: MemoryReservations,
     pub(crate) persistence: tokio::sync::Mutex<()>,
+    pub(crate) reclaim: tokio::sync::Mutex<()>,
 }
 
 impl HostState {
@@ -92,6 +94,7 @@ impl HostState {
             transitions: Mutex::new(BTreeMap::new()),
             memory_reservations: Arc::default(),
             persistence: tokio::sync::Mutex::new(()),
+            reclaim: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -169,17 +172,22 @@ impl HostState {
     /// snapshot; and each app's own, so that the sleeps a pass runs side by side wait on nothing
     /// but the disk.
     pub async fn transition(&self, app_id: &AppId) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut transitions = self
-                .transitions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // A guard and a waiter each hold a reference, so an app's lock is kept only while
-            // something is at it, and the map does not grow by one for every app ever moved.
-            transitions.retain(|_, lock| Arc::strong_count(lock) > 1);
-            transitions.entry(app_id.clone()).or_default().clone()
-        };
-        lock.lock_owned().await
+        self.transition_lock(app_id).lock_owned().await
+    }
+
+    pub(crate) fn try_transition(&self, app_id: &AppId) -> Option<OwnedMutexGuard<()>> {
+        self.transition_lock(app_id).try_lock_owned().ok()
+    }
+
+    fn transition_lock(&self, app_id: &AppId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut transitions = self
+            .transitions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A guard and a waiter each hold a reference, so an app's lock is kept only while
+        // something is at it, and the map does not grow by one for every app ever moved.
+        transitions.retain(|_, lock| Arc::strong_count(lock) > 1);
+        transitions.entry(app_id.clone()).or_default().clone()
     }
 
     pub async fn snapshot(&self) -> HostSnapshot {

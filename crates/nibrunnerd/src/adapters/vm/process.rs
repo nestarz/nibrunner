@@ -125,7 +125,7 @@ impl VmProcesses {
         let memory = super::memory::Controls::for_budget(&budget);
         // Scope mode execs the VMM in place; a fresh unit name avoids waiting for the old scope to be collected.
         command
-            .args(["--scope", "--quiet", "--collect"])
+            .args(["--scope", "--quiet", "--collect", "--slice=-.slice"])
             .arg(format!("--property=CPUQuota={}%", budget.cpu_percent))
             .arg(format!("--property=MemoryLow={}", memory.low))
             .arg(format!("--property=MemoryHigh={}", memory.high))
@@ -401,6 +401,7 @@ mod tests {
             .collect();
         assert_eq!(command.as_std().get_program(), "systemd-run");
         assert!(args.contains(&"--scope"));
+        assert!(args.contains(&"--slice=-.slice"));
         assert!(args.contains(&"--property=CPUQuota=50%"));
         assert!(args.contains(&"--property=MemoryMax=1342177280"));
         assert_eq!(args.last(), Some(&"/bin/firecracker"));

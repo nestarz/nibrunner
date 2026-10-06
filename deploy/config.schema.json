@@ -126,11 +126,17 @@
         },
         "mode": {
           "$ref": "#/$defs/MemoryAdmissionMode"
+        },
+        "reclaim": {
+          "description": "Suspend eligible quiet workloads before refusing starts and when physical memory is low.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
       "required": [
         "mode",
+        "reclaim",
         "headroom_mib"
       ]
     },

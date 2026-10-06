@@ -467,6 +467,12 @@
     "ReportedMemory": {
       "type": "object",
       "properties": {
+        "cgroup": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "currentBytes": {
           "type": "integer",
           "format": "uint64",
@@ -510,6 +516,15 @@
         },
         "pressureSomeUs": {
           "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "proportionalSetBytes": {
+          "description": "Resident mappings, with shared pages divided among their users. Snapshot pages may be\ncharged to the process that wrote them rather than this VM's cgroup.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0
         },

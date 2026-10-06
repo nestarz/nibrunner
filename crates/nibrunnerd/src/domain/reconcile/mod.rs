@@ -6,6 +6,7 @@ pub mod ingress;
 pub mod instances;
 pub mod network;
 pub mod plan;
+pub(crate) mod pressure;
 pub mod volumes;
 
 pub use plan::*;
@@ -178,7 +179,10 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
     for desired in starts {
         let _transition = host.state.transition(&desired.app_id).await;
         let wanted = &desired.config.resources;
-        let _reservation = match host.reserve_memory(&desired.app_id, *wanted).await {
+        let _reservation = match host
+            .reserve_memory(&desired.app_id, *wanted, pressure::ReclaimPurpose::Deployment)
+            .await
+        {
             Ok(reservation) => reservation,
             Err(shortfall_mib) => {
                 instances::wait_for_room(host, desired, shortfall_mib).await;
