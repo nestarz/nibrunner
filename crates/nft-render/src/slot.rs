@@ -64,7 +64,7 @@ const OCTET_SIZE: u32 = 256;
 const HOST_ADDRESS_OFFSET: u32 = 1;
 const GUEST_ADDRESS_OFFSET: u32 = 2;
 
-pub const TAP_NAME_PREFIX: &str = "nbr";
+pub const INTERFACE_NAME_PREFIX: &str = "nbr";
 
 const MAC_PREFIX: &str = "02:00";
 
@@ -76,7 +76,7 @@ pub struct AppSlot {
     pub host_ipv4: Ipv4Address,
     pub guest_ipv4: Ipv4Address,
     pub guest_mac: String,
-    pub tap_name: String,
+    pub interface_name: String,
     pub nbd_device_path: String,
     pub subnet_prefix_length: u8,
 }
@@ -118,7 +118,7 @@ pub fn describe_slot(slot: u32, app_id: AppId) -> AppSlot {
         host_ipv4: address_at(base + HOST_ADDRESS_OFFSET),
         guest_mac: mac_for(&guest_ipv4),
         guest_ipv4,
-        tap_name: format!("{TAP_NAME_PREFIX}{slot}"),
+        interface_name: format!("{INTERFACE_NAME_PREFIX}{slot}"),
         nbd_device_path: nbd_device_path(slot),
         subnet_prefix_length: GUEST_SUBNET_PREFIX_LENGTH,
     }
@@ -131,8 +131,8 @@ impl AppSlot {
     }
 }
 
-pub fn is_tap_name(name: &str) -> bool {
-    name.strip_prefix(TAP_NAME_PREFIX)
+pub fn is_interface_name(name: &str) -> bool {
+    name.strip_prefix(INTERFACE_NAME_PREFIX)
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(slot.host_ipv4.as_str(), "10.201.0.1");
         assert_eq!(slot.guest_ipv4.as_str(), "10.201.0.2");
         assert_eq!(slot.guest_mac, "02:00:0a:c9:00:02");
-        assert_eq!(slot.tap_name, "nbr0");
+        assert_eq!(slot.interface_name, "nbr0");
         assert_eq!(slot.nbd_device_path, "/dev/nbd0");
         assert_eq!(slot.subnet_prefix_length, 30);
     }
@@ -214,9 +214,9 @@ mod tests {
     }
 
     #[test]
-    fn tap_names_are_the_prefix_and_a_number() {
-        assert!(is_tap_name("nbr12"));
-        assert!(!is_tap_name("nbr"));
-        assert!(!is_tap_name("eth0"));
+    fn attachment_names_are_the_prefix_and_a_number() {
+        assert!(is_interface_name("nbr12"));
+        assert!(!is_interface_name("nbr"));
+        assert!(!is_interface_name("eth0"));
     }
 }

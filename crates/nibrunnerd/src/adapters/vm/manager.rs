@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use protocol::AppId;
 
 use crate::adapters::logs::receiver::{tenant_log_socket_path, TenantLogReceiver};
-use crate::adapters::net::tap::{HostNetwork, Neighbour, TapInterface};
+use crate::adapters::net::attachment::{HostInterface, HostNetwork, Neighbour};
 use crate::adapters::vm::firecracker_api::FirecrackerApi;
 use crate::adapters::vm::process::VmProcesses;
 use crate::adapters::vm::snapshot::{
@@ -101,10 +101,10 @@ impl VmManager {
 
     async fn stage(&self, request: &BootRequest) -> Result<PathBuf, VmError> {
         let slot = &request.slot;
-        let host = |error: crate::adapters::net::tap::NetworkError| VmError::Host(error.message());
+        let host = |error: crate::adapters::net::attachment::NetworkError| VmError::Host(error.message());
         self.network
-            .ensure_tap(&TapInterface {
-                tap_name: slot.tap_name.clone(),
+            .ensure_tap(&HostInterface {
+                interface_name: slot.interface_name.clone(),
                 host_ipv4: slot.host_ipv4.clone(),
                 subnet_prefix_length: slot.subnet_prefix_length,
             })
@@ -114,7 +114,7 @@ impl VmManager {
             .refresh_neighbour(&Neighbour {
                 guest_ipv4: slot.guest_ipv4.clone(),
                 guest_mac: slot.guest_mac.clone(),
-                tap_name: slot.tap_name.clone(),
+                interface_name: slot.interface_name.clone(),
             })
             .await
             .map_err(host)?;
@@ -159,7 +159,7 @@ impl VmManager {
                     .collect(),
             },
             &VmNetwork {
-                tap_name: slot.tap_name.clone(),
+                interface_name: slot.interface_name.clone(),
                 guest_mac: slot.guest_mac.clone(),
                 guest_ipv4: slot.guest_ipv4.clone(),
                 host_ipv4: slot.host_ipv4.clone(),
@@ -422,7 +422,7 @@ impl Vmm for VmManager {
                                     .refresh_neighbour(&Neighbour {
                                         guest_ipv4: request.slot.guest_ipv4.clone(),
                                         guest_mac: request.slot.guest_mac.clone(),
-                                        tap_name: request.slot.tap_name.clone(),
+                                        interface_name: request.slot.interface_name.clone(),
                                     })
                                     .await
                                     .map_err(|error| VmError::Host(error.message())),
@@ -461,15 +461,15 @@ impl Vmm for VmManager {
         Ok(())
     }
 
-    async fn delete_tap(&self, tap_name: &str) -> Result<(), VmError> {
+    async fn delete_attachment(&self, interface_name: &str) -> Result<(), VmError> {
         self.network
-            .delete_tap(tap_name)
+            .delete_attachment(interface_name)
             .await
             .map_err(|error| VmError::Host(error.message()))
     }
 
-    async fn tap_names(&self) -> Vec<String> {
-        self.network.tap_names().await
+    async fn attachment_names(&self) -> Vec<String> {
+        self.network.attachment_names().await
     }
 
     async fn statuses(&self, app_ids: &[AppId]) -> std::collections::BTreeMap<AppId, VmStatus> {
@@ -1028,7 +1028,7 @@ mod tests {
         assert_eq!(config["vsock"]["uds_path"], "logs.vsock");
         assert_eq!(config["vsock"]["guest_cid"], 3);
 
-        assert_eq!(fixture.network.taps()[0].tap_name, "nbr0");
+        assert_eq!(fixture.network.taps()[0].interface_name, "nbr0");
         assert_eq!(fixture.network.neighbours()[0].guest_mac, "02:00:0a:c9:00:02");
         assert_eq!(fixture.manager.logs.attached().await, vec![app_id()]);
     }
@@ -1158,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn a_boot_a_tap_could_not_be_made_for_starts_no_hypervisor_at_all() {
         let mut fixture = fixture();
-        fixture.manager.network = mocks::network_refusing(crate::adapters::net::tap::NetworkError {
+        fixture.manager.network = mocks::network_refusing(crate::adapters::net::attachment::NetworkError {
             what: "a tap device",
             device: "nbr0".into(),
             reason: "operation not permitted".into(),

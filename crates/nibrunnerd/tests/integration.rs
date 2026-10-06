@@ -839,15 +839,16 @@ async fn a_tap_is_created_addressed_and_given_the_guest_it_will_hold() {
         return;
     }
     require_root();
-    use nibrunnerd::adapters::net::tap::{HostNetwork, KernelNetwork, Neighbour, TapInterface};
+    use nibrunnerd::adapters::net::attachment::{HostInterface, HostNetwork, KernelNetwork, Neighbour};
 
-    let network = KernelNetwork::open().expect("a netlink socket");
+    let namespace_dir = tempfile::tempdir().unwrap();
+    let network = KernelNetwork::open(namespace_dir.path().to_owned()).expect("a netlink socket");
     let slot = nft_render::describe_slot(
         nft_render::most_apps_the_ports_fit() - 1,
         protocol::AppId::parse("integration").unwrap(),
     );
-    let tap = TapInterface {
-        tap_name: slot.tap_name.clone(),
+    let tap = HostInterface {
+        interface_name: slot.interface_name.clone(),
         host_ipv4: slot.host_ipv4.clone(),
         subnet_prefix_length: slot.subnet_prefix_length,
     };
@@ -856,13 +857,13 @@ async fn a_tap_is_created_addressed_and_given_the_guest_it_will_hold() {
         .ensure_tap(&tap)
         .await
         .expect("a second pass changes nothing");
-    assert!(network.tap_names().await.contains(&slot.tap_name));
+    assert!(network.attachment_names().await.contains(&slot.interface_name));
 
     network
         .refresh_neighbour(&Neighbour {
             guest_ipv4: slot.guest_ipv4.clone(),
             guest_mac: slot.guest_mac.clone(),
-            tap_name: slot.tap_name.clone(),
+            interface_name: slot.interface_name.clone(),
         })
         .await
         .expect("the neighbour entry is written");
@@ -873,7 +874,7 @@ async fn a_tap_is_created_addressed_and_given_the_guest_it_will_hold() {
             "neigh",
             "show",
             "dev",
-            &slot.tap_name,
+            &slot.interface_name,
         ]))
         .await
         .unwrap_or_default();
@@ -883,17 +884,241 @@ async fn a_tap_is_created_addressed_and_given_the_guest_it_will_hold() {
     );
 
     network
-        .delete_tap(&slot.tap_name)
+        .delete_attachment(&slot.interface_name)
         .await
         .expect("the tap is taken back");
     assert!(
-        !network.tap_names().await.contains(&slot.tap_name),
+        !network.attachment_names().await.contains(&slot.interface_name),
         "a tap a persistent flag kept alive is gone once the app that held it is"
     );
     network
-        .delete_tap(&slot.tap_name)
+        .delete_attachment(&slot.interface_name)
         .await
         .expect("a tap that is already gone is the state being asked for, not a failure");
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_interface(offset: u32) -> nibrunnerd::adapters::net::attachment::NamespaceInterface {
+    use nibrunnerd::adapters::net::attachment::{HostInterface, NamespaceInterface};
+    let slot = nft_render::describe_slot(
+        nft_render::most_apps_the_ports_fit() - offset,
+        protocol::AppId::parse("namespace-integration").unwrap(),
+    );
+    NamespaceInterface {
+        host: HostInterface {
+            interface_name: slot.interface_name,
+            host_ipv4: slot.host_ipv4,
+            subnet_prefix_length: slot.subnet_prefix_length,
+        },
+        guest_ipv4: slot.guest_ipv4,
+        guest_mac: slot.guest_mac,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_namespace_survives_reopening_isolates_ports_and_reclaims_orphaned_links() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use nibrunnerd::adapters::net::attachment::{HostNetwork, KernelNetwork};
+    use std::os::unix::fs::MetadataExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let namespace_dir = directory.path().join("network");
+    let network = KernelNetwork::open(namespace_dir.clone()).unwrap();
+    let interface = namespace_interface(2);
+    let name = &interface.host.interface_name;
+    let original_namespace = std::fs::read_link("/proc/thread-self/ns/net").unwrap();
+    let namespace = network.ensure_namespace(&interface).await.unwrap();
+    let inode = std::fs::metadata(&namespace).unwrap().ino();
+    let host_index = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex")).unwrap();
+    drop(network);
+    let network = KernelNetwork::open(namespace_dir).unwrap();
+    assert_eq!(network.ensure_namespace(&interface).await.unwrap(), namespace);
+    assert_eq!(std::fs::metadata(&namespace).unwrap().ino(), inode);
+    assert_eq!(
+        std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex")).unwrap(),
+        host_index
+    );
+    assert_eq!(
+        std::fs::read_link("/proc/thread-self/ns/net").unwrap(),
+        original_namespace
+    );
+    assert!(network.attachment_names().await.contains(name));
+    assert!(network.ensure_tap(&interface.host).await.is_err());
+
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let ready = directory.path().join("ready");
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "namespace_tcp_server_process", "--nocapture"])
+        .env("NIBRUNNER_TEST_NAMESPACE", &namespace)
+        .env(
+            "NIBRUNNER_TEST_NAMESPACE_INTERFACE",
+            serde_json::json!({
+                "address": interface.guest_ipv4.as_str(),
+                "gateway": interface.host.host_ipv4.as_str(),
+                "mac": interface.guest_mac,
+                "port": port,
+                "ready": ready,
+            })
+            .to_string(),
+        )
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Err(format!("namespace server exited before binding: {status}"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut stream = tokio::net::TcpStream::connect((interface.guest_ipv4.addr(), port))
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(b"ping")
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut reply = [0; 4];
+        stream
+            .read_exact(&mut reply)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(reply)
+    })
+    .await;
+    let _ = child.kill().await;
+
+    commands()
+        .stdout_of(nibrunnerd::ports::CommandRequest::new(&[
+            "ip", "link", "delete", name,
+        ]))
+        .await
+        .unwrap();
+    assert!(
+        network.attachment_names().await.contains(name),
+        "an orphan namespace must remain discoverable"
+    );
+    network.delete_attachment(name).await.unwrap();
+    network.delete_attachment(name).await.unwrap();
+    assert!(!namespace.exists());
+    assert!(!network.attachment_names().await.contains(name));
+    assert_eq!(response.unwrap().unwrap(), *b"pong");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn namespace_tcp_server_process() {
+    use std::io::{Read, Write};
+    let Ok(namespace) = std::env::var("NIBRUNNER_TEST_NAMESPACE") else {
+        return;
+    };
+    require_root();
+    let config: serde_json::Value =
+        serde_json::from_str(&std::env::var("NIBRUNNER_TEST_NAMESPACE_INTERFACE").unwrap()).unwrap();
+    nix::sched::setns(
+        std::fs::File::open(namespace).unwrap(),
+        nix::sched::CloneFlags::CLONE_NEWNET,
+    )
+    .unwrap();
+    let ip = |args: &[&str]| {
+        let output = std::process::Command::new("ip").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let addresses = ip(&["-j", "address", "show", "dev", "eth0"]);
+    assert_eq!(addresses[0]["address"], config["mac"]);
+    assert!(addresses[0]["addr_info"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|address| address["local"] == config["address"]));
+    let routes = ip(&["-j", "route", "show", "default"]);
+    assert_eq!(routes[0]["gateway"], config["gateway"]);
+    let port = u16::try_from(config["port"].as_u64().unwrap()).unwrap();
+    let _same_port = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = std::net::TcpListener::bind((config["address"].as_str().unwrap(), port)).unwrap();
+    std::fs::write(config["ready"].as_str().unwrap(), b"").unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut request = [0; 4];
+    stream.read_exact(&mut request).unwrap();
+    assert_eq!(&request, b"ping");
+    stream.write_all(b"pong").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn namespace_attachments_refuse_foreign_interfaces_and_unsafe_handles() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use nibrunnerd::adapters::net::attachment::{HostNetwork, KernelNetwork};
+    let directory = tempfile::tempdir().unwrap();
+    let network = KernelNetwork::open(directory.path().to_owned()).unwrap();
+    let interface = namespace_interface(3);
+    let name = &interface.host.interface_name;
+    let path = directory.path().join(name);
+    commands()
+        .stdout_of(nibrunnerd::ports::CommandRequest::new(&[
+            "ip",
+            "link",
+            "add",
+            name,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "nib-test-peer",
+        ]))
+        .await
+        .unwrap();
+    let index_path = format!("/sys/class/net/{name}/ifindex");
+    let index = std::fs::read_to_string(&index_path).unwrap();
+    assert!(network.ensure_namespace(&interface).await.is_err());
+    assert!(network.ensure_tap(&interface.host).await.is_err());
+    assert!(network.delete_attachment(name).await.is_err());
+    assert!(!network.attachment_names().await.contains(name));
+    assert_eq!(std::fs::read_to_string(index_path).unwrap(), index);
+    commands()
+        .stdout_of(nibrunnerd::ports::CommandRequest::new(&[
+            "ip", "link", "delete", name,
+        ]))
+        .await
+        .unwrap();
+    std::fs::write(&path, b"unrelated").unwrap();
+    assert!(network.ensure_namespace(&interface).await.is_err());
+    assert!(network.delete_attachment(name).await.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"unrelated");
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("/proc/self/ns/net", &path).unwrap();
+    assert!(network.ensure_namespace(&interface).await.is_err());
+    assert!(network.delete_attachment(name).await.is_err());
+    assert!(path.is_symlink());
+    std::fs::remove_file(&path).unwrap();
+    let mut invalid = interface.clone();
+    invalid.guest_mac = "1:2:3:4:5:6".into();
+    assert!(network.ensure_namespace(&invalid).await.is_err());
+    for name in ["../outside", "nbr1234567890123456", "lo"] {
+        invalid = interface.clone();
+        invalid.host.interface_name = name.into();
+        assert!(network.ensure_namespace(&invalid).await.is_err());
+        assert!(network.delete_attachment(name).await.is_err());
+    }
+    assert!(!path.exists());
+    assert!(!std::path::Path::new(&format!("/sys/class/net/{}", interface.host.interface_name)).exists());
 }
 
 #[tokio::test]

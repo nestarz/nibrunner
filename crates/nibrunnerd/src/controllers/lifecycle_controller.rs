@@ -45,7 +45,7 @@ impl LifecycleController {
                 }
             }
         }
-        crate::domain::reconcile::network::reclaim_stranded_taps(&self.host).await;
+        crate::domain::reconcile::network::reclaim_stranded_attachments(&self.host).await;
         crate::domain::reconcile::network::apply_activators(&self.host).await;
         crate::domain::reconcile::network::apply_network(&self.host).await;
         crate::run::serve_proxy(&self.host);

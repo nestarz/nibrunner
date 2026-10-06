@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use protocol::{AppId, ObjectKey};
 
-use crate::adapters::net::tap::{MockHostNetwork, Neighbour, NetworkError, TapInterface};
+use crate::adapters::net::attachment::{HostInterface, MockHostNetwork, Neighbour, NetworkError};
 use crate::adapters::vm::VmStatus;
 use crate::adapters::volumes::{
     AttachedVolume, CacheReservation, MockVolumeBackend, ObservedBacking, VolumeBackend, VolumeError,
@@ -96,8 +96,8 @@ pub fn commands_answering(
 #[derive(Clone)]
 pub struct VmmSpy {
     calls: Arc<Mutex<Vec<VmCall>>>,
-    removed_taps: Arc<Mutex<Vec<String>>>,
-    present_taps: Arc<Mutex<Vec<String>>>,
+    removed_attachments: Arc<Mutex<Vec<String>>>,
+    present_attachments: Arc<Mutex<Vec<String>>>,
     status: Arc<Mutex<VmStatus>>,
     frozen: Arc<Mutex<BTreeMap<AppId, bool>>>,
     on_thaw: Arc<Mutex<Option<VmError>>>,
@@ -112,8 +112,8 @@ impl Default for VmmSpy {
     fn default() -> Self {
         Self {
             calls: shared(Vec::new()),
-            removed_taps: shared(Vec::new()),
-            present_taps: shared(Vec::new()),
+            removed_attachments: shared(Vec::new()),
+            present_attachments: shared(Vec::new()),
             status: shared(VmStatus::default()),
             frozen: shared(BTreeMap::new()),
             on_thaw: shared(None),
@@ -155,12 +155,12 @@ impl VmmSpy {
         *self.verdict.lock().expect("no panic holds this lock") = Some(verdict.into());
     }
 
-    pub fn removed_taps(&self) -> Vec<String> {
-        held(&self.removed_taps)
+    pub fn removed_attachments(&self) -> Vec<String> {
+        held(&self.removed_attachments)
     }
 
-    pub fn set_present_taps(&self, names: Vec<String>) {
-        *self.present_taps.lock().expect("no panic holds this lock") = names;
+    pub fn set_present_attachments(&self, names: Vec<String>) {
+        *self.present_attachments.lock().expect("no panic holds this lock") = names;
     }
 
     pub fn set_adopted(&self, app_ids: Vec<AppId>) {
@@ -220,16 +220,16 @@ pub fn vmm() -> (Arc<MockVmm>, VmmSpy) {
         push(&calls, VmCall::Discard);
         Ok(())
     });
-    let (calls, removed_taps) = (spy.calls.clone(), spy.removed_taps.clone());
-    vms.expect_delete_tap().returning(move |name: &str| {
-        push(&calls, VmCall::DeleteTap);
-        push(&removed_taps, name.to_string());
+    let (calls, removed_attachments) = (spy.calls.clone(), spy.removed_attachments.clone());
+    vms.expect_delete_attachment().returning(move |name: &str| {
+        push(&calls, VmCall::DeleteAttachment);
+        push(&removed_attachments, name.to_string());
         Ok(())
     });
-    let removed_taps = spy.removed_taps.clone();
-    let present = spy.present_taps.clone();
-    vms.expect_tap_names().returning(move || {
-        let gone = held(&removed_taps);
+    let removed_attachments = spy.removed_attachments.clone();
+    let present = spy.present_attachments.clone();
+    vms.expect_attachment_names().returning(move || {
+        let gone = held(&removed_attachments);
         held(&present)
             .into_iter()
             .filter(|name: &String| !gone.contains(name))
@@ -388,12 +388,12 @@ impl Vmm for HeldSleeps {
         self.vms.discard(app_id).await
     }
 
-    async fn delete_tap(&self, tap_name: &str) -> Result<(), VmError> {
-        self.vms.delete_tap(tap_name).await
+    async fn delete_attachment(&self, interface_name: &str) -> Result<(), VmError> {
+        self.vms.delete_attachment(interface_name).await
     }
 
-    async fn tap_names(&self) -> Vec<String> {
-        self.vms.tap_names().await
+    async fn attachment_names(&self) -> Vec<String> {
+        self.vms.attachment_names().await
     }
 
     async fn statuses(&self, app_ids: &[AppId]) -> BTreeMap<AppId, VmStatus> {
@@ -551,13 +551,13 @@ pub fn exports_answering(
 
 #[derive(Clone, Default)]
 pub struct NetworkSpy {
-    taps: Arc<Mutex<Vec<TapInterface>>>,
+    taps: Arc<Mutex<Vec<HostInterface>>>,
     neighbours: Arc<Mutex<Vec<Neighbour>>>,
     removed: Arc<Mutex<Vec<String>>>,
 }
 
 impl NetworkSpy {
-    pub fn taps(&self) -> Vec<TapInterface> {
+    pub fn taps(&self) -> Vec<HostInterface> {
         held(&self.taps)
     }
 
@@ -575,7 +575,7 @@ pub fn network() -> (Arc<MockHostNetwork>, NetworkSpy) {
     let mut network = MockHostNetwork::new();
 
     let taps = spy.taps.clone();
-    network.expect_ensure_tap().returning(move |tap: &TapInterface| {
+    network.expect_ensure_tap().returning(move |tap: &HostInterface| {
         push(&taps, tap.clone());
         Ok(())
     });
@@ -587,17 +587,17 @@ pub fn network() -> (Arc<MockHostNetwork>, NetworkSpy) {
             Ok(())
         });
     let (taps, removed) = (spy.taps.clone(), spy.removed.clone());
-    network.expect_delete_tap().returning(move |name: &str| {
+    network.expect_delete_attachment().returning(move |name: &str| {
         push(&removed, name.to_string());
         if let Ok(mut held) = taps.lock() {
-            held.retain(|tap| tap.tap_name != name);
+            held.retain(|tap| tap.interface_name != name);
         }
         Ok(())
     });
     let taps = spy.taps.clone();
     network
-        .expect_tap_names()
-        .returning(move || held(&taps).into_iter().map(|tap| tap.tap_name).collect());
+        .expect_attachment_names()
+        .returning(move || held(&taps).into_iter().map(|tap| tap.interface_name).collect());
 
     (Arc::new(network), spy)
 }
@@ -611,7 +611,7 @@ pub fn network_refusing(error: NetworkError) -> Arc<MockHostNetwork> {
     network
         .expect_refresh_neighbour()
         .returning(move |_| Err(error.clone()));
-    network.expect_tap_names().returning(Vec::new);
-    network.expect_delete_tap().returning(move |_| Ok(()));
+    network.expect_attachment_names().returning(Vec::new);
+    network.expect_delete_attachment().returning(move |_| Ok(()));
     Arc::new(network)
 }

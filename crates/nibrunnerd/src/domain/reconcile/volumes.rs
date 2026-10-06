@@ -161,19 +161,19 @@ pub async fn apply_volumes(
         .await;
 }
 
-/// The tap goes with the slot rather than with the microVM, because a stopped app keeps both and
+/// The attachment goes with the slot rather than with the runtime, because a stopped app keeps both and
 /// only an app that is leaving gives them up. Taking it here is also what stops the slot the
 /// cursor hands out next from inheriting a live device.
 async fn give_back_slot(host: &Host, app_id: &AppId) {
-    let tap_name = {
+    let interface_name = {
         let mut allocator = host.allocator.lock().await;
-        let held = allocator.lookup(app_id).map(|slot| slot.tap_name);
+        let held = allocator.lookup(app_id).map(|slot| slot.interface_name);
         allocator.release(app_id);
         held
     };
-    if let Some(tap_name) = tap_name {
-        if let Err(error) = host.vms.delete_tap(&tap_name).await {
-            tracing::warn!(%tap_name, error = %error.message(), "a tap outlived the app it was made for");
+    if let Some(interface_name) = interface_name {
+        if let Err(error) = host.vms.delete_attachment(&interface_name).await {
+            tracing::warn!(%interface_name, error = %error.message(), "a network attachment outlived the app it was made for");
         }
     }
 }
@@ -370,7 +370,7 @@ mod tests {
         assert!(snapshot.deleted_volumes.contains_key(&volume_id()));
         assert!(host.volumes.observe(&Default::default()).await.is_empty());
         assert_eq!(
-            host.vms.removed_taps(),
+            host.vms.removed_attachments(),
             vec!["nbr0".to_string()],
             "the slot went back with its tap still on the host"
         );
@@ -388,7 +388,7 @@ mod tests {
         };
         apply_teardowns(&host, &plan).await;
         assert!(
-            host.vms.removed_taps().is_empty(),
+            host.vms.removed_attachments().is_empty(),
             "a device nothing was ever given is not one to go looking for"
         );
     }
@@ -1103,7 +1103,7 @@ mod tests {
 
         assert!(host.slot_of(&app_id()).await.is_none());
         assert_eq!(
-            host.vms.removed_taps(),
+            host.vms.removed_attachments(),
             vec!["nbr0".to_string()],
             "the slot went back with its tap"
         );
@@ -1131,7 +1131,7 @@ mod tests {
         apply_teardowns(&host, &detaching()).await;
 
         assert!(host.slot_of(&app_id()).await.is_some());
-        assert!(host.vms.removed_taps().is_empty());
+        assert!(host.vms.removed_attachments().is_empty());
     }
 
     #[tokio::test]
