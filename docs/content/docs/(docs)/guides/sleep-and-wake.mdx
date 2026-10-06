@@ -81,8 +81,8 @@ Thaw resumes the VM before synchronizing the guest clock. This requires the paus
 With host swap and a per-VM swap allowance, reclaim can move pages into zram. Compression,
 retained memory and wake latency depend on the workload; freezing does not imply zero RAM.
 Frozen apps retain their full admission budget under strict and observation modes. Adaptive
-admission uses a fresh measured resident footprint and reserves the full budget before a wake
-or snapshot. Their original idle deadline still applies, and
+admission uses a fresh measured resident footprint, reserves the observed peak plus a margin for
+a known revision's wake, and reserves the full budget for a snapshot. Their original idle deadline still applies, and
 memory pressure can select them for earlier snapshots. Within each priority, frozen apps are
 selected before running apps.
 Under pressure or blocked admission, eligible running apps enter the frozen tier first. This

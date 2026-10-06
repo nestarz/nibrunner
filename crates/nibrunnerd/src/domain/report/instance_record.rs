@@ -42,6 +42,8 @@ pub struct InstanceRecord {
     pub restart_policy: RestartPolicy,
     pub desired_running: bool,
     pub on_request: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_peak_bytes: Option<u64>,
     #[serde(default)]
     pub expiry: Option<protocol::ExpiryPolicy>,
     #[serde(default)]
@@ -110,6 +112,7 @@ impl InstanceRecord {
             restart_policy: fields.restart_policy,
             desired_running: fields.desired_running,
             on_request: fields.on_request,
+            memory_peak_bytes: None,
             expiry_since_ms: fields.expiry.as_ref().map(|_| crate::clock::now_ms()),
             expiry: fields.expiry,
             expired_at_ms: None,
@@ -125,6 +128,9 @@ impl InstanceRecord {
     }
 
     pub fn adopt(&mut self, fields: RecordFields) {
+        if self.deployment_id != fields.deployment_id || self.resources != fields.resources {
+            self.memory_peak_bytes = None;
+        }
         self.apply_expiry(fields.expiry, &fields.deployment_id, crate::clock::now_ms());
         self.deployment_id = fields.deployment_id;
         self.volume_id = fields.volume_id;

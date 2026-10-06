@@ -152,18 +152,6 @@ impl Host {
             })
             .collect();
         let policy = self.config.memory_admission.as_ref();
-        let production_wake_bytes = records
-            .iter()
-            .filter(|record| record.on_request && record.expired_at_ms.is_none())
-            .filter_map(|record| self.runtime_policy.vm_budget(&record.app_id))
-            .filter(|budget| {
-                budget
-                    .memory
-                    .is_some_and(|memory| memory.priority == protocol::MemoryPriority::Production)
-            })
-            .map(|budget| u64::from(budget.memory_mib.get()) * 1_048_576)
-            .max()
-            .unwrap_or(0);
         let pool = match policy.and_then(|policy| policy.pool.as_ref()) {
             None => None,
             Some(configuration) => {
@@ -180,21 +168,51 @@ impl Host {
                 Some(pool)
             }
         };
-        Some((
-            policy.map_or(crate::config::MemoryAdmissionMode::Observe, |policy| policy.mode),
-            crate::domain::memory_admission::MemoryReadings {
-                pool,
-                reservation_generation,
-                available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
-                headroom_bytes: u64::from(policy.map_or(1024, |policy| policy.headroom_mib.get()))
-                    * 1_048_576,
-                production_wake_bytes,
-                measured_at_ms: crate::clock::now_ms(),
-                apps,
-                external_resident_bytes,
-                ceilings,
-            },
-        ))
+        let mode = policy.map_or(crate::config::MemoryAdmissionMode::Observe, |policy| policy.mode);
+        let mut readings = crate::domain::memory_admission::MemoryReadings {
+            pool,
+            reservation_generation,
+            available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
+            headroom_bytes: u64::from(policy.map_or(1024, |policy| policy.headroom_mib.get())) * 1_048_576,
+            production_wake_bytes: 0,
+            measured_at_ms: crate::clock::now_ms(),
+            apps,
+            external_resident_bytes,
+            ceilings,
+        };
+        for record in &records {
+            if let Some(peak) = readings.observed_peak_bytes(record) {
+                self.state
+                    .update_record(&record.app_id, |held| {
+                        if held.deployment_id == record.deployment_id && held.resources == record.resources {
+                            held.memory_peak_bytes = Some(held.memory_peak_bytes.unwrap_or(0).max(peak));
+                        }
+                    })
+                    .await;
+            }
+        }
+        readings.production_wake_bytes = records
+            .iter()
+            .filter(|record| {
+                record.on_request
+                    && record.expired_at_ms.is_none()
+                    && matches!(
+                        record.state,
+                        protocol::InstanceState::Idle | protocol::InstanceState::Frozen
+                    )
+            })
+            .filter(|record| {
+                self.runtime_policy
+                    .vm_budget(&record.app_id)
+                    .and_then(|budget| budget.memory)
+                    .is_some_and(|memory| memory.priority == protocol::MemoryPriority::Production)
+            })
+            .map(|record| {
+                readings.wake_headroom_bytes(record, mode == crate::config::MemoryAdmissionMode::Adaptive)
+            })
+            .max()
+            .unwrap_or(0);
+        Some((mode, readings))
     }
 
     pub async fn slot_for(

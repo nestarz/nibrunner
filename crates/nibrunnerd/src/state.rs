@@ -400,6 +400,26 @@ impl HostState {
                 }
             }
             bytes = app_id.map_or(bytes, |app| readings.ceiling(app, wanted));
+            let effective_adaptive = mode == crate::config::MemoryAdmissionMode::Adaptive
+                && readings
+                    .pool
+                    .as_ref()
+                    .is_none_or(|pool| pool.all_workloads_contained);
+            if effective_adaptive
+                && readings.reservation_generation == reservations.generation
+                && operation == crate::domain::memory_admission::MemoryOperation::Start
+            {
+                if let Some(record) = app_id.and_then(|app| snapshot.records.get(app)).filter(|record| {
+                    matches!(
+                        record.state,
+                        protocol::InstanceState::Idle
+                            | protocol::InstanceState::Frozen
+                            | protocol::InstanceState::Running
+                    )
+                }) {
+                    bytes = readings.wake_target_bytes(record);
+                }
+            }
             let reserved_bytes = reservations
                 .held
                 .values()
@@ -452,16 +472,13 @@ impl HostState {
                 resident_reserved_bytes.saturating_add(wanted_resident_bytes),
                 0,
             );
-            let effective_adaptive = mode == crate::config::MemoryAdmissionMode::Adaptive
-                && readings
-                    .pool
-                    .as_ref()
-                    .is_none_or(|pool| pool.all_workloads_contained);
             tracing::info!(
                 ?owner,
                 ?mode,
                 effective_adaptive,
                 snapshot_outside_pool,
+                reservation_mib = bytes.div_ceil(1_048_576),
+                production_wake_headroom_mib = wake_headroom.div_ceil(1_048_576),
                 strict_shortfall_mib = strict_shortfall,
                 measured_shortfall_mib = measured_shortfall,
                 "memory admission evaluated"
@@ -931,6 +948,47 @@ mod tests {
             }
             drop(reservation);
         }
+    }
+
+    #[tokio::test]
+    async fn a_known_revision_wakes_from_its_persisted_peak_but_snapshotting_still_needs_the_full_budget() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        use crate::domain::memory_admission::MemoryOperation;
+        let host = crate::test_support::test_host().await;
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Idle;
+                record.memory_peak_bytes = Some(512 * 1_048_576);
+            }))
+            .await;
+        host.persist().await;
+        host.load().await;
+        for (operation, admitted) in [(MemoryOperation::Start, true), (MemoryOperation::Snapshot, false)] {
+            let mut readings = frozen_readings(&host.state);
+            readings.available_bytes = 1800 * 1_048_576;
+            let reservation = host
+                .state
+                .reserve_for_operation(
+                    8192,
+                    &app_id(),
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    operation,
+                    Some((Adaptive, readings)),
+                )
+                .await;
+            assert_eq!(reservation.is_ok(), admitted);
+        }
+        host.state
+            .update_record(&app_id(), |record| {
+                let mut fields = crate::test_support::record_fields();
+                fields.deployment_id = protocol::DeploymentId::parse("different-deployment").unwrap();
+                record.adopt(fields);
+            })
+            .await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().memory_peak_bytes,
+            None
+        );
     }
 
     #[tokio::test]
