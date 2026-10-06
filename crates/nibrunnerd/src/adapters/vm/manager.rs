@@ -69,6 +69,7 @@ impl VmManager {
 
     fn current_stamp(&self, request: &SuspendRequest) -> SnapshotStamp {
         SnapshotStamp {
+            firecracker_version: Some(super::process::FIRECRACKER_VERSION.into()),
             deployment_id: request.deployment_id.clone(),
             guest_image_version: self.guest_image_version.clone(),
             host_boot_id: self.processes.boot_id().to_string(),
@@ -200,6 +201,17 @@ impl VmManager {
 #[async_trait]
 impl Vmm for VmManager {
     async fn freeze(&self, app_id: &AppId) -> Result<(), VmError> {
+        if self
+            .processes
+            .read_record(app_id)
+            .and_then(|record| record.firecracker_version)
+            .as_deref()
+            != Some(super::process::FIRECRACKER_VERSION)
+        {
+            return Err(VmError::Host(
+                "freeze waits for a VM started with the current Firecracker version".into(),
+            ));
+        }
         self.processes
             .frozen(app_id)
             .map_err(|error| VmError::Host(error.to_string()))?;
@@ -215,6 +227,8 @@ impl Vmm for VmManager {
             .map_err(|error| VmError::Host(error.to_string()))?;
         let result = async {
             time_sync::freeze_tenant(&control).await?;
+            // Host freezer requests alone timed out with running vCPUs on Linux 6.1.
+            self.api(app_id).pause().await?;
             self.processes
                 .freeze(app_id)
                 .await
@@ -238,10 +252,12 @@ impl Vmm for VmManager {
             .thaw(app_id)
             .await
             .map_err(|error| VmError::Host(error.to_string()))?;
+        self.api(app_id).resume().await?;
         let control = self
             .working_dir_for(app_id)
             .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
         if let Err(error) = time_sync::wake(&control).await {
+            let _ = self.api(app_id).pause().await;
             let _ = self.processes.freeze(app_id).await;
             return Err(error);
         }
@@ -296,7 +312,11 @@ impl Vmm for VmManager {
             self.thaw(&request.app_id).await?;
         }
         let paths = snapshot_paths(&self.snapshot_dir, &request.app_id);
-        let stamp = self.current_stamp(&request);
+        let mut stamp = self.current_stamp(&request);
+        stamp.firecracker_version = self
+            .processes
+            .read_record(&request.app_id)
+            .and_then(|record| record.firecracker_version);
         let api = self.api(&request.app_id);
 
         self.discard_snapshot(&request.app_id);
@@ -455,6 +475,13 @@ impl Vmm for VmManager {
 
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
         if self.processes.status(app_id).frozen {
+            if !self
+                .processes
+                .frozen(app_id)
+                .map_err(|error| VmError::Host(error.to_string()))?
+            {
+                self.api(app_id).pause().await?;
+            }
             self.processes
                 .freeze(app_id)
                 .await
@@ -950,6 +977,7 @@ mod tests {
         write_json(
             &paths.stamp_path,
             &SnapshotStamp {
+                firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.into()),
                 deployment_id: deployment_id(),
                 guest_image_version: "an-older-image".into(),
                 host_boot_id: fixture.manager.processes.boot_id().to_string(),
@@ -1083,6 +1111,7 @@ mod tests {
         write_json(
             &paths.stamp_path,
             &SnapshotStamp {
+                firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.into()),
                 deployment_id: deployment_id(),
                 guest_image_version: fixture.manager.guest_image_version.clone(),
                 host_boot_id: fixture.manager.processes.boot_id().to_string(),

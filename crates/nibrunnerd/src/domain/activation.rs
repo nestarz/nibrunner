@@ -70,7 +70,9 @@ pub fn should_sleep(
         SleepPolicy::TrafficIdle { timeout_ms } => {
             // A stretch nobody read the counters over is not a stretch of quiet: an app taking
             // hundreds of requests a second reads exactly like one taking none.
-            if answering || !signals.measured_lately(now_ms) {
+            // Frozen guests route new requests through the activator, so their removed nft counters
+            // cannot provide newer readings. Open requests still protect a pending thaw.
+            if answering || (record.state != InstanceState::Frozen && !signals.measured_lately(now_ms)) {
                 return None;
             }
             let quiet_since = signals.last_active_at_ms?;

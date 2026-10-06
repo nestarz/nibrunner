@@ -91,7 +91,7 @@ fn eligible(
         && matches!(policy.sleep_when, SleepPolicy::TrafficIdle { .. })
         && !(purpose == ReclaimPurpose::Deployment && priority == MemoryPriority::Production)
         && signals.requests_open == 0
-        && signals.measured_lately(now)
+        && (record.state == InstanceState::Frozen || signals.measured_lately(now))
         && signals
             .last_active_at_ms
             .is_some_and(|at| now.saturating_sub(at) >= QUIET_MS)
