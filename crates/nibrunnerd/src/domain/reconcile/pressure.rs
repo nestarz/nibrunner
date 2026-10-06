@@ -87,6 +87,8 @@ fn eligible(
 ) -> bool {
     record.on_request
         && record.desired_running
+        // Established raw flows bypass proxy request accounting, including between packets.
+        && record.ports.is_empty()
         && matches!(record.state, InstanceState::Running | InstanceState::Frozen)
         && matches!(policy.sleep_when, SleepPolicy::TrafficIdle { .. })
         && !(purpose == ReclaimPurpose::Deployment && priority == MemoryPriority::Production)
@@ -499,6 +501,35 @@ mod tests {
         assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
         assert!(host.vms.calls().is_empty());
         drop(request);
+        assert!(reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+    }
+
+    #[tokio::test]
+    async fn raw_port_apps_are_not_reclaimed_without_connection_accounting() {
+        let host = workloads().await;
+        for id in ["production", "preview"] {
+            host.state
+                .update_record(&AppId::parse(id).unwrap(), |record| {
+                    record.ports.push(crate::domain::report::RecordPort {
+                        name: protocol::PortName::parse("raw").unwrap(),
+                        host_port: protocol::HostPort::try_from(30000).unwrap(),
+                        guest_port: protocol::GuestPort::try_from(9000).unwrap(),
+                    });
+                })
+                .await;
+        }
+        let _reclaiming = host.state.reclaim.lock().await;
+        for purpose in [
+            ReclaimPurpose::Pressure,
+            ReclaimPurpose::Deployment,
+            ReclaimPurpose::Wake,
+        ] {
+            assert!(!reclaim_one(host.arc(), purpose, None).await);
+        }
+        assert!(host.vms.calls().is_empty());
+        host.state
+            .update_record(&AppId::parse("preview").unwrap(), |record| record.ports.clear())
+            .await;
         assert!(reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
     }
 

@@ -177,7 +177,9 @@ Quiet builds and previews sleep first, followed by standard and production apps.
 fresh activity readings, no open requests, at least 30 seconds without traffic and 60 seconds
 since start or restore. Only traffic-idle policies qualify. Apps with a transition in progress
 are skipped, and each attempt has a 60-second cooldown. Active streams and always-running work
-are protected. Snapshots preserve rollback state, but disk latency still affects sleep and wake.
+are protected. Apps with raw ports are excluded: established connections can bypass proxy
+accounting, so a quiet packet counter does not prove that they have no active connections.
+Snapshots preserve rollback state, but disk latency still affects sleep and wake.
 
 The optional [frozen tier](/docs/guides/sleep-and-wake#frozen-tier) keeps recently quiet VMs
 paused in memory before their snapshot deadline. It can reclaim pages into configured host
