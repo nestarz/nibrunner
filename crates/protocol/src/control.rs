@@ -409,6 +409,9 @@ pub struct ReportedMemory {
     /// charged to the process that wrote them rather than this VM's cgroup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proportional_set_bytes: Option<u64>,
+    /// Resident anonymous mappings, excluding file cache and swapped pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous_set_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ReportedMemoryLimits>,
     pub current_bytes: u64,

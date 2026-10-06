@@ -25,9 +25,22 @@ struct Owner {
     pid: i32,
     start_ticks: u64,
     cgroup: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<crate::adapters::cgroup::MemoryGroup>,
 }
 
 impl Owner {
+    fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.start_ticks == other.start_ticks
+            && self.cgroup == other.cgroup
+            && self
+                .group
+                .as_ref()
+                .zip(other.group.as_ref())
+                .is_none_or(|(a, b)| a == b)
+    }
+
     fn for_pid(pid: i32) -> io::Result<Self> {
         let start_ticks = process_start_ticks(pid)
             .filter(|_| pid > 0)
@@ -39,19 +52,27 @@ impl Owner {
             .filter(|group| isolated_group(group).is_some())
             .ok_or_else(|| io::Error::other("the memory lease owner needs a service or scope cgroup"))?
             .to_owned();
-        if process_start_ticks(pid) != Some(start_ticks) {
+        let unit = Path::new(&cgroup)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("the memory lease owner has no cgroup name"))?;
+        let group = crate::adapters::cgroup::MemoryGroup::capture(&cgroup, unit)
+            .ok_or_else(|| io::Error::other("the memory lease owner's cgroup cannot be identified"))?;
+        if process_start_ticks(pid) != Some(start_ticks) || group.replaced() {
             return Err(io::Error::other("the memory lease owner exited"));
         }
         Ok(Self {
             pid,
             start_ticks,
             cgroup,
+            group: Some(group),
         })
     }
 
     fn gone(&self) -> bool {
         process_start_ticks(self.pid) != Some(self.start_ticks)
-            && isolated_group(&self.cgroup).is_some_and(|path| group_empty(&path).unwrap_or(false))
+            && (self.group.as_ref().is_some_and(|group| group.replaced())
+                || isolated_group(&self.cgroup).is_some_and(|path| group_empty(&path).unwrap_or(false)))
     }
 }
 
@@ -232,7 +253,7 @@ impl MemoryService {
                 }
                 if let Some(existing) = held.leases.get(&id) {
                     return Ok(
-                        if existing.owner == lease.owner
+                        if existing.owner.same_process(&lease.owner)
                             && existing.unit == lease.unit
                             && existing.requested() == lease.requested()
                         {
@@ -272,7 +293,7 @@ impl MemoryService {
                 let Some(lease) = held.leases.get(&id) else {
                     return Ok(Reply::Released);
                 };
-                if lease.owner != owner {
+                if !lease.owner.same_process(&owner) {
                     return Ok(Reply::Rejected {
                         reason: "only the lease owner can release it".into(),
                     });
@@ -341,10 +362,16 @@ impl MemoryService {
             .leases
             .iter()
             .filter(|(_, lease)| lease.owner.gone())
-            .map(|(id, lease)| (id.clone(), lease.unit.clone()))
+            .map(|(id, lease)| {
+                (
+                    id.clone(),
+                    lease.unit.clone(),
+                    lease.group.as_ref().is_some_and(|group| group.replaced()),
+                )
+            })
             .collect();
-        for (id, unit) in abandoned {
-            if self.finished(&unit).await? {
+        for (id, unit, replaced) in abandoned {
+            if replaced || self.finished(&unit).await? {
                 self.release(&mut held, &id)?;
             }
         }
@@ -497,6 +524,7 @@ mod tests {
             pid: i32::MAX,
             start_ticks: 1,
             cgroup: "/nibrunner-memory-test-absent.scope".into(),
+            group: None,
         }
     }
 
@@ -670,6 +698,49 @@ mod tests {
             .reserve_memory(512, &app_id(), protocol::DEFAULT_INSTANCE_RESOURCES)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_replaced_budget_group_does_not_keep_an_abandoned_lease_alive() {
+        let host = test_host().await;
+        seed(host.arc());
+        let service = MemoryService::restore_for_boot(host.arc().clone(), "boot-1".into()).unwrap();
+        let group = serde_json::from_value(serde_json::json!({
+            "membership": "/nibrunner-memory-test-absent.scope", "device": 0, "inode": 1
+        }))
+        .unwrap();
+        {
+            let mut held = service.held.lock().await;
+            held.leases.get_mut(ID).unwrap().group = Some(group);
+        }
+        service.sweep().await.unwrap();
+        assert!(service.held.lock().await.leases.is_empty());
+        assert!(host
+            .state
+            .reserve_memory(512, &app_id(), protocol::DEFAULT_INSTANCE_RESOURCES)
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn a_legacy_lease_still_recognizes_its_owner_after_an_upgrade() {
+        let previous = owner();
+        let mut current = previous.clone();
+        current.group = Some(
+            serde_json::from_value(serde_json::json!({
+                "membership": previous.cgroup, "device": 0, "inode": 1
+            }))
+            .unwrap(),
+        );
+        assert!(previous.same_process(&current));
+        let mut replaced = current.clone();
+        replaced.group = Some(
+            serde_json::from_value(serde_json::json!({
+                "membership": previous.cgroup, "device": 0, "inode": 2
+            }))
+            .unwrap(),
+        );
+        assert!(!current.same_process(&replaced));
     }
 
     #[tokio::test]

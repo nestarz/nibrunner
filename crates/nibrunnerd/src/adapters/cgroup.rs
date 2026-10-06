@@ -97,6 +97,17 @@ pub(crate) struct MemoryGroup {
 }
 
 impl MemoryGroup {
+    pub(crate) fn replaced(&self) -> bool {
+        cgroup_path(&format!("0::{}", self.membership)).is_some_and(|path| self.replaced_at(&path))
+    }
+
+    fn replaced_at(&self, path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Ok(metadata) => metadata.dev() != self.device || metadata.ino() != self.inode,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        }
+    }
+
     pub(crate) fn within(&self, pool: &crate::domain::memory_admission::PoolMemory) -> bool {
         self.within_membership(&pool.membership)
     }
@@ -352,6 +363,7 @@ mod tests {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
+        assert!(!group.replaced_at(&path));
         std::fs::write(path.join("memory.current"), "800").unwrap();
         std::fs::write(
             path.join("memory.stat"),
@@ -365,11 +377,13 @@ mod tests {
         }
         std::fs::write(path.join("memory.max"), "1024").unwrap();
         std::fs::rename(&path, directory.path().join("old.slice")).unwrap();
+        assert!(group.replaced_at(&path));
         std::fs::create_dir(&path).unwrap();
         for name in ["memory.current", "memory.stat", "memory.max"] {
             std::fs::copy(directory.path().join("old.slice").join(name), path.join(name)).unwrap();
         }
         assert_eq!(group.resident_at(&path, 1024), None);
+        assert!(group.replaced_at(&path));
     }
 
     #[test]

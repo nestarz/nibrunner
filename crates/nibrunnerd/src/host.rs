@@ -152,6 +152,18 @@ impl Host {
             })
             .collect();
         let policy = self.config.memory_admission.as_ref();
+        let production_wake_bytes = records
+            .iter()
+            .filter(|record| record.on_request && record.expired_at_ms.is_none())
+            .filter_map(|record| self.runtime_policy.vm_budget(&record.app_id))
+            .filter(|budget| {
+                budget
+                    .memory
+                    .is_some_and(|memory| memory.priority == protocol::MemoryPriority::Production)
+            })
+            .map(|budget| u64::from(budget.memory_mib.get()) * 1_048_576)
+            .max()
+            .unwrap_or(0);
         let pool = match policy.and_then(|policy| policy.pool.as_ref()) {
             None => None,
             Some(configuration) => {
@@ -176,6 +188,7 @@ impl Host {
                 available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
                 headroom_bytes: u64::from(policy.map_or(1024, |policy| policy.headroom_mib.get()))
                     * 1_048_576,
+                production_wake_bytes,
                 measured_at_ms: crate::clock::now_ms(),
                 apps,
                 external_resident_bytes,

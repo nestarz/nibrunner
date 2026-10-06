@@ -282,6 +282,7 @@ async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
             Some(std::path::Path::new("/"))
         );
         assert!(memory.proportional_set_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(memory.anonymous_set_bytes.is_some_and(|bytes| bytes > 0));
         let limits = observed
             .and_then(|m| m.limits)
             .unwrap_or_else(|| panic!("the scope did not start: {console}"));

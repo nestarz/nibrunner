@@ -468,6 +468,15 @@
     "ReportedMemory": {
       "type": "object",
       "properties": {
+        "anonymousSetBytes": {
+          "description": "Resident anonymous mappings, excluding file cache and swapped pages.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "cgroup": {
           "type": [
             "string",

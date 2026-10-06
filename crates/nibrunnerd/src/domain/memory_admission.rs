@@ -18,6 +18,7 @@ pub(crate) struct MemoryReadings {
     pub reservation_generation: u64,
     pub available_bytes: u64,
     pub headroom_bytes: u64,
+    pub production_wake_bytes: u64,
     pub measured_at_ms: i64,
     pub apps: BTreeMap<AppId, ReportedMemory>,
     pub external_resident_bytes: BTreeMap<String, u64>,
@@ -120,6 +121,18 @@ impl MemoryReadings {
         target.saturating_sub(memory.current_bytes)
     }
 
+    pub(crate) fn anonymous_resident_bytes(&self, record: &InstanceRecord) -> u64 {
+        self.resident_memory(record)
+            .map(|memory| {
+                memory
+                    .anonymous_set_bytes
+                    .unwrap_or(0)
+                    .min(memory.proportional_set_bytes.unwrap_or(0))
+                    .min(memory.current_bytes)
+            })
+            .unwrap_or(0)
+    }
+
     pub(crate) fn shortfall_mib(
         &self,
         capacity_mib: u64,
@@ -176,12 +189,14 @@ mod tests {
             external_resident_bytes: BTreeMap::new(),
             available_bytes: 2048 * BYTES_PER_MIB,
             headroom_bytes: 1024 * BYTES_PER_MIB,
+            production_wake_bytes: 0,
             measured_at_ms: 10_000,
             apps: BTreeMap::from([(
                 app_id(),
                 ReportedMemory {
                     cgroup: None,
                     proportional_set_bytes: Some(256 * BYTES_PER_MIB),
+                    anonymous_set_bytes: Some(256 * BYTES_PER_MIB),
                     measured_at: Timestamp::from_epoch_ms(10_000),
                     limits: Some(ReportedMemoryLimits {
                         low_bytes: 0,

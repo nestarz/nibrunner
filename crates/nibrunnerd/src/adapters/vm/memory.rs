@@ -98,6 +98,7 @@ fn read_cgroup(path: &Path) -> Option<ReportedMemory> {
             .ok()
             .map(|relative| format!("/{}", relative.display())),
         proportional_set_bytes: None,
+        anonymous_set_bytes: None,
         limits: limits(path),
         current_bytes: number(path, "memory.current")?,
         peak_bytes: number(path, "memory.peak"),
@@ -112,14 +113,19 @@ fn read_cgroup(path: &Path) -> Option<ReportedMemory> {
 pub(super) fn read_process(pid: i32) -> Option<ReportedMemory> {
     let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let mut memory = read_cgroup(&cgroup_path(&membership)?)?;
-    memory.proportional_set_bytes = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
-        .ok()
-        .and_then(|text| proportional_set_bytes(&text));
+    if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
+        memory.proportional_set_bytes = proportional_set_bytes(&text);
+        memory.anonymous_set_bytes = mapping_bytes(&text, "Pss_Anon:");
+    }
     Some(memory)
 }
 
 fn proportional_set_bytes(text: &str) -> Option<u64> {
-    let value = text.lines().find_map(|line| line.strip_prefix("Pss:"))?;
+    mapping_bytes(text, "Pss:")
+}
+
+fn mapping_bytes(text: &str, field: &str) -> Option<u64> {
+    let value = text.lines().find_map(|line| line.strip_prefix(field))?;
     let mut parts = value.split_whitespace();
     let kib = parts.next()?.parse::<u64>().ok()?;
     (parts.next()? == "kB" && parts.next().is_none())
@@ -137,6 +143,14 @@ mod tests {
             proportional_set_bytes("Rss: 4096 kB\nPss: 2048 kB\nPss_Anon: 1024 kB\n"),
             Some(2 << 20)
         );
+        assert_eq!(
+            mapping_bytes(
+                "Pss: 2048 kB\nPss_Anon: 1024 kB\nPss_File: 1024 kB\n",
+                "Pss_Anon:"
+            ),
+            Some(1 << 20)
+        );
+        assert_eq!(mapping_bytes("Pss: 2048 kB\n", "Pss_Anon:"), None);
         for text in [
             "Pss_Anon: 1024 kB",
             "Pss: 2 MB",
