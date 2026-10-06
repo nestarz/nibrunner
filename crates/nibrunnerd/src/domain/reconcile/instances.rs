@@ -605,24 +605,32 @@ async fn verdict(
 }
 
 pub async fn refresh_states(host: &Arc<Host>) {
-    let snapshot = host.state.snapshot().await;
-    let app_ids: Vec<AppId> = snapshot.records.keys().cloned().collect();
-    let statuses = host.vms.statuses(&app_ids).await;
-    let now = now_ms();
-
+    let app_ids: Vec<_> = host
+        .state
+        .records()
+        .await
+        .into_iter()
+        .map(|record| record.app_id)
+        .collect();
     let mut settling = Vec::new();
-    for record in snapshot.records.values().cloned() {
+    for app_id in app_ids {
         let host = host.clone();
-        let status = statuses.get(&record.app_id).copied().unwrap_or(UNKNOWN_VM);
-        let due = now
-            >= snapshot
-                .next_probe_at_ms
-                .get(&record.app_id)
-                .copied()
-                .unwrap_or(0);
-        let snapshotting = snapshot.snapshotting.contains(&record.app_id);
         settling.push(tokio::spawn(async move {
-            settle(&host, record, status, due, snapshotting, now).await;
+            let Some(_transition) = host.state.try_transition(&app_id) else {
+                return;
+            };
+            let snapshot = host.state.snapshot().await;
+            if snapshot.snapshotting.contains(&app_id) {
+                return;
+            }
+            let Some(record) = snapshot.records.get(&app_id).cloned() else {
+                return;
+            };
+            let statuses = host.vms.statuses(std::slice::from_ref(&app_id)).await;
+            let status = statuses.get(&app_id).copied().unwrap_or(UNKNOWN_VM);
+            let now = now_ms();
+            let due = now >= snapshot.next_probe_at_ms.get(&app_id).copied().unwrap_or(0);
+            settle(&host, record, status, due, now).await;
         }));
     }
     for task in settling {
@@ -630,14 +638,7 @@ pub async fn refresh_states(host: &Arc<Host>) {
     }
 }
 
-async fn settle(
-    host: &Arc<Host>,
-    record: InstanceRecord,
-    status: VmStatus,
-    due: bool,
-    snapshotting: bool,
-    now_ms: i64,
-) {
+async fn settle(host: &Arc<Host>, record: InstanceRecord, status: VmStatus, due: bool, now_ms: i64) {
     if record.expired_at_ms.is_some() {
         return;
     }
@@ -683,7 +684,7 @@ async fn settle(
         desired_running: record.desired_running,
         on_request: record.on_request,
         stop_requested: record.stop_requested,
-        snapshotting,
+        snapshotting: false,
         started_at_ms: record.started_at.as_ref().map(protocol::Timestamp::epoch_ms),
         now_ms,
         current: record.state,
@@ -1676,6 +1677,41 @@ mod tests {
         host.state.probe_at_once(&app_id()).await;
         refresh_states(host.arc()).await;
         host.state.record(&app_id()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_refresh_skips_a_lifecycle_transition_and_reads_the_new_state_afterward() {
+        let host = test_host().await;
+        host.vms.set_status(up());
+        let mut record = well_until_now(protocol::HttpPort::new(1).unwrap());
+        record.health.consecutive_failures = TCP_HEALTH_CHECK.probe().unhealthy_threshold - 1;
+        host.state.put_record(record.clone()).await;
+        let transition = host.state.transition(&app_id()).await;
+        tokio::time::timeout(std::time::Duration::from_millis(100), refresh_states(host.arc()))
+            .await
+            .expect("health refresh skips an occupied transition");
+        assert_eq!(host.state.record(&app_id()).await.unwrap(), record);
+        assert_eq!(host.metrics.health.of(&app_id()).went_unhealthy, 0);
+        host.vms.set_status(VmStatus {
+            active: false,
+            ..up()
+        });
+        host.state
+            .update_record(&app_id(), |record| {
+                record.on_request = true;
+                record.stop_requested = true;
+                record.state = InstanceState::Idle;
+            })
+            .await;
+        drop(transition);
+        refresh_states(host.arc()).await;
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Idle);
+        assert_eq!(
+            record.health.consecutive_failures,
+            TCP_HEALTH_CHECK.probe().unhealthy_threshold - 1
+        );
+        assert_eq!(host.metrics.health.of(&app_id()).went_unhealthy, 0);
     }
 
     #[tokio::test]

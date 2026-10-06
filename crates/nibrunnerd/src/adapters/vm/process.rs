@@ -47,6 +47,8 @@ pub fn extract_firecracker(directory: &Path) -> std::io::Result<PathBuf> {
 pub struct VmRecord {
     pub app_id: AppId,
     pub pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ticks: Option<u64>,
     pub host_boot_id: String,
     pub started_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +216,37 @@ impl VmProcesses {
         super::memory::read_process(record.pid)
     }
 
+    fn cgroup(&self, app_id: &AppId) -> std::io::Result<crate::adapters::cgroup::Group> {
+        let record = self
+            .read_record(app_id)
+            .filter(|record| {
+                record.host_boot_id == self.boot_id
+                    && record.exit().is_none()
+                    && is_alive(record.pid)
+                    && record
+                        .start_ticks
+                        .is_some_and(|ticks| process_start_ticks(record.pid) == Some(ticks))
+            })
+            .ok_or_else(|| std::io::Error::other("the VM process is not running"))?;
+        crate::adapters::cgroup::Group::for_process(record.pid)
+    }
+
+    pub async fn freeze(&self, app_id: &AppId) -> std::io::Result<()> {
+        self.cgroup(app_id)?.freeze().await
+    }
+
+    pub async fn thaw(&self, app_id: &AppId) -> std::io::Result<()> {
+        self.cgroup(app_id)?.thaw().await
+    }
+
+    pub fn frozen(&self, app_id: &AppId) -> std::io::Result<bool> {
+        self.cgroup(app_id)?.frozen()
+    }
+
+    pub async fn reclaim_frozen(&self, app_id: &AppId, bytes: u64) -> std::io::Result<u64> {
+        self.cgroup(app_id)?.reclaim(bytes).await
+    }
+
     pub async fn spawn(
         &self,
         app_id: &AppId,
@@ -287,6 +320,7 @@ impl VmProcesses {
         let record = VmRecord {
             app_id: app_id.clone(),
             pid,
+            start_ticks: process_start_ticks(pid),
             host_boot_id: self.boot_id.clone(),
             started_at_ms: crate::clock::now_ms(),
             exit_code: None,
@@ -322,6 +356,9 @@ impl VmProcesses {
         if !is_alive(record.pid) {
             return;
         }
+        if self.frozen(app_id).unwrap_or(false) {
+            let _ = self.thaw(app_id).await;
+        }
         signal(record.pid, libc::SIGTERM);
         let deadline =
             std::time::Duration::from_millis(guest_contract::control::GUEST_SHUTDOWN_GRACE_MS + 5_000);
@@ -334,6 +371,14 @@ impl VmProcesses {
         }
         signal(record.pid, libc::SIGKILL);
     }
+}
+
+fn process_start_ticks(pid: i32) -> Option<u64> {
+    start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn start_ticks(stat: &str) -> Option<u64> {
+    stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn is_alive(pid: i32) -> bool {
@@ -368,6 +413,40 @@ mod tests {
             policy: Arc::default(),
             runtime_dir: directory.to_path_buf(),
             boot_id: "boot-1".into(),
+        }
+    }
+
+    #[test]
+    fn process_identity_uses_the_start_field_after_a_name_with_spaces_and_parentheses() {
+        let fields = std::iter::repeat_n("0", 19)
+            .chain(["1234", "5678"])
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            start_ticks(&format!("42 (a ) strange ( name) {fields}")),
+            Some(1234)
+        );
+        assert_eq!(start_ticks("42 (incomplete) S 0"), None);
+    }
+
+    #[tokio::test]
+    async fn freeze_refuses_a_missing_or_reused_process_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let processes = processes(directory.path());
+        for ticks in [None, Some(u64::MAX)] {
+            processes
+                .write_record(&VmRecord {
+                    app_id: app_id(),
+                    pid: std::process::id() as i32,
+                    start_ticks: ticks,
+                    host_boot_id: "boot-1".into(),
+                    started_at_ms: 0,
+                    exit_code: None,
+                    signal: None,
+                    stop_requested: false,
+                })
+                .unwrap();
+            assert!(processes.freeze(&app_id()).await.is_err());
         }
     }
 
@@ -476,6 +555,7 @@ mod tests {
             .write_record(&VmRecord {
                 app_id: app_id(),
                 pid: std::process::id() as i32,
+                start_ticks: None,
                 host_boot_id: "an-earlier-boot".into(),
                 started_at_ms: 0,
                 exit_code: None,
@@ -498,6 +578,7 @@ mod tests {
             .write_record(&VmRecord {
                 app_id: app_id(),
                 pid: std::process::id() as i32,
+                start_ticks: None,
                 host_boot_id: "boot-1".into(),
                 started_at_ms: 0,
                 exit_code: None,
@@ -518,6 +599,7 @@ mod tests {
         let record = VmRecord {
             app_id: app_id(),
             pid: 1,
+            start_ticks: None,
             host_boot_id: "boot-1".into(),
             started_at_ms: 0,
             exit_code: Some(1),
@@ -602,6 +684,7 @@ mod tests {
             .write_record(&VmRecord {
                 app_id: app_id(),
                 pid: 1,
+                start_ticks: None,
                 host_boot_id: "boot-1".into(),
                 started_at_ms: 0,
                 exit_code: Some(0),
@@ -781,6 +864,7 @@ mod tests {
             .write_record(&VmRecord {
                 app_id: app_id(),
                 pid: -1,
+                start_ticks: None,
                 host_boot_id: "boot-1".into(),
                 started_at_ms: 0,
                 exit_code: None,

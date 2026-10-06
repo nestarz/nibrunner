@@ -75,7 +75,20 @@ async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         let console = std::fs::read_to_string(processes.console_path(&app)).unwrap_or_default();
+        if observed.is_some() {
+            processes.freeze(&app).await.unwrap();
+            assert!(processes.frozen(&app).unwrap());
+            let _ = processes.reclaim_frozen(&app, 1024 * 1024).await;
+            processes.thaw(&app).await.unwrap();
+            assert!(!processes.frozen(&app).unwrap());
+            processes.freeze(&app).await.unwrap();
+        }
+        let stopping = std::time::Instant::now();
         processes.stop(&app).await;
+        assert!(
+            stopping.elapsed() < std::time::Duration::from_secs(3),
+            "stopping a frozen process must thaw before SIGTERM"
+        );
         let memory = observed
             .as_ref()
             .unwrap_or_else(|| panic!("the scope did not start: {console}"));
