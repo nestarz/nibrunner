@@ -1,4 +1,6 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+
+use crate::adapters::cgroup::cgroup_path;
 
 use protocol::ReportedMemory;
 
@@ -46,19 +48,6 @@ impl Controls {
         }
         controls
     }
-}
-
-fn cgroup_path(membership: &str) -> Option<PathBuf> {
-    let relative = membership.lines().find_map(|line| line.strip_prefix("0::/"))?;
-    let path = Path::new(relative);
-    if relative.is_empty()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(Path::new("/sys/fs/cgroup").join(path))
 }
 
 fn number(path: &Path, name: &str) -> Option<u64> {
@@ -199,17 +188,6 @@ mod tests {
                 oom_score: "0"
             }
         );
-    }
-
-    #[test]
-    fn only_a_named_unified_cgroup_can_be_measured() {
-        assert_eq!(
-            cgroup_path("0::/system.slice/run-test.scope\n"),
-            Some(PathBuf::from("/sys/fs/cgroup/system.slice/run-test.scope"))
-        );
-        for invalid in ["0::/", "0::/../outside", "2:memory:/legacy", "0::/./relative"] {
-            assert!(cgroup_path(invalid).is_none(), "{invalid}");
-        }
     }
 
     #[test]

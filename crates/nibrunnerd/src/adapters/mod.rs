@@ -1,4 +1,5 @@
 pub mod artifact_store;
+pub(crate) mod cgroup;
 pub mod exec;
 pub mod filesystem;
 pub mod guest_measurements;

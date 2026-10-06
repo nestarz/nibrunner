@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pass_that_lands_mid_capture_reads_the_microvm_as_asleep_rather_than_crashed() {
+    async fn a_pass_that_lands_mid_capture_leaves_publication_to_the_sleep_transition() {
         let host = test_host().await;
         host.vms.set_status(stopped_vm());
         host.state
@@ -576,7 +576,7 @@ mod tests {
         instances::refresh_states(host.arc()).await;
 
         let record = host.state.record(&app_id()).await.unwrap();
-        assert_eq!(record.state, InstanceState::Idle);
+        assert_eq!(record.state, InstanceState::Running);
         assert!(record.message.is_none());
     }
 
