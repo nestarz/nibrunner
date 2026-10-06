@@ -78,7 +78,8 @@ mod linux {
     }
 
     const PEER: &str = "eth0";
-    const NAMESPACE_ALIAS: &str = "nibrunner namespace";
+    // IFLA_GROUP is applied during creation; IFLA_IFALIAS is only applied by a later update.
+    const NAMESPACE_GROUP: u32 = 0x004e_4942;
 
     impl KernelNetwork {
         pub fn open(namespace_dir: PathBuf) -> Result<Self, NetworkError> {
@@ -152,7 +153,13 @@ mod linux {
                 let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).ok()?;
                 (flags & 2 != 0).then_some(InfoKind::Tun)
             }
-            InfoKind::Veth if link.attributes.iter().any(|attribute| matches!(attribute, LinkAttribute::IfAlias(alias) if alias == NAMESPACE_ALIAS)) => Some(InfoKind::Veth),
+            InfoKind::Veth
+                if link.attributes.iter().any(
+                    |attribute| matches!(attribute, LinkAttribute::Group(group) if *group == NAMESPACE_GROUP),
+                ) =>
+            {
+                Some(InfoKind::Veth)
+            }
             _ => None,
         }
     }
@@ -306,7 +313,7 @@ mod linux {
                     .link()
                     .add(
                         LinkVeth::new(name, PEER)
-                            .alias(NAMESPACE_ALIAS)
+                            .link_group(NAMESPACE_GROUP)
                             .set_info_data(InfoData::Veth(InfoVeth::Peer(peer)))
                             .build(),
                     )
