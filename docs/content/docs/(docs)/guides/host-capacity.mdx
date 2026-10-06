@@ -209,6 +209,9 @@ candidates can snapshot when a full guest reservation fits. Without the frozen t
 go directly to snapshot admission. Deployment admission
 protects production apps; request-triggered wakes can reclaim idle production as a last resort.
 The reclaim lock waits at most 30 seconds. Snapshot time is additional.
+When another VM is starting or holds a memory reservation, a request-triggered wake retries
+admission for up to ten seconds while that transition settles. Every retry uses fresh readings
+and the same headroom and pool limits. A persistent shortfall still refuses the wake.
 
 The activity pass also reclaims one app when `MemAvailable` falls below headroom, or memory PSI
 over ten seconds reaches 10 percent `some` or 1 percent `full`. Recovery requires headroom plus
