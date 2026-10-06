@@ -135,6 +135,9 @@ Use a new UUID for each operation. Start work only after `status: granted`, with
 `MemoryMax` set to the granted budget. A `waiting` reply names the capacity or service condition
 to retry. Repeating the same request from the same process returns the same grant.
 Changing its owner, unit or budget is rejected.
+Set optional `minimum_mib` to accept a smaller grant when the preferred `memory_mib` does not fit.
+The reply gives the actual budget to enforce. Grants never fall below the minimum; fixed requests
+continue to require the full requested budget. Retrying a flexible request returns its original grant.
 
 After the service exits, send `{"operation":"release","id":"03ae9139-c7fc-4ad4-a94b-6e3c81d3b406"}`.
 Release waits for an inactive or failed unit with no queued job and no live processes.

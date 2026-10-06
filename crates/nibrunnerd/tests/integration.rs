@@ -86,18 +86,23 @@ fn memory_lease_client_process() {
         serde_json::from_slice(&bytes).unwrap()
     };
     let acquire = Request::Acquire {
+        minimum_mib: Some(32.try_into().unwrap()),
         id: id.clone(),
         unit: unit.clone(),
-        memory_mib: 32.try_into().unwrap(),
+        memory_mib: u32::MAX.try_into().unwrap(),
     };
-    assert!(matches!(request(acquire.clone()), Reply::Granted { .. }));
-    assert!(matches!(request(acquire), Reply::Granted { .. }));
+    let granted = request(acquire.clone());
+    let Reply::Granted { memory_mib } = granted else {
+        panic!("{granted:?}");
+    };
+    assert!((32..u32::MAX).contains(&memory_mib.get()));
+    assert_eq!(request(acquire), granted);
     assert!(std::process::Command::new("systemd-run")
         .args([
             "--unit",
             &unit,
             "--collect",
-            "--property=MemoryMax=32M",
+            &format!("--property=MemoryMax={}M", memory_mib.get()),
             "--property=RuntimeMaxSec=20",
             "/bin/sleep",
             "20"
