@@ -67,6 +67,22 @@ impl VmManager {
         FirecrackerApi::at(self.processes.api_socket(app_id))
     }
 
+    async fn pause_tenant(&self, app_id: &AppId) -> Result<(), VmError> {
+        let control = self
+            .working_dir_for(app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        time_sync::freeze_tenant(&control).await?;
+        self.api(app_id).pause().await
+    }
+
+    async fn resume_tenant(&self, app_id: &AppId) -> Result<(), VmError> {
+        self.api(app_id).resume().await?;
+        let control = self
+            .working_dir_for(app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        time_sync::wake(&control).await
+    }
+
     fn current_stamp(&self, request: &SuspendRequest) -> SnapshotStamp {
         SnapshotStamp {
             firecracker_version: Some(super::process::FIRECRACKER_VERSION.into()),
@@ -225,23 +241,13 @@ impl Vmm for VmManager {
         self.processes
             .remember_frozen(app_id, true)
             .map_err(|error| VmError::Host(error.to_string()))?;
-        let result = async {
-            time_sync::freeze_tenant(&control).await?;
-            // Host freezer requests alone timed out with running vCPUs on Linux 6.1.
-            self.api(app_id).pause().await?;
-            self.processes
-                .freeze(app_id)
-                .await
-                .map_err(|error| VmError::Host(error.to_string()))
-        }
-        .await;
-        if let Err(error) = result {
+        if let Err(error) = self.pause_tenant(app_id).await {
             if let Err(recovery) = self.thaw(app_id).await {
                 tracing::warn!(%app_id, error = %recovery.message(), "freeze recovery remains pending for the next wake");
             }
             return Err(error);
         }
-        if let Err(error) = self.processes.reclaim_frozen(app_id, 64 * 1_048_576).await {
+        if let Err(error) = self.processes.reclaim_memory(app_id, 64 * 1_048_576).await {
             tracing::debug!(%app_id, %error, "frozen memory reclaim was incomplete");
         }
         Ok(())
@@ -252,13 +258,8 @@ impl Vmm for VmManager {
             .thaw(app_id)
             .await
             .map_err(|error| VmError::Host(error.to_string()))?;
-        self.api(app_id).resume().await?;
-        let control = self
-            .working_dir_for(app_id)
-            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
-        if let Err(error) = time_sync::wake(&control).await {
+        if let Err(error) = self.resume_tenant(app_id).await {
             let _ = self.api(app_id).pause().await;
-            let _ = self.processes.freeze(app_id).await;
             return Err(error);
         }
         self.processes
@@ -475,17 +476,12 @@ impl Vmm for VmManager {
 
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
         if self.processes.status(app_id).frozen {
-            if !self
-                .processes
-                .frozen(app_id)
-                .map_err(|error| VmError::Host(error.to_string()))?
-            {
-                self.api(app_id).pause().await?;
-            }
+            // Releases predating native pause may have left the VMM's host cgroup frozen.
             self.processes
-                .freeze(app_id)
+                .thaw(app_id)
                 .await
                 .map_err(|error| VmError::Host(error.to_string()))?;
+            self.api(app_id).pause().await?;
         }
         // The deployment its output should be stamped with is the one the record remembers. A
         // guest this host holds no record of has nothing to attribute its lines to, so it is left
@@ -806,6 +802,28 @@ mod tests {
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls[0], "SLEEP");
         assert!(calls[1].starts_with("WAKE "));
+        fixture.manager.processes.stop(&app_id()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_pause_keeps_the_vm_and_holds_the_tenant_until_clock_recovery() {
+        let mut fixture = fixture();
+        let calls = running_fake_vm(&mut fixture, false).await;
+        let pid = fixture.manager.processes.read_record(&app_id()).unwrap().pid;
+
+        fixture.manager.pause_tenant(&app_id()).await.unwrap();
+        assert!(fixture.manager.processes.status(&app_id()).active);
+        fixture.manager.resume_tenant(&app_id()).await.unwrap();
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(&calls[..3], ["SLEEP", "/vm", "/vm"]);
+        assert!(calls[3].starts_with("WAKE "));
+        assert_eq!(calls[4], "GO");
+        assert_eq!(fixture.manager.processes.read_record(&app_id()).unwrap().pid, pid);
+        assert!(!snapshot_paths(&fixture.manager.snapshot_dir, &app_id())
+            .directory
+            .exists());
         fixture.manager.processes.stop(&app_id()).await;
     }
 

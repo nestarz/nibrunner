@@ -70,12 +70,13 @@ connections can bypass the proxy's open-request accounting, so they cannot yet e
 | Reported state | Memory and wake behavior |
 | --- | --- |
 | `running` | The app executes normally. |
-| `frozen` | The tenant and host cgroup are frozen. A request thaws the existing process, synchronizes its clock and waits for readiness. |
+| `frozen` | The tenant is frozen and the VM is paused. A request resumes the existing VM, synchronizes its clock and waits for readiness. |
 | `idle` | The VM has been snapshotted and stopped. A request restores its snapshot. |
 
 The host requests guest cache reclaim before freezing, then up to 64 MiB of host cgroup reclaim.
-Firecracker's pause API stops the vCPUs before the host cgroup freezes. Thaw reverses that order
-before synchronizing the guest clock. This requires the pause/resume vsock fix in Firecracker
+Firecracker's native pause API stops the vCPUs; its API thread remains available. The host cgroup
+continues to enforce memory limits and supports reclaim without entering the host freezer.
+Thaw resumes the VM before synchronizing the guest clock. This requires the pause/resume vsock fix in Firecracker
 1.16.2. VMs retained from an older daemon wait for their next start before entering this tier.
 With host swap and a per-VM swap allowance, reclaim can move pages into zram. Compression,
 retained memory and wake latency depend on the workload; freezing does not imply zero RAM.
