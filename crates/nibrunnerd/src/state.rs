@@ -558,11 +558,12 @@ impl HostState {
     /// Admit and count the request under the same lock that makes expiry terminal.
     pub(crate) async fn admit<T>(&self, app_id: &AppId, now_ms: i64, open: impl FnOnce() -> T) -> Option<T> {
         let mut snapshot = self.snapshot.write().await;
-        if snapshot
-            .records
-            .get(app_id)
-            .is_some_and(|r| r.expired_at_ms.is_some())
-        {
+        if snapshot.records.get(app_id).is_some_and(|r| {
+            r.expired_at_ms.is_some()
+                || r.expiry
+                    .as_ref()
+                    .is_some_and(|policy| policy.deadline_reached(now_ms))
+        }) {
             return None;
         }
         snapshot.last_active_at_ms.insert(app_id.clone(), now_ms);

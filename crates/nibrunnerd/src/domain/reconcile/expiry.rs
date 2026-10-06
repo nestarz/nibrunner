@@ -21,7 +21,7 @@ pub(crate) async fn apply(host: &Arc<Host>, now: i64) {
         let Some(mut record) = snapshot.records.get(id).cloned() else {
             continue;
         };
-        let Some(policy) = record.expiry else {
+        let Some(policy) = record.expiry.as_ref() else {
             continue;
         };
         if record.deployment_id != previous.deployment_id {
@@ -31,7 +31,10 @@ pub(crate) async fn apply(host: &Arc<Host>, now: i64) {
             continue;
         };
         let last = since.max(snapshot.last_active_at_ms.get(id).copied().unwrap_or(since));
-        if record.expired_at_ms.is_none() && now.saturating_sub(last) < policy.idle_ms.get() as i64 {
+        if record.expired_at_ms.is_none()
+            && !policy.deadline_reached(now)
+            && now.saturating_sub(last) < policy.idle_ms.get() as i64
+        {
             continue;
         }
         record.expired_at_ms.get_or_insert(now);
@@ -82,6 +85,7 @@ mod tests {
                 r.on_request = true;
                 r.expiry = Some(ExpiryPolicy {
                     idle_ms: ExpiryIdleMs::try_from(IDLE as u64).unwrap(),
+                    deadline: None,
                 });
                 r.expiry_since_ms = Some(0);
             }))
@@ -126,6 +130,57 @@ mod tests {
         assert!(restarted.admit(&app_id(), IDLE + 3, || ()).await.is_none());
         assert_eq!(persisted[0].expired_at_ms, Some(IDLE + 1));
     }
+
+    #[tokio::test]
+    async fn an_absolute_deadline_drains_open_requests_without_renewal() {
+        let host = expirable().await;
+        host.state
+            .update_record(&app_id(), |r| {
+                r.expiry.as_mut().unwrap().deadline = Some(protocol::Timestamp::from_epoch_ms(IDLE));
+            })
+            .await;
+        let open = host
+            .state
+            .admit(&app_id(), IDLE - 1, || host.metrics.proxy.open(&app_id()))
+            .await
+            .unwrap();
+        assert!(host.state.admit(&app_id(), IDLE, || ()).await.is_none());
+        apply(host.arc(), IDLE).await;
+        assert!(host.vms.calls().is_empty());
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Running
+        );
+        drop(open);
+        apply(host.arc(), IDLE).await;
+        assert_eq!(host.vms.calls(), [VmCall::Stop, VmCall::Discard]);
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().expired_at_ms,
+            Some(IDLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_cannot_extend_an_absolute_deadline_and_promotion_removes_it() {
+        let host = expirable().await;
+        host.state
+            .update_record(&app_id(), |r| {
+                r.expiry.as_mut().unwrap().deadline = Some(protocol::Timestamp::from_epoch_ms(IDLE));
+            })
+            .await;
+        host.persist().await;
+        host.load().await;
+        assert!(host.state.admit(&app_id(), IDLE, || ()).await.is_none());
+        apply(host.arc(), IDLE).await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Expired
+        );
+        host.state
+            .update_record(&app_id(), |r| r.apply_expiry(None, &deployment_id(), IDLE + 1))
+            .await;
+        assert!(host.state.admit(&app_id(), IDLE + 1, || ()).await.is_some());
+    }
     #[tokio::test]
     async fn no_policy_never_expires() {
         let host = test_host().await;
@@ -163,10 +218,11 @@ mod tests {
         assert_eq!(r.expired_at_ms, None);
         let policy = Some(ExpiryPolicy {
             idle_ms: ExpiryIdleMs::try_from(IDLE as u64).unwrap(),
+            deadline: None,
         });
-        r.apply_expiry(policy, &deployment_id(), IDLE + 2);
+        r.apply_expiry(policy.clone(), &deployment_id(), IDLE + 2);
         assert_eq!(r.expiry_since_ms, Some(IDLE + 2));
-        r.apply_expiry(policy, &deployment_id(), IDLE + 3);
+        r.apply_expiry(policy.clone(), &deployment_id(), IDLE + 3);
         assert_eq!(r.expiry_since_ms, Some(IDLE + 2));
         r.state = InstanceState::Expired;
         r.expired_at_ms = Some(2 * IDLE + 2);

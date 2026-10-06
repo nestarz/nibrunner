@@ -503,11 +503,20 @@ impl JsonSchema for ExpiryIdleMs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExpiryPolicy {
     pub idle_ms: ExpiryIdleMs,
+    /// Stop new requests at this instant, then expire after admitted requests finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<Timestamp>,
+}
+
+impl ExpiryPolicy {
+    pub fn deadline_reached(&self, now_ms: i64) -> bool {
+        self.deadline.as_ref().is_some_and(|at| now_ms >= at.epoch_ms())
+    }
 }
 
 pub const MIN_MAX_LIFETIME_MS: u64 = 60_000;

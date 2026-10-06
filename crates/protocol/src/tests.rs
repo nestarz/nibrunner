@@ -938,7 +938,7 @@ fn expiry_is_bounded_optional_and_only_for_on_request_instances() {
         let mut document = desired_json();
         document["instances"][0]["expiry"] = serde_json::json!({"idleMs": value});
         let parsed: HostDesiredState = serde_json::from_value(document.clone()).unwrap();
-        assert_eq!(parsed.instances[0].expiry.unwrap().idle_ms.get(), value);
+        assert_eq!(parsed.instances[0].expiry.as_ref().unwrap().idle_ms.get(), value);
         for state in ["running", "stopped"] {
             document["instances"][0]["desiredState"] = state.into();
             assert!(serde_json::from_value::<HostDesiredState>(document.clone()).is_err());
@@ -952,6 +952,21 @@ fn expiry_is_bounded_optional_and_only_for_on_request_instances() {
     assert!(serde_json::to_value(parsed).unwrap()["instances"][0]
         .get("expiry")
         .is_none());
+}
+
+#[test]
+fn expiry_deadlines_are_validated_instants_and_legacy_policies_keep_their_encoding() {
+    let legacy = serde_json::json!({"idleMs": MIN_EXPIRY_IDLE_MS});
+    let mut policy: ExpiryPolicy = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!policy.deadline_reached(i64::MAX));
+    assert_eq!(serde_json::to_value(&policy).unwrap(), legacy);
+    policy.deadline = Some(Timestamp::from_epoch_ms(60_000));
+    assert!(!policy.deadline_reached(59_999));
+    assert!(policy.deadline_reached(60_000));
+    assert!(serde_json::from_value::<ExpiryPolicy>(serde_json::json!({
+        "idleMs": MIN_EXPIRY_IDLE_MS, "deadline": "tomorrow"
+    }))
+    .is_err());
 }
 
 #[test]

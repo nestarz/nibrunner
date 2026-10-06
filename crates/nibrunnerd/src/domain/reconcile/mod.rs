@@ -98,7 +98,11 @@ async fn sync_desired(host: &Arc<Host>, desired: &HostDesiredState) {
         }
         host.state
             .update_record(&wanted.app_id, |record| {
-                record.apply_expiry(wanted.expiry, &wanted.deployment_id, crate::clock::now_ms());
+                record.apply_expiry(
+                    wanted.expiry.clone(),
+                    &wanted.deployment_id,
+                    crate::clock::now_ms(),
+                );
                 record.hostnames = wanted.hostnames.clone();
                 record.health_check = wanted.config.health_check.clone();
                 record.resources = wanted.config.resources;
