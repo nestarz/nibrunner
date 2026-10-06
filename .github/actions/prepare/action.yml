@@ -12,6 +12,10 @@ inputs:
     description: A name for jobs that build the same thing to share one cargo cache under. Empty keys the cache by job.
     required: false
     default: ""
+  prepare-docs:
+    description: Whether to install docs dependencies. `enabled` or `disabled`.
+    required: false
+    default: enabled
 
 runs:
   using: composite
@@ -21,6 +25,7 @@ runs:
       env:
         CACHE: ${{ inputs.cache }}
         PREPARE_FOR_BUILD: ${{ inputs.prepare-for-build }}
+        PREPARE_DOCS: ${{ inputs.prepare-docs }}
       run: |
         case "$CACHE" in
           enabled | disabled) ;;
@@ -33,6 +38,13 @@ runs:
           enabled | disabled) ;;
           *)
             echo "prepare: prepare-for-build must be 'enabled' or 'disabled', got '$PREPARE_FOR_BUILD'"
+            exit 1
+            ;;
+        esac
+        case "$PREPARE_DOCS" in
+          enabled | disabled) ;;
+          *)
+            echo "prepare: prepare-docs must be 'enabled' or 'disabled', got '$PREPARE_DOCS'"
             exit 1
             ;;
         esac
@@ -60,6 +72,7 @@ runs:
         cache: true
 
     - name: Install the docs site's dependencies
+      if: inputs.prepare-docs == 'enabled'
       shell: bash
       run: cd docs && bun install --frozen-lockfile
 
