@@ -86,7 +86,8 @@ or snapshot. Their original idle deadline still applies, and
 memory pressure can select them for earlier snapshots. Within each priority, frozen apps are
 selected before running apps.
 
-The daemon records freeze intent before pausing and recovers it after a restart. Health and
+The daemon records freeze intent before pausing, including snapshot creation, and recovers it
+after a restart. A refused snapshot clears that intent only after guest recovery. Health and
 guest usage probes skip frozen apps. Changing the policy to require continued execution thaws
 them. Omit `freeze_after_ms` to disable new automatic freezes; requests still wake existing ones.
 
