@@ -271,6 +271,22 @@ pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Tr
     converge::observe(host, crate::clock::now_ms()).await;
     host.persist().await;
 
+    let mut retained: BTreeSet<_> = desired
+        .instances
+        .iter()
+        .flat_map(|i| i.layers.iter().map(|layer| layer.digest().clone()))
+        .collect();
+    retained.extend(
+        host.state
+            .records()
+            .await
+            .into_iter()
+            .flat_map(|r| r.layer_digests),
+    );
+    if let Err(error) = host.payloads.retain(&retained).await {
+        tracing::warn!(error = %error.message(), "unused layer images could not be removed");
+    }
+
     host.state.modify(|snapshot| snapshot.converged = true).await;
     host.state.signal_report();
 }

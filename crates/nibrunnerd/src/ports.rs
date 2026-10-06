@@ -289,6 +289,10 @@ pub struct PreparedPayload {
 #[async_trait]
 pub trait PayloadBuilder: Send + Sync {
     async fn prepare(&self, layers: &[DesiredLayer]) -> Result<PreparedPayload, ArtifactError>;
+    async fn retain(
+        &self,
+        digests: &std::collections::BTreeSet<protocol::Sha256Digest>,
+    ) -> Result<(), ArtifactError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
