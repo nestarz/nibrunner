@@ -545,6 +545,7 @@ mod tests {
             VmStatus {
                 loaded: true,
                 active: true,
+                frozen: false,
                 failed: false,
                 started_this_boot: true,
                 exit: None,

@@ -8,8 +8,8 @@ pub use protocol::DEFAULT_IDLE_TIMEOUT_MS;
 pub const ACTIVITY_INTERVAL_MS: u64 = 5_000;
 
 // How many apps a pass puts to sleep at once. A snapshot is disk-bound — pausing the guest is
-// instant, and the rest is writing its memory out to the one NVMe every app on the host runs
-// from — so four keep that disk busy without forty of them queueing on it, and the last app of a
+// instant, and the rest is writing its memory to shared host storage — so four keep that disk
+// busy without forty of them queueing on it, and the last app of a
 // batch that went quiet together is asleep a few snapshots after the first rather than forty.
 pub const SLEEP_CONCURRENCY: usize = 4;
 
@@ -398,6 +398,7 @@ pub async fn apply_sleep(host: &std::sync::Arc<Host>) -> usize {
             .unwrap_or_default()
     };
     reclaim_quiet(host, &policies).await;
+    super::frozen::apply(host).await;
     let snapshot = host.state.snapshot().await;
     let requests_open = host.metrics.proxy.open_requests();
     let now = crate::clock::now_ms();

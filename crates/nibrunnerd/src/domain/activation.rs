@@ -2,9 +2,8 @@ use protocol::{ActivationPolicy, InstanceState, SleepPolicy};
 
 use crate::domain::report::InstanceRecord;
 
-/// The only state with a running microVM to put down. Everything else is either on its way
-/// somewhere already or has nothing to suspend.
-const SLEEPABLE_STATES: [InstanceState; 1] = [InstanceState::Running];
+/// States holding a live microVM that can move to a disk snapshot.
+const SLEEPABLE_STATES: [InstanceState; 2] = [InstanceState::Running, InstanceState::Frozen];
 
 /// How long past its lifetime an app with a request still open is left to finish answering it.
 /// Bounded, because a policy that recycles an app on a clock must not be held off it for ever by
@@ -313,10 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_running_on_request_app_this_host_still_wants_up_is_ever_let_go() {
+    fn only_live_on_request_apps_this_host_still_wants_up_can_be_snapshotted() {
         let long_ago = quiet_since(0);
         for state in INSTANCE_STATES {
-            let expected = (state == InstanceState::Running).then_some(SleepReason::Quiet);
+            let expected =
+                matches!(state, InstanceState::Running | InstanceState::Frozen).then_some(SleepReason::Quiet);
             assert_eq!(
                 should_sleep(&traffic_idle(), &serving(state), &long_ago, NOW_MS),
                 expected,

@@ -117,10 +117,11 @@ pub fn refusal_str(refusal: &WakeRefusal) -> &'static str {
 }
 
 const WAKE_PHASES: [WakePhase; 2] = [WakePhase::Ready, WakePhase::Total];
-const WAKE_OUTCOMES: [WakeOutcome; 3] = [
+const WAKE_OUTCOMES: [WakeOutcome; 4] = [
     WakeOutcome::Restored,
     WakeOutcome::ColdBoot,
     WakeOutcome::AlreadyRunning,
+    WakeOutcome::Thawed,
 ];
 const REFUSALS: [&str; 9] = [
     "no_room",
@@ -635,6 +636,7 @@ mod tests {
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"restored\"} 1",
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"cold-boot\"} 0",
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"already-running\"} 0",
+                "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"thawed\"} 0",
             ]
         );
         assert_eq!(

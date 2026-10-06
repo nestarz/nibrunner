@@ -698,6 +698,7 @@ pub enum InstanceState {
     Pending,
     Starting,
     Running,
+    Frozen,
     Unhealthy,
     Stopping,
     Stopped,
@@ -706,10 +707,11 @@ pub enum InstanceState {
     Failed,
 }
 
-pub const INSTANCE_STATES: [InstanceState; 9] = [
+pub const INSTANCE_STATES: [InstanceState; 10] = [
     InstanceState::Pending,
     InstanceState::Starting,
     InstanceState::Running,
+    InstanceState::Frozen,
     InstanceState::Unhealthy,
     InstanceState::Stopping,
     InstanceState::Stopped,
@@ -724,6 +726,7 @@ impl InstanceState {
             InstanceState::Pending => "pending",
             InstanceState::Starting => "starting",
             InstanceState::Running => "running",
+            InstanceState::Frozen => "frozen",
             InstanceState::Unhealthy => "unhealthy",
             InstanceState::Stopping => "stopping",
             InstanceState::Stopped => "stopped",

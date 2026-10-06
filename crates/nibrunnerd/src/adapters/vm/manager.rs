@@ -199,6 +199,57 @@ impl VmManager {
 
 #[async_trait]
 impl Vmm for VmManager {
+    async fn freeze(&self, app_id: &AppId) -> Result<(), VmError> {
+        self.processes
+            .frozen(app_id)
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        let control = self
+            .working_dir_for(app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        if let Err(error) = time_sync::reclaim(&control).await {
+            tracing::debug!(%app_id, error = %error.message(), "guest reclaim before freeze was incomplete");
+        }
+        // An interrupted transition remains discoverable even before the host freezer acknowledges it.
+        self.processes
+            .remember_frozen(app_id, true)
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        let result = async {
+            time_sync::freeze_tenant(&control).await?;
+            self.processes
+                .freeze(app_id)
+                .await
+                .map_err(|error| VmError::Host(error.to_string()))
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(recovery) = self.thaw(app_id).await {
+                tracing::warn!(%app_id, error = %recovery.message(), "freeze recovery remains pending for the next wake");
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.processes.reclaim_frozen(app_id, 64 * 1_048_576).await {
+            tracing::debug!(%app_id, %error, "frozen memory reclaim was incomplete");
+        }
+        Ok(())
+    }
+
+    async fn thaw(&self, app_id: &AppId) -> Result<(), VmError> {
+        self.processes
+            .thaw(app_id)
+            .await
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        let control = self
+            .working_dir_for(app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        if let Err(error) = time_sync::wake(&control).await {
+            let _ = self.processes.freeze(app_id).await;
+            return Err(error);
+        }
+        self.processes
+            .remember_frozen(app_id, false)
+            .map_err(|error| VmError::Host(error.to_string()))
+    }
+
     async fn reclaim(&self, app_id: &AppId) -> Result<(), VmError> {
         let path = self
             .working_dir_for(app_id)
@@ -241,6 +292,9 @@ impl Vmm for VmManager {
             .admit_snapshot(&request.app_id)
             .await
             .map_err(|reason| VmError::SleepRefused { reason })?;
+        if self.processes.status(&request.app_id).frozen {
+            self.thaw(&request.app_id).await?;
+        }
         let paths = snapshot_paths(&self.snapshot_dir, &request.app_id);
         let stamp = self.current_stamp(&request);
         let api = self.api(&request.app_id);
@@ -400,6 +454,12 @@ impl Vmm for VmManager {
     }
 
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
+        if self.processes.status(app_id).frozen {
+            self.processes
+                .freeze(app_id)
+                .await
+                .map_err(|error| VmError::Host(error.to_string()))?;
+        }
         // The deployment its output should be stamped with is the one the record remembers. A
         // guest this host holds no record of has nothing to attribute its lines to, so it is left
         // for the reconcile pass, which discards a microVM it was never told to keep.

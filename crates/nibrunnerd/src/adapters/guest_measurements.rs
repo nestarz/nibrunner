@@ -20,6 +20,19 @@ impl VsockMeasurements {
 #[async_trait]
 impl GuestMeasurements for VsockMeasurements {
     async fn measure(&self, app_id: &AppId) -> GuestReading {
+        let Some(_transition) = self.host.state.try_transition(app_id) else {
+            return GuestReading::default();
+        };
+        if self
+            .host
+            .vms
+            .statuses(std::slice::from_ref(app_id))
+            .await
+            .get(app_id)
+            .is_some_and(|status| status.frozen)
+        {
+            return GuestReading::default();
+        }
         reader::measure(&self.host, app_id).await
     }
 }

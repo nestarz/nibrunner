@@ -325,6 +325,41 @@ mod tests {
     use protocol::InstanceState;
 
     #[tokio::test]
+    async fn concurrent_requests_to_a_frozen_app_share_one_thaw_and_wait_for_readiness() {
+        let host = test_host().await;
+        let port = listening().await;
+        host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
+        host.state.modify(|snapshot| snapshot.isolated = true).await;
+        host.state
+            .put_record(instance_record(|record| {
+                record.on_request = true;
+                record.state = InstanceState::Frozen;
+                record.health_check = protocol::HealthCheck::BootCompleted;
+                record.guest_ipv4 = crate::domain::health::probe::loopback();
+                record.http_port = port;
+            }))
+            .await;
+        host.vms.set_status(crate::adapters::vm::VmStatus {
+            active: true,
+            frozen: true,
+            ..Default::default()
+        });
+        host.cache.lock().await.accept(desired_state(|state| {
+            state.instances = vec![desired_instance(|instance| {
+                instance.desired_state = DesiredInstanceState::OnRequest;
+            })];
+        }));
+        let waker = AppWaker::new(host.arc().clone());
+        let outcomes = futures::future::join_all((0..10).map(|_| {
+            let waker = waker.clone();
+            async move { waker.wake(&app_id()).await }
+        }))
+        .await;
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        assert_eq!(host.vms.calls(), vec![crate::ports::VmCall::Thaw]);
+    }
+
+    #[tokio::test]
     async fn concurrent_requests_to_one_app_cause_one_wake() {
         let host = test_host().await;
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();

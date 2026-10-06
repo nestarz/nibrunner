@@ -9,9 +9,10 @@ use crate::ports::GuestReading;
 
 // A microVM exists and is holding the memory it was promised. Pending has not been given any yet,
 // Idle handed it back to a snapshot, and Stopped and Failed are holding none.
-const HOLDS_MEMORY: [InstanceState; 4] = [
+const HOLDS_MEMORY: [InstanceState; 5] = [
     InstanceState::Starting,
     InstanceState::Running,
+    InstanceState::Frozen,
     InstanceState::Unhealthy,
     InstanceState::Stopping,
 ];

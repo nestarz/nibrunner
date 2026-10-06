@@ -49,6 +49,39 @@ Without `sleepWhen`, an `on-request` instance sleeps after five minutes idle. An
     the silence for quiet, and says so in its log. `max-lifetime` runs on the clock either way.
 </Callout>
 
+## Frozen tier
+
+To pause quiet apps before writing a snapshot, set an optional threshold in host configuration:
+
+```toml
+[memory_admission]
+mode = "observe"
+headroom_mib = 1024
+reclaim = true
+freeze_after_ms = 60000
+```
+
+Only `on-request` apps with a `traffic-idle` policy qualify. The threshold must precede the
+snapshot deadline; values below 30 seconds use 30 seconds. Open requests, recent wakes,
+missing activity readings and declared background work prevent freezing.
+
+| Reported state | Memory and wake behavior |
+| --- | --- |
+| `running` | The app executes normally. |
+| `frozen` | The tenant and host cgroup are frozen. A request thaws the existing process, synchronizes its clock and waits for readiness. |
+| `idle` | The VM has been snapshotted and stopped. A request restores its snapshot. |
+
+The host requests guest cache reclaim before freezing, then up to 64 MiB of host cgroup reclaim.
+With host swap and a per-VM swap allowance, reclaim can move pages into zram. Compression,
+retained memory and wake latency depend on the workload; freezing does not imply zero RAM.
+Frozen apps retain their admission budget. Their original idle deadline still applies, and
+memory pressure can select them for earlier snapshots. Within each priority, frozen apps are
+selected before running apps.
+
+The daemon records freeze intent before pausing and recovers it after a restart. Health and
+guest usage probes skip frozen apps. Changing the policy to require continued execution thaws
+them. Omit `freeze_after_ms` to disable new automatic freezes; requests still wake existing ones.
+
 ## What wakes it
 
 Any inbound traffic: an HTTP request on one of its hostnames, or anything on a

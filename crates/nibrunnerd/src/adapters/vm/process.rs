@@ -49,6 +49,8 @@ pub struct VmRecord {
     pub pid: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_ticks: Option<u64>,
+    #[serde(default)]
+    pub frozen: bool,
     pub host_boot_id: String,
     pub started_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +204,7 @@ impl VmProcesses {
         VmStatus {
             loaded: true,
             active,
+            frozen: active && record.frozen,
             failed: !active && !record.stop_requested && exit.is_some_and(|exit| exit != VmExit::Code(0)),
             started_this_boot,
             exit,
@@ -214,6 +217,14 @@ impl VmProcesses {
             return None;
         }
         super::memory::read_process(record.pid)
+    }
+
+    pub fn remember_frozen(&self, app_id: &AppId, frozen: bool) -> std::io::Result<()> {
+        let mut record = self
+            .read_record(app_id)
+            .ok_or_else(|| std::io::Error::other("the VM has no process record"))?;
+        record.frozen = frozen;
+        self.write_record(&record)
     }
 
     fn cgroup(&self, app_id: &AppId) -> std::io::Result<crate::adapters::cgroup::Group> {
@@ -321,6 +332,7 @@ impl VmProcesses {
             app_id: app_id.clone(),
             pid,
             start_ticks: process_start_ticks(pid),
+            frozen: false,
             host_boot_id: self.boot_id.clone(),
             started_at_ms: crate::clock::now_ms(),
             exit_code: None,
@@ -439,6 +451,7 @@ mod tests {
                     app_id: app_id(),
                     pid: std::process::id() as i32,
                     start_ticks: ticks,
+                    frozen: false,
                     host_boot_id: "boot-1".into(),
                     started_at_ms: 0,
                     exit_code: None,
@@ -556,6 +569,7 @@ mod tests {
                 app_id: app_id(),
                 pid: std::process::id() as i32,
                 start_ticks: None,
+                frozen: false,
                 host_boot_id: "an-earlier-boot".into(),
                 started_at_ms: 0,
                 exit_code: None,
@@ -579,6 +593,7 @@ mod tests {
                 app_id: app_id(),
                 pid: std::process::id() as i32,
                 start_ticks: None,
+                frozen: false,
                 host_boot_id: "boot-1".into(),
                 started_at_ms: 0,
                 exit_code: None,
@@ -600,6 +615,7 @@ mod tests {
             app_id: app_id(),
             pid: 1,
             start_ticks: None,
+            frozen: false,
             host_boot_id: "boot-1".into(),
             started_at_ms: 0,
             exit_code: Some(1),
@@ -685,6 +701,7 @@ mod tests {
                 app_id: app_id(),
                 pid: 1,
                 start_ticks: None,
+                frozen: false,
                 host_boot_id: "boot-1".into(),
                 started_at_ms: 0,
                 exit_code: Some(0),
@@ -865,6 +882,7 @@ mod tests {
                 app_id: app_id(),
                 pid: -1,
                 start_ticks: None,
+                frozen: false,
                 host_boot_id: "boot-1".into(),
                 started_at_ms: 0,
                 exit_code: None,

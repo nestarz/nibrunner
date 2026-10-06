@@ -1,6 +1,7 @@
 pub mod checkpoints;
 pub(crate) mod expiry;
 pub mod exports;
+pub(crate) mod frozen;
 pub mod idle;
 pub mod ingress;
 pub mod instances;
@@ -66,6 +67,35 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
 async fn sync_desired(host: &Host, desired: &HostDesiredState) {
     for wanted in &desired.instances {
         let _transition = host.state.transition(&wanted.app_id).await;
+        let must_run = wanted.desired_state == DesiredInstanceState::Running
+            || (wanted.desired_state == DesiredInstanceState::OnRequest
+                && !matches!(
+                    wanted.activation().sleep_when,
+                    protocol::SleepPolicy::TrafficIdle { .. }
+                ));
+        if must_run
+            && host
+                .vms
+                .statuses(std::slice::from_ref(&wanted.app_id))
+                .await
+                .get(&wanted.app_id)
+                .is_some_and(|status| status.frozen)
+        {
+            let Ok(_reservation) = host
+                .reserve_memory(
+                    &wanted.app_id,
+                    wanted.config.resources,
+                    pressure::ReclaimPurpose::Wake,
+                )
+                .await
+            else {
+                tracing::warn!(app_id = %wanted.app_id, "thaw waits for host memory");
+                continue;
+            };
+            if let Err(error) = instances::resume_instance(host, wanted).await {
+                tracing::warn!(app_id = %wanted.app_id, ?error, "a workload that must keep running could not thaw");
+            }
+        }
         host.state
             .update_record(&wanted.app_id, |record| {
                 record.apply_expiry(wanted.expiry, &wanted.deployment_id, crate::clock::now_ms());
@@ -260,6 +290,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: true,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: None,
@@ -270,6 +301,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: Some(VmExit::Code(0)),
@@ -280,6 +312,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: true,
             started_this_boot: false,
             exit: None,

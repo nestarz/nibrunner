@@ -87,7 +87,7 @@ fn eligible(
 ) -> bool {
     record.on_request
         && record.desired_running
-        && record.state == InstanceState::Running
+        && matches!(record.state, InstanceState::Running | InstanceState::Frozen)
         && matches!(policy.sleep_when, SleepPolicy::TrafficIdle { .. })
         && !(purpose == ReclaimPurpose::Deployment && priority == MemoryPriority::Production)
         && signals.requests_open == 0
@@ -155,11 +155,18 @@ pub(crate) async fn reclaim_one(host: &Host, purpose: ReclaimPurpose, exclude: O
                 priority,
                 now,
             )
-            .then(|| (eviction_order(priority), signals.last_active_at_ms, id.clone()))
+            .then(|| {
+                (
+                    eviction_order(priority),
+                    record.state != InstanceState::Frozen,
+                    signals.last_active_at_ms,
+                    id.clone(),
+                )
+            })
         })
         .collect();
-    candidates.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
-    for (_, _, app) in candidates {
+    candidates.sort();
+    for (_, _, _, app) in candidates {
         let Some(_transition) = host.state.try_transition(&app) else {
             continue;
         };
@@ -493,6 +500,7 @@ mod tests {
         inner.guest_memory_mib = u64::from(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib) * 2;
         inner.config.memory_admission = Some(crate::config::MemoryAdmission {
             mode: crate::config::MemoryAdmissionMode::Observe,
+            freeze_after_ms: None,
             reclaim: true,
             headroom_mib: 1024.try_into().unwrap(),
         });

@@ -170,6 +170,9 @@ pub fn evaluate_instance_state(inputs: &LifecycleInputs<'_>) -> InstanceState {
     if inputs.stop_requested {
         return InstanceState::Stopping;
     }
+    if inputs.unit.frozen {
+        return InstanceState::Frozen;
+    }
     if inputs.tracker.consecutive_successes >= inputs.health_check.probe().healthy_threshold {
         return InstanceState::Running;
     }
@@ -223,6 +226,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: true,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: None,
@@ -233,6 +237,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: Some(VmExit::Code(0)),
@@ -243,6 +248,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: true,
             started_this_boot: true,
             exit: Some(VmExit::Code(1)),

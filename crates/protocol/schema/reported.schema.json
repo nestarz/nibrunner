@@ -209,6 +209,7 @@
         "pending",
         "starting",
         "running",
+        "frozen",
         "unhealthy",
         "stopping",
         "stopped",

@@ -118,6 +118,12 @@
     "MemoryAdmission": {
       "type": "object",
       "properties": {
+        "freeze_after_ms": {
+          "description": "Freeze quiet on-request apps before their traffic-idle snapshot deadline. Omit to disable.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
         "headroom_mib": {
           "description": "Physical memory held back for the host and bursts; swap never increases this capacity.",
           "type": "integer",

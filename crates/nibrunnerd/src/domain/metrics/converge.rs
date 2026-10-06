@@ -145,7 +145,11 @@ pub fn is_converged(
             held.is_some_and(|(held, state)| held == deployment_id && state == InstanceState::Running)
         }
         DesiredInstanceState::OnRequest => held.is_some_and(|(held, state)| {
-            held == deployment_id && matches!(state, InstanceState::Idle | InstanceState::Running)
+            held == deployment_id
+                && matches!(
+                    state,
+                    InstanceState::Idle | InstanceState::Frozen | InstanceState::Running
+                )
         }),
     }
 }
@@ -770,6 +774,7 @@ mod tests {
         host.vms.set_status(VmStatus {
             loaded: true,
             active: true,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: None,
