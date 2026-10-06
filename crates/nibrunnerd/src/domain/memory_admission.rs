@@ -187,10 +187,11 @@ impl MemoryReadings {
             .saturating_sub(self.available_bytes);
         let budget_shortfall = targets.saturating_sub(capacity_mib.saturating_mul(BYTES_PER_MIB));
         let pool_shortfall = self.pool.as_ref().map_or(0, |pool| {
-            let available = pool.max_bytes.saturating_sub(pool.working_set_bytes());
+            let budget = pool.high_bytes.min(pool.max_bytes);
+            let available = budget.saturating_sub(pool.working_set_bytes());
             future
                 .saturating_sub(available)
-                .max(targets.saturating_sub(pool.max_bytes))
+                .max(targets.saturating_sub(budget))
         });
         physical_shortfall
             .max(budget_shortfall)
@@ -263,8 +264,8 @@ mod tests {
         let mut observed = readings();
         observed.available_bytes = 8192 * BYTES_PER_MIB;
         observed.pool = Some(pool(1700));
-        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 0);
-        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 164);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 156);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 412);
         observed.pool = Some(pool(2200));
         assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 256);
     }
@@ -277,7 +278,7 @@ mod tests {
         pool.reclaimable_file_bytes = 300 * BYTES_PER_MIB;
         observed.pool = Some(pool);
         assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 0);
-        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 0);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 112);
         assert_eq!(
             observed.strict_pool_shortfall_mib(&[], 0, 2304 * BYTES_PER_MIB),
             256
@@ -297,6 +298,23 @@ mod tests {
         assert_eq!(
             observed.shortfall_mib(8192, &[running()], 0, 0, 256 * BYTES_PER_MIB),
             0
+        );
+    }
+
+    #[test]
+    fn a_changing_soft_budget_queues_growth_without_changing_the_hard_quota() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        let mut measured = pool(1024);
+        measured.high_bytes = 1280 * BYTES_PER_MIB;
+        observed.pool = Some(measured);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 256);
+        observed.pool.as_mut().unwrap().high_bytes = 1800 * BYTES_PER_MIB;
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 0);
+        assert_eq!(observed.pool.as_ref().unwrap().max_bytes, 2048 * BYTES_PER_MIB);
+        assert_eq!(
+            observed.strict_pool_shortfall_mib(&[], 0, 2304 * BYTES_PER_MIB),
+            256
         );
     }
 
