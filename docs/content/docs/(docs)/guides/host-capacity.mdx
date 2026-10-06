@@ -102,6 +102,8 @@ added to this budget.
 
 A measured frozen VM reserves its resident footprint. Its swapped pages do not count as expected
 growth while it remains paused. A wake or snapshot must reserve its full budget before resuming it.
+Fresh `Pss_Anon` measurements credit pages already resident during that reservation. File cache,
+swapped pages and missing or stale samples receive no credit; the full ceiling remains reserved.
 Full snapshots fault in guest memory even when the paused footprint is small. Their reservations
 share the start/wake pool and remain held until the operation finishes. Under strict admission,
 snapshotting reuses the VM's existing full budget so an overcommitted host can still drain.
@@ -113,6 +115,12 @@ Adaptive admission can admit guests whose combined ceilings exceed physical RAM.
 must use the reservation API below; unregistered builds are not coordinated. Admission does not
 guarantee capacity for simultaneous growth. Keep observation mode until the workload and pressure
 handling are validated.
+
+External builds also leave one production wake budget free, sized to the largest production
+on-request instance. This reserve is separate from host headroom and is checked against both
+physical memory and the workload pool. A build takes a smaller grant or waits when it cannot fit.
+The reserve protects a wake opportunity; it does not guarantee room for every sleeping app to
+reach its ceiling at once.
 
 ### A bounded workload pool
 

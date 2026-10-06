@@ -412,7 +412,11 @@ impl HostState {
                         .copied()
                         .unwrap_or(0)
                         .min(held.bytes),
-                    ReservationOwner::App(_) => 0,
+                    ReservationOwner::App(id) => snapshot
+                        .records
+                        .get(id)
+                        .map_or(0, |record| readings.anonymous_resident_bytes(record))
+                        .min(held.bytes),
                 };
                 total.saturating_add(resident)
             });
@@ -428,6 +432,15 @@ impl HostState {
             if snapshot_outside_pool {
                 readings.pool = None;
             }
+            let wanted_resident_bytes = app_id
+                .and_then(|app| snapshot.records.get(app))
+                .map_or(0, |record| readings.anonymous_resident_bytes(record))
+                .min(bytes);
+            let wake_headroom = if app_id.is_none() {
+                readings.production_wake_bytes
+            } else {
+                0
+            };
             let measured_shortfall = readings.shortfall_mib(
                 if snapshot_outside_pool {
                     u64::MAX
@@ -435,9 +448,9 @@ impl HostState {
                     capacity_mib
                 },
                 &records,
-                reserved_bytes,
-                resident_reserved_bytes,
-                bytes,
+                reserved_bytes.saturating_add(bytes).saturating_add(wake_headroom),
+                resident_reserved_bytes.saturating_add(wanted_resident_bytes),
+                0,
             );
             let effective_adaptive = mode == crate::config::MemoryAdmissionMode::Adaptive
                 && readings
@@ -663,6 +676,7 @@ mod tests {
                 external_resident_bytes: BTreeMap::new(),
                 available_bytes: available_mib * 1_048_576,
                 headroom_bytes: 1024 * 1_048_576,
+                production_wake_bytes: 0,
                 measured_at_ms: crate::clock::now_ms(),
                 apps: BTreeMap::new(),
                 ceilings: BTreeMap::new(),
@@ -718,6 +732,7 @@ mod tests {
             external_resident_bytes: BTreeMap::new(),
             available_bytes: 1500 * 1_048_576,
             headroom_bytes: 1024 * 1_048_576,
+            production_wake_bytes: 0,
             measured_at_ms: crate::clock::now_ms(),
             ceilings: BTreeMap::from([(app_id(), 2048 * 1_048_576)]),
             apps: BTreeMap::from([(
@@ -726,6 +741,7 @@ mod tests {
                     measured_at: crate::clock::now_timestamp(),
                     cgroup: Some("/test.scope".into()),
                     proportional_set_bytes: Some(64 * 1_048_576),
+                    anonymous_set_bytes: None,
                     current_bytes: 64 * 1_048_576,
                     peak_bytes: Some(2048 * 1_048_576),
                     swap_bytes: 1024 * 1_048_576,
@@ -841,6 +857,80 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_wake_credits_only_its_fresh_resident_anonymous_pages_and_keeps_the_full_reservation() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(1));
+            }))
+            .await;
+        for (anonymous, stale, admitted) in [
+            (None, false, false),
+            (Some(512), true, false),
+            (Some(512), false, true),
+        ] {
+            let mut readings = frozen_readings(&state);
+            readings.available_bytes = 2600 * 1_048_576;
+            let memory = readings.apps.get_mut(&app_id()).unwrap();
+            memory.current_bytes = 600 * 1_048_576;
+            memory.proportional_set_bytes = Some(550 * 1_048_576);
+            memory.anonymous_set_bytes = anonymous.map(|mib| mib * 1_048_576);
+            if stale {
+                memory.measured_at = protocol::Timestamp::from_epoch_ms(0);
+            }
+            let reservation = state
+                .reserve_with_readings(
+                    8192,
+                    &app_id(),
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    Some((Adaptive, readings)),
+                )
+                .await;
+            assert_eq!(reservation.is_ok(), admitted);
+            if admitted {
+                let held = state.memory_reservations.lock().unwrap();
+                assert_eq!(
+                    held.held[&ReservationOwner::App(app_id())].bytes,
+                    2048 * 1_048_576
+                );
+            }
+            drop(reservation);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_build_leaves_room_for_a_production_wake_before_it_starts() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        for (grant, admitted) in [(2500, false), (2000, true)] {
+            let (mode, mut readings) = measured(Adaptive, 4096).unwrap();
+            readings.reservation_generation = state.memory_generation();
+            readings.production_wake_bytes = 1024 * 1_048_576;
+            let reservation = state
+                .reserve_external(8192, "build", grant.try_into().unwrap(), (mode, readings))
+                .await;
+            assert_eq!(reservation.is_ok(), admitted);
+            if admitted {
+                let (mode, mut readings) = measured(Adaptive, 4096).unwrap();
+                readings.reservation_generation = state.memory_generation();
+                readings.ceilings.insert(app_id(), 1024 * 1_048_576);
+                assert!(state
+                    .reserve_with_readings(
+                        8192,
+                        &app_id(),
+                        protocol::DEFAULT_INSTANCE_RESOURCES,
+                        Some((mode, readings))
+                    )
+                    .await
+                    .is_ok());
+            }
+            drop(reservation);
+        }
     }
 
     #[tokio::test]
