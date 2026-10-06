@@ -15,6 +15,8 @@ pub const SNAPSHOT_STAMP_FILENAME: &str = "stamp.json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotStamp {
+    #[serde(default)]
+    pub firecracker_version: Option<String>,
     pub deployment_id: DeploymentId,
     pub guest_image_version: String,
     pub host_boot_id: String,
@@ -24,6 +26,9 @@ pub struct SnapshotStamp {
 fn drift_reason(stored: &SnapshotStamp, expected: &SnapshotStamp) -> Option<&'static str> {
     if stored.deployment_id != expected.deployment_id {
         return Some("the app has been deployed again since");
+    }
+    if stored.firecracker_version != expected.firecracker_version {
+        return Some("the Firecracker snapshot format has changed");
     }
     if stored.guest_image_version != expected.guest_image_version {
         return Some("the guest image has changed");
@@ -286,6 +291,7 @@ mod tests {
 
     fn stamp() -> SnapshotStamp {
         SnapshotStamp {
+            firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.into()),
             deployment_id: deployment_id(),
             guest_image_version: "6.1.180-98db6df338f0".into(),
             host_boot_id: "b6b8f0d2-0000-4000-8000-000000000001".into(),
@@ -305,7 +311,18 @@ mod tests {
     #[test]
     fn every_way_a_snapshot_stops_being_loadable_is_named() {
         assert_eq!(drift_from(&stamp(), &stamp()), None);
+        for version in [None, Some("v1.16.1".into())] {
+            let old_format = SnapshotStamp {
+                firecracker_version: version,
+                ..stamp()
+            };
+            assert_eq!(
+                drift_from(&old_format, &stamp()).as_deref(),
+                Some("the Firecracker snapshot format has changed")
+            );
+        }
         let redeployed = SnapshotStamp {
+            firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.into()),
             deployment_id: DeploymentId::parse("dep-2").unwrap(),
             ..stamp()
         };
@@ -326,6 +343,15 @@ mod tests {
         assert!(drift_from(&rebooted, &stamp()).unwrap().contains("rebooted"));
         let moved = SnapshotStamp { slot: 8, ..stamp() };
         assert!(drift_from(&moved, &stamp()).unwrap().contains("another slot"));
+    }
+
+    #[test]
+    fn a_legacy_snapshot_without_a_vmm_version_is_readable_but_not_restorable() {
+        let mut legacy = serde_json::to_value(stamp()).unwrap();
+        legacy.as_object_mut().unwrap().remove("firecrackerVersion");
+        let legacy: SnapshotStamp = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.firecracker_version.is_none());
+        assert!(drift_from(&legacy, &stamp()).is_some());
     }
 
     #[test]
@@ -461,6 +487,7 @@ mod tests {
     #[test]
     fn the_first_reason_a_snapshot_drifted_is_the_one_the_operator_is_told() {
         let everything_moved = SnapshotStamp {
+            firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.into()),
             deployment_id: DeploymentId::parse("dep-2").unwrap(),
             guest_image_version: "another".into(),
             host_boot_id: "another".into(),
@@ -622,6 +649,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let this_boot = stamp().host_boot_id;
         let drifted = serde_json::to_string(&SnapshotStamp {
+            firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.into()),
             deployment_id: DeploymentId::parse("dep-2").unwrap(),
             guest_image_version: "older".into(),
             slot: 8,

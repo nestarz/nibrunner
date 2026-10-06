@@ -74,6 +74,9 @@ connections can bypass the proxy's open-request accounting, so they cannot yet e
 | `idle` | The VM has been snapshotted and stopped. A request restores its snapshot. |
 
 The host requests guest cache reclaim before freezing, then up to 64 MiB of host cgroup reclaim.
+Firecracker's pause API stops the vCPUs before the host cgroup freezes. Thaw reverses that order
+before synchronizing the guest clock. This requires the pause/resume vsock fix in Firecracker
+1.16.2. VMs retained from an older daemon wait for their next start before entering this tier.
 With host swap and a per-VM swap allowance, reclaim can move pages into zram. Compression,
 retained memory and wake latency depend on the workload; freezing does not imply zero RAM.
 Frozen apps retain their admission budget. Their original idle deadline still applies, and
@@ -83,6 +86,9 @@ selected before running apps.
 The daemon records freeze intent before pausing and recovers it after a restart. Health and
 guest usage probes skip frozen apps. Changing the policy to require continued execution thaws
 them. Omit `freeze_after_ms` to disable new automatic freezes; requests still wake existing ones.
+
+Snapshots record their Firecracker version. An older or unknown snapshot format falls back to
+a cold start with the existing volume; upgrades do not attempt to load an incompatible snapshot.
 
 ## What wakes it
 

@@ -1,10 +1,10 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const FIRECRACKER_VERSION: &str = "v1.16.1";
-const FIRECRACKER_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz";
-const FIRECRACKER_SHA256: &str = "382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6";
-const FIRECRACKER_MEMBER: &str = "release-v1.16.1-x86_64/firecracker-v1.16.1-x86_64";
+const FIRECRACKER_VERSION: &str = "v1.16.2";
+const FIRECRACKER_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.2/firecracker-v1.16.2-x86_64.tgz";
+const FIRECRACKER_SHA256: &str = "32e3cdcd4081f91fe2b024a266f57dcb3b4e5fec5033e0cb22467ad7f7820bda";
+const FIRECRACKER_MEMBER: &str = "release-v1.16.2-x86_64/firecracker-v1.16.2-x86_64";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

@@ -110,7 +110,18 @@ pub async fn record_activity(host: &Host) {
     let snapshot = host.state.snapshot().await;
     let taken = match host.firewall.traffic().await {
         Ok(taken) => {
-            if let Some(unread_ms) = unread_for(&snapshot.last_measured_at_ms, now) {
+            let watched = snapshot
+                .records
+                .values()
+                .filter(|record| record.state == protocol::InstanceState::Running)
+                .filter_map(|record| {
+                    snapshot
+                        .last_measured_at_ms
+                        .get(&record.app_id)
+                        .map(|at| (record.app_id.clone(), *at))
+                })
+                .collect();
+            if let Some(unread_ms) = unread_for(&watched, now) {
                 tracing::warn!(unread_ms, "app traffic had gone unread");
             }
             taken
@@ -761,6 +772,7 @@ mod activity_tests {
         let (said, _listening) = Said::listening();
         let host = test_host().await;
         host.slot_for(&app_id()).await.unwrap();
+        host.state.put_record(instance_record(|_| {})).await;
         let long_ago = crate::clock::now_ms() - MAX_ACTIVITY_AGE_MS - 1;
         host.state
             .modify(|snapshot| {
@@ -777,6 +789,30 @@ mod activity_tests {
             "{:?}",
             said.lines()
         );
+    }
+
+    #[tokio::test]
+    async fn removed_counters_for_frozen_or_idle_apps_do_not_report_a_monitoring_failure() {
+        let (said, _listening) = Said::listening();
+        let host = test_host().await;
+        host.slot_for(&app_id()).await.unwrap();
+        for state in [protocol::InstanceState::Frozen, protocol::InstanceState::Idle] {
+            host.state
+                .put_record(instance_record(|record| record.state = state))
+                .await;
+            host.state
+                .modify(|snapshot| {
+                    snapshot
+                        .last_measured_at_ms
+                        .insert(app_id(), crate::clock::now_ms() - MAX_ACTIVITY_AGE_MS - 1);
+                })
+                .await;
+            record_activity(&host).await;
+        }
+        assert!(!said
+            .lines()
+            .iter()
+            .any(|line| line == "WARN app traffic had gone unread"));
     }
 }
 

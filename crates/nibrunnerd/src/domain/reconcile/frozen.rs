@@ -262,6 +262,11 @@ mod tests {
             crate::clock::now_ms() - protocol::DEFAULT_IDLE_TIMEOUT_MS as i64 - 1,
         )
         .await;
+        host.state
+            .modify(|snapshot| {
+                snapshot.last_measured_at_ms.remove(&app_id());
+            })
+            .await;
         super::super::idle::apply_sleep(host.arc()).await;
         assert_eq!(
             host.state.record(&app_id()).await.unwrap().state,
