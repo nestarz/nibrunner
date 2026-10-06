@@ -204,6 +204,11 @@ fn a_prepared_runtime_uses_host_limits_and_unix_channels_and_can_cold_start_agai
         include_str!("fixtures/prepared-namespace.sh"),
     )
     .unwrap();
+    std::fs::write(
+        scratch.join("root/app/test.sh"),
+        include_str!("fixtures/prepared-app.sh"),
+    )
+    .unwrap();
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     for iteration in 0..2 {
         for channel in [Channel::Logs, Channel::Control, Channel::Filesystem] {
@@ -225,8 +230,7 @@ fn a_prepared_runtime_uses_host_limits_and_unix_channels_and_can_cold_start_agai
             protocol::TenantValue::parse(value).unwrap(),
         )]))
         .unwrap();
-        let arguments = TenantArguments::try_from(vec!["-c".into(),
-            "printf '%s\n' \"$TEST_VALUE\" >> /app/runs; printf 'ready\n'; printf 'error\n' >&2; while :; do /bin/sleep 1; done".into()]).unwrap();
+        let arguments = TenantArguments::try_from(vec!["/app/test.sh".into()]).unwrap();
         let config = render_instance_env(&InstanceEnvContent {
             http_port: protocol::DEFAULT_HTTP_PORT,
             layers: 0,
