@@ -111,7 +111,9 @@ impl Host {
                 .await;
         };
         let measured = self.memory_readings(Some(app_id)).await;
-        if measured.is_none() && policy.mode == crate::config::MemoryAdmissionMode::Adaptive {
+        if measured.is_none()
+            && (policy.mode == crate::config::MemoryAdmissionMode::Adaptive || policy.pool.is_some())
+        {
             tracing::warn!(%app_id, "memory admission waits for a host memory reading");
             return Err(u64::from(wanted.memory_mib));
         }
@@ -136,15 +138,40 @@ impl Host {
             .iter()
             .chain(additional_app)
             .filter_map(|app| {
-                self.runtime_policy
-                    .vm_budget(app)
-                    .map(|budget| (app.clone(), u64::from(budget.memory_mib.get()) * 1_048_576))
+                self.runtime_policy.vm_budget(app).map(|budget| {
+                    let observed = apps
+                        .get(app)
+                        .and_then(|memory| memory.limits.as_ref())
+                        .and_then(|limits| limits.max_bytes)
+                        .unwrap_or(0);
+                    (
+                        app.clone(),
+                        (u64::from(budget.memory_mib.get()) * 1_048_576).max(observed),
+                    )
+                })
             })
             .collect();
         let policy = self.config.memory_admission.as_ref();
+        let pool = match policy.and_then(|policy| policy.pool.as_ref()) {
+            None => None,
+            Some(configuration) => {
+                let mut pool = crate::adapters::cgroup::read_pool(configuration).ok()?;
+                pool.all_workloads_contained = self.state.external_groups_within(&pool)
+                    && records
+                        .iter()
+                        .filter(|record| crate::domain::report::capacity::holds_something(record))
+                        .all(|record| {
+                            apps.get(&record.app_id)
+                                .and_then(|memory| memory.cgroup.as_deref())
+                                .is_some_and(|group| pool.contains(group))
+                        });
+                Some(pool)
+            }
+        };
         Some((
             policy.map_or(crate::config::MemoryAdmissionMode::Observe, |policy| policy.mode),
             crate::domain::memory_admission::MemoryReadings {
+                pool,
                 reservation_generation,
                 available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
                 headroom_bytes: u64::from(policy.map_or(1024, |policy| policy.headroom_mib.get()))

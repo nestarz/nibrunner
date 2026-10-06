@@ -133,6 +133,10 @@
         "mode": {
           "$ref": "#/$defs/MemoryAdmissionMode"
         },
+        "pool": {
+          "description": "A dedicated root-level systemd slice, already limited by the host's orchestrator.",
+          "$ref": "#/$defs/WorkloadPool"
+        },
         "reclaim": {
           "description": "Suspend eligible quiet workloads before refusing starts and when physical memory is low.",
           "type": "boolean",
@@ -234,6 +238,26 @@
       "additionalProperties": false,
       "required": [
         "default"
+      ]
+    },
+    "WorkloadPool": {
+      "type": "object",
+      "properties": {
+        "memory_mib": {
+          "description": "The largest permitted memory.max of the shared slice, including every descendant.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "slice": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_]+\\.slice$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "slice",
+        "memory_mib"
       ]
     },
     "artifacts": {

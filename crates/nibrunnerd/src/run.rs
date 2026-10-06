@@ -107,7 +107,16 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         config.http_admission.clone(),
         config.vm_budgets.clone(),
     ));
-    let processes = VmProcesses::with_policy(config.runtime_dir.clone(), runtime_policy.clone());
+    let pool = config
+        .memory_admission
+        .as_ref()
+        .and_then(|policy| policy.pool.as_ref());
+    if let Some(pool) = pool {
+        crate::adapters::cgroup::read_pool(pool)
+            .map_err(|error| StartupError::Unusable(format!("workload pool: {error}")))?;
+    }
+    let processes =
+        VmProcesses::with_policy(config.runtime_dir.clone(), runtime_policy.clone()).with_pool(pool);
     let reaped = reap_stale_snapshots(&config.snapshot_dir, processes.boot_id());
     if reaped.snapshots > 0 {
         tracing::info!(
@@ -188,7 +197,8 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     });
 
     let host = Arc::new(Host {
-        guest_memory_mib: guest_memory_mib(read_host_memory_mib(), volumes.reserved_cache().memory_mib()),
+        guest_memory_mib: guest_memory_mib(read_host_memory_mib(), volumes.reserved_cache().memory_mib())
+            .min(pool.map_or(u64::MAX, |pool| u64::from(pool.memory_mib.get()))),
         guest_image_version,
         state: state.clone(),
         allocator: allocator.clone(),

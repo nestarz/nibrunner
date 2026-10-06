@@ -22,6 +22,21 @@ pub(crate) struct MemoryReadings {
     pub apps: BTreeMap<AppId, ReportedMemory>,
     pub external_resident_bytes: BTreeMap<String, u64>,
     pub ceilings: BTreeMap<AppId, u64>,
+    pub pool: Option<PoolMemory>,
+}
+
+pub(crate) struct PoolMemory {
+    pub membership: String,
+    pub current_bytes: u64,
+    pub high_bytes: u64,
+    pub max_bytes: u64,
+    pub all_workloads_contained: bool,
+}
+
+impl PoolMemory {
+    pub(crate) fn contains(&self, membership: &str) -> bool {
+        std::path::Path::new(membership).starts_with(&self.membership) && membership != self.membership
+    }
 }
 
 impl MemoryReadings {
@@ -36,6 +51,22 @@ impl MemoryReadings {
             .get(app)
             .copied()
             .unwrap_or_else(|| (u64::from(resources.memory_mib) + 64) * BYTES_PER_MIB)
+    }
+
+    pub(crate) fn strict_pool_shortfall_mib(
+        &self,
+        records: &[InstanceRecord],
+        reserved_bytes: u64,
+        wanted_bytes: u64,
+    ) -> u64 {
+        let Some(pool) = &self.pool else { return 0 };
+        let committed = records
+            .iter()
+            .filter(|record| super::report::capacity::holds_something(record))
+            .fold(reserved_bytes.saturating_add(wanted_bytes), |total, record| {
+                total.saturating_add(self.ceiling(&record.app_id, record.resources))
+            });
+        committed.saturating_sub(pool.max_bytes).div_ceil(BYTES_PER_MIB)
     }
 
     fn resident_memory(&self, record: &InstanceRecord) -> Option<&ReportedMemory> {
@@ -111,7 +142,19 @@ impl MemoryReadings {
             .saturating_add(self.headroom_bytes)
             .saturating_sub(self.available_bytes);
         let budget_shortfall = targets.saturating_sub(capacity_mib.saturating_mul(BYTES_PER_MIB));
-        physical_shortfall.max(budget_shortfall).div_ceil(BYTES_PER_MIB)
+        let pool_shortfall = self.pool.as_ref().map_or(0, |pool| {
+            let available = pool
+                .high_bytes
+                .min(pool.max_bytes)
+                .saturating_sub(pool.current_bytes);
+            future
+                .saturating_sub(available)
+                .max(targets.saturating_sub(pool.max_bytes))
+        });
+        physical_shortfall
+            .max(budget_shortfall)
+            .max(pool_shortfall)
+            .div_ceil(BYTES_PER_MIB)
     }
 }
 
@@ -123,6 +166,7 @@ mod tests {
 
     fn readings() -> MemoryReadings {
         MemoryReadings {
+            pool: None,
             reservation_generation: 0,
             external_resident_bytes: BTreeMap::new(),
             available_bytes: 2048 * BYTES_PER_MIB,
@@ -158,6 +202,49 @@ mod tests {
             record.state = InstanceState::Running;
             record.started_at = Some(Timestamp::from_epoch_ms(1000));
         })
+    }
+
+    fn pool(current_mib: u64) -> PoolMemory {
+        PoolMemory {
+            membership: "/workloads.slice".into(),
+            current_bytes: current_mib * BYTES_PER_MIB,
+            high_bytes: 1800 * BYTES_PER_MIB,
+            max_bytes: 2048 * BYTES_PER_MIB,
+            all_workloads_contained: true,
+        }
+    }
+
+    #[test]
+    fn parent_usage_limits_admission_even_when_the_host_has_free_memory() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        observed.pool = Some(pool(1700));
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 156);
+        observed.pool = Some(pool(2200));
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 256);
+    }
+
+    #[test]
+    fn strict_pool_admission_charges_host_limits_including_vm_overhead() {
+        let mut observed = readings();
+        observed.pool = Some(pool(256));
+        assert_eq!(
+            observed.strict_pool_shortfall_mib(&[running()], 0, 256 * BYTES_PER_MIB),
+            256
+        );
+        assert_eq!(
+            observed.shortfall_mib(8192, &[running()], 0, 0, 256 * BYTES_PER_MIB),
+            0
+        );
+    }
+
+    #[test]
+    fn containment_requires_a_child_group_and_checks_path_components() {
+        let pool = pool(0);
+        assert!(pool.contains("/workloads.slice/build.slice/compile.service"));
+        assert!(!pool.contains("/workloads.slice"));
+        assert!(!pool.contains("/workloads.slice-other/app.scope"));
+        assert!(!pool.contains("/system.slice/app.scope"));
     }
 
     #[test]

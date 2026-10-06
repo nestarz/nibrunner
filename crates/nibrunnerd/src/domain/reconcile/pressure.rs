@@ -28,15 +28,39 @@ pub(crate) struct PressureState {
 struct Reading {
     available_bytes: u64,
     stalls: Option<(f64, f64)>,
+    pool: Option<PoolPressure>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PoolPressure {
+    available_bytes: u64,
+    low_bytes: u64,
+    recovered_bytes: u64,
+}
+
+impl From<crate::domain::memory_admission::PoolMemory> for PoolPressure {
+    fn from(pool: crate::domain::memory_admission::PoolMemory) -> Self {
+        let low_bytes = pool.max_bytes.saturating_sub(pool.high_bytes);
+        Self {
+            available_bytes: pool.max_bytes.saturating_sub(pool.current_bytes),
+            low_bytes,
+            recovered_bytes: low_bytes
+                .saturating_add((low_bytes / 4).max(256 * BYTES_PER_MIB))
+                .min(pool.max_bytes),
+        }
+    }
 }
 
 impl Reading {
-    fn read() -> Option<Self> {
+    fn read(pool: Option<&crate::config::WorkloadPool>) -> Option<Self> {
         Some(Self {
             available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
             stalls: std::fs::read_to_string("/proc/pressure/memory")
                 .ok()
                 .and_then(|text| pressure(&text)),
+            pool: pool
+                .and_then(|pool| crate::adapters::cgroup::read_pool(pool).ok())
+                .map(Into::into),
         })
     }
 }
@@ -65,12 +89,19 @@ impl PressureState {
             .is_some_and(|(some, full)| some >= 10.0 || full >= 1.0);
         let recovered = reading.available_bytes >= high
             && reading
+                .pool
+                .is_none_or(|pool| pool.available_bytes >= pool.recovered_bytes)
+            && reading
                 .stalls
                 .is_none_or(|(some, full)| some <= 2.0 && full <= 0.2);
         self.recovering = if self.recovering {
             !recovered
         } else {
-            reading.available_bytes < low || stalled
+            reading.available_bytes < low
+                || stalled
+                || reading
+                    .pool
+                    .is_some_and(|pool| pool.available_bytes <= pool.low_bytes)
         };
         self.recovering
     }
@@ -235,7 +266,7 @@ pub(crate) async fn apply(host: &std::sync::Arc<Host>) {
     else {
         return;
     };
-    let Some(reading) = Reading::read() else {
+    let Some(reading) = Reading::read(config.pool.as_ref()) else {
         return;
     };
     let Ok(_reclaiming) = host.state.reclaim.try_lock() else {
@@ -297,6 +328,7 @@ mod tests {
         let read = |available_mib, stalls| Reading {
             available_bytes: available_mib * BYTES_PER_MIB,
             stalls,
+            pool: None,
         };
         assert!(!state.observe(read(1024, Some((0.0, 0.0))), 1024));
         assert!(state.observe(read(1023, Some((0.0, 0.0))), 1024));
@@ -305,6 +337,29 @@ mod tests {
         assert!(state.observe(read(2048, Some((1.0, 1.0))), 1024));
         assert!(state.observe(read(2048, Some((1.0, 0.3))), 1024));
         assert!(!state.observe(read(2048, Some((1.0, 0.2))), 1024));
+    }
+
+    #[test]
+    fn parent_pressure_reclaims_before_host_exhaustion_and_requires_recovery_headroom() {
+        let mut state = PressureState::default();
+        let read = |current_mib| Reading {
+            available_bytes: 4096 * BYTES_PER_MIB,
+            stalls: Some((0.0, 0.0)),
+            pool: Some(
+                crate::domain::memory_admission::PoolMemory {
+                    membership: "/workloads.slice".into(),
+                    current_bytes: current_mib * BYTES_PER_MIB,
+                    high_bytes: 1800 * BYTES_PER_MIB,
+                    max_bytes: 2048 * BYTES_PER_MIB,
+                    all_workloads_contained: true,
+                }
+                .into(),
+            ),
+        };
+        assert!(!state.observe(read(1799), 1024));
+        assert!(state.observe(read(1800), 1024));
+        assert!(state.observe(read(1545), 1024));
+        assert!(!state.observe(read(1544), 1024));
     }
 
     #[test]
@@ -539,6 +594,7 @@ mod tests {
         let inner = std::sync::Arc::get_mut(&mut host.host).unwrap();
         inner.guest_memory_mib = u64::from(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib) * 2;
         inner.config.memory_admission = Some(crate::config::MemoryAdmission {
+            pool: None,
             mode: crate::config::MemoryAdmissionMode::Observe,
             freeze_after_ms: None,
             reclaim: true,

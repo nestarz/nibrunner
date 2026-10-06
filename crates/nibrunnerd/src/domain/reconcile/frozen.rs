@@ -161,6 +161,7 @@ mod tests {
             .unwrap()
             .config
             .memory_admission = Some(crate::config::MemoryAdmission {
+            pool: None,
             mode: crate::config::MemoryAdmissionMode::Observe,
             freeze_after_ms: Some(60_000.try_into().unwrap()),
             reclaim: false,
