@@ -28,12 +28,17 @@ pub(crate) struct MemoryReadings {
 pub(crate) struct PoolMemory {
     pub membership: String,
     pub current_bytes: u64,
+    pub reclaimable_file_bytes: u64,
     pub high_bytes: u64,
     pub max_bytes: u64,
     pub all_workloads_contained: bool,
 }
 
 impl PoolMemory {
+    pub(crate) fn working_set_bytes(&self) -> u64 {
+        self.current_bytes.saturating_sub(self.reclaimable_file_bytes)
+    }
+
     pub(crate) fn contains(&self, membership: &str) -> bool {
         std::path::Path::new(membership).starts_with(&self.membership) && membership != self.membership
     }
@@ -146,7 +151,7 @@ impl MemoryReadings {
             let available = pool
                 .high_bytes
                 .min(pool.max_bytes)
-                .saturating_sub(pool.current_bytes);
+                .saturating_sub(pool.working_set_bytes());
             future
                 .saturating_sub(available)
                 .max(targets.saturating_sub(pool.max_bytes))
@@ -208,6 +213,7 @@ mod tests {
         PoolMemory {
             membership: "/workloads.slice".into(),
             current_bytes: current_mib * BYTES_PER_MIB,
+            reclaimable_file_bytes: 0,
             high_bytes: 1800 * BYTES_PER_MIB,
             max_bytes: 2048 * BYTES_PER_MIB,
             all_workloads_contained: true,
@@ -221,6 +227,23 @@ mod tests {
         observed.pool = Some(pool(1700));
         assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 156);
         observed.pool = Some(pool(2200));
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 256);
+    }
+
+    #[test]
+    fn clean_inactive_file_cache_does_not_block_admission_or_expand_the_hard_budget() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        let mut pool = pool(1700);
+        pool.reclaimable_file_bytes = 300 * BYTES_PER_MIB;
+        observed.pool = Some(pool);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 0);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 112);
+        assert_eq!(
+            observed.strict_pool_shortfall_mib(&[], 0, 2304 * BYTES_PER_MIB),
+            256
+        );
+        observed.available_bytes = 1024 * BYTES_PER_MIB;
         assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 256);
     }
 

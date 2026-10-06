@@ -138,7 +138,10 @@ production child limits so that the hierarchy permits production protection. Thi
 protection, not immunity from OOM.
 
 Admission checks both physical headroom and the parent group's remaining space below
-`memory.high`. Unknown usage in the parent consumes that space too. Pool pressure triggers the
+`memory.high`. Clean, inactive file cache is reclaimable capacity; dirty pages, shared memory,
+active file cache and swap are not. Missing cache counters give no credit. Unknown usage in the
+parent consumes that space too. This estimate never raises the hard limit or the physical RAM
+budget. Pool pressure uses the same working-set estimate and triggers the
 same quiet-app reclaim policy even while the host has free RAM elsewhere. Recovery requires an
 additional margin before reclaim stops.
 

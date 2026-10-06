@@ -79,30 +79,33 @@ async fn real_build_services_hold_memory_until_their_work_has_exited() {
 }
 
 #[cfg(target_os = "linux")]
+fn memory_request(socket: &str, request: protocol::memory::Request) -> protocol::memory::Reply {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let bytes = serde_json::to_vec(&request).unwrap();
+    stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+    stream.write_all(&bytes).unwrap();
+    let mut length = [0; 4];
+    stream.read_exact(&mut length).unwrap();
+    let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn memory_lease_client_process() {
     use protocol::memory::{Reply, Request};
-    use std::io::{Read, Write};
     let Ok(socket) = std::env::var("NIBRUNNER_MEMORY_TEST_SOCKET") else {
         return;
     };
     require_root();
     let id = std::env::var("NIBRUNNER_MEMORY_TEST_ID").unwrap();
     let unit = format!("nibrunner-memory-work-{id}.service");
-    let request = |request: Request| -> Reply {
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        let bytes = serde_json::to_vec(&request).unwrap();
-        stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
-        stream.write_all(&bytes).unwrap();
-        let mut length = [0; 4];
-        stream.read_exact(&mut length).unwrap();
-        let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
-        stream.read_exact(&mut bytes).unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    };
+    let request = |request| memory_request(&socket, request);
     for slice in [
         None,
         Some(format!("nibrunnerbuild-{}.slice", id.replace('-', ""))),
@@ -297,6 +300,175 @@ async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
 }
 
 #[cfg(target_os = "linux")]
+struct WorkloadSlice(String);
+
+#[cfg(target_os = "linux")]
+impl Drop for WorkloadSlice {
+    fn drop(&mut self) {
+        for operation in ["stop", "revert"] {
+            let _ = std::process::Command::new("systemctl")
+                .args([operation, &self.0])
+                .status();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WorkloadSlice {
+    fn new(high: &str) -> Self {
+        let slice = Self(format!("nibpooltest{}.slice", uuid::Uuid::new_v4().simple()));
+        let high = format!("MemoryHigh={high}");
+        for args in [
+            vec![
+                "set-property",
+                "--runtime",
+                &slice.0,
+                "MemoryMax=384M",
+                &high,
+                "MemoryLow=384M",
+                "MemorySwapMax=0",
+            ],
+            vec!["start", &slice.0],
+        ] {
+            let output = std::process::Command::new("systemctl")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        slice
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cached_file_memory_client_process() {
+    use std::io::Write;
+    let Ok(socket) = std::env::var("NIBRUNNER_CACHE_TEST_SOCKET") else {
+        return;
+    };
+    require_root();
+    let id = std::env::var("NIBRUNNER_CACHE_TEST_ID").unwrap();
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let mut file = std::fs::File::create(directory.path().join("cache")).unwrap();
+    let block = vec![1u8; 1_048_576];
+    for _ in 0..256 {
+        file.write_all(&block).unwrap();
+    }
+    file.sync_all().unwrap();
+    let membership = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let group = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::/"))
+        .unwrap();
+    let group = std::path::Path::new("/sys/fs/cgroup").join(group);
+    let parent = group.parent().unwrap();
+    let cached = || {
+        std::fs::read_to_string(parent.join("memory.stat"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("inactive_file "))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let cached_before = cached();
+    assert!(cached_before >= 128 * 1_048_576, "{cached_before}");
+    let current: u64 = std::fs::read_to_string(parent.join("memory.current"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        current > 128 * 1_048_576,
+        "the cached file must prevent admission without cache credit: {current}"
+    );
+    let reply = memory_request(
+        &socket,
+        protocol::memory::Request::Acquire {
+            id: id.clone(),
+            unit: format!("nibrunner-cache-{id}.service"),
+            memory_mib: 256.try_into().unwrap(),
+            minimum_mib: None,
+        },
+    );
+    assert!(
+        matches!(reply, protocol::memory::Reply::Granted { .. }),
+        "{reply:?}"
+    );
+    let mut allocation = vec![0u8; 200 * 1_048_576];
+    for page in allocation.chunks_mut(4096) {
+        page[0] = 1;
+    }
+    std::hint::black_box(&allocation);
+    assert!(
+        cached() < cached_before,
+        "allocation must reclaim cached file pages"
+    );
+    for name in ["memory.events.local", "memory.events"] {
+        let events = std::fs::read_to_string(parent.join(name)).unwrap();
+        assert!(events.lines().any(|line| line == "oom 0"), "{events}");
+        assert!(events.lines().any(|line| line == "oom_kill 0"), "{events}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cached_files_leave_capacity_for_a_new_allocation_without_oom() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use nibrunnerd::config::{MemoryAdmission, MemoryAdmissionMode, WorkloadPool};
+    let slice = WorkloadSlice::new("384M");
+    let mut host = nibrunnerd::test_support::test_host().await;
+    let inner = Arc::get_mut(&mut host.host).unwrap();
+    inner.commands = commands();
+    inner.guest_memory_mib = 384;
+    inner.config.memory_admission = Some(MemoryAdmission {
+        mode: MemoryAdmissionMode::Adaptive,
+        pool: Some(WorkloadPool {
+            slice: slice.0.clone(),
+            memory_mib: 384.try_into().unwrap(),
+        }),
+        freeze_after_ms: None,
+        reclaim: false,
+        headroom_mib: 128.try_into().unwrap(),
+    });
+    std::fs::create_dir_all(&host.config.runtime_dir).unwrap();
+    let service = nibrunnerd::memory_service::MemoryService::restore(host.arc().clone()).unwrap();
+    let server = service.serve().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let socket = host.config.runtime_dir.join(protocol::memory::SOCKET_NAME);
+    let executable = std::env::current_exe().unwrap();
+    let result = commands()
+        .run(nibrunnerd::ports::CommandRequest::new(&[
+            "systemd-run",
+            "--wait",
+            "--pipe",
+            "--collect",
+            &format!("--unit=nibrunner-cache-{id}"),
+            &format!("--slice={}", slice.0),
+            "--property=MemoryMax=384M",
+            "--property=RuntimeMaxSec=30",
+            &format!("--setenv=NIBRUNNER_CACHE_TEST_SOCKET={}", socket.display()),
+            &format!("--setenv=NIBRUNNER_CACHE_TEST_ID={id}"),
+            executable.to_str().unwrap(),
+            "--exact",
+            "cached_file_memory_client_process",
+            "--nocapture",
+        ]))
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(result.code, 0, "{}\n{}", result.stdout, result.stderr);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn workload_pool_allocation_process() {
     if !std::path::Path::new("allocate.marker").exists() {
@@ -322,39 +494,7 @@ async fn a_shared_workload_pool_contains_a_spike_and_prefers_production_over_pre
     use nibrunnerd::config::{VmBudget, VmBudgets, WorkloadPool};
     use std::os::unix::fs::PermissionsExt;
 
-    struct Slice(String);
-    impl Drop for Slice {
-        fn drop(&mut self) {
-            for operation in ["stop", "revert"] {
-                let _ = std::process::Command::new("systemctl")
-                    .args([operation, &self.0])
-                    .status();
-            }
-        }
-    }
-    let slice = Slice(format!("nibpooltest{}.slice", uuid::Uuid::new_v4().simple()));
-    for args in [
-        vec![
-            "set-property",
-            "--runtime",
-            &slice.0,
-            "MemoryMax=384M",
-            "MemoryHigh=infinity",
-            "MemoryLow=384M",
-            "MemorySwapMax=0",
-        ],
-        vec!["start", &slice.0],
-    ] {
-        let output = std::process::Command::new("systemctl")
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let slice = WorkloadSlice::new("infinity");
     let root = tempfile::tempdir().unwrap();
     let executable = std::env::current_exe().unwrap();
     let helper = root.path().join("helper.sh");

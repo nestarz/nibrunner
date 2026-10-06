@@ -39,6 +39,11 @@ fn read_pool_at(
             .min(max_bytes)
     };
     let current_bytes = number("memory.current")?;
+    let reclaimable_file_bytes = read("memory.stat")
+        .ok()
+        .and_then(|stat| reclaimable_file_bytes(&stat))
+        .unwrap_or(0)
+        .min(current_bytes);
     let current = std::fs::metadata(path)?;
     if current.dev() != original.dev() || current.ino() != original.ino() {
         return Err(io::Error::other("workload pool changed during observation"));
@@ -46,10 +51,28 @@ fn read_pool_at(
     Ok(crate::domain::memory_admission::PoolMemory {
         membership: pool.membership(),
         current_bytes,
+        reclaimable_file_bytes,
         high_bytes,
         max_bytes,
         all_workloads_contained: false,
     })
+}
+
+fn reclaimable_file_bytes(stat: &str) -> Option<u64> {
+    let field = |name| {
+        stat.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == name).then(|| fields.next()?.parse::<u64>().ok())?
+        })
+    };
+    // These counters overlap; subtracting all exclusions before crediting cache is conservative.
+    Some(
+        field("inactive_file")?
+            .min(field("file")?)
+            .saturating_sub(field("shmem")?)
+            .saturating_sub(field("file_dirty")?)
+            .saturating_sub(field("file_writeback")?),
+    )
 }
 
 pub(crate) fn cgroup_path(membership: &str) -> Option<PathBuf> {
@@ -260,6 +283,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_clean_inactive_file_pages_are_reclaimable_capacity() {
+        let stat = "anon 900\nfile 800\ninactive_file 600\nshmem 100\nfile_dirty 50\nfile_writeback 25\n";
+        assert_eq!(reclaimable_file_bytes(stat), Some(425));
+        assert_eq!(
+            reclaimable_file_bytes(&stat.replace("file 800", "file 500")),
+            Some(325)
+        );
+        assert_eq!(
+            reclaimable_file_bytes(&stat.replace("shmem 100", "shmem 700")),
+            Some(0)
+        );
+        for field in ["file", "inactive_file", "shmem", "file_dirty", "file_writeback"] {
+            let missing = stat
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{field} ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(reclaimable_file_bytes(&missing), None, "{field}");
+            let malformed = stat.replace(&format!("{field} "), &format!("{field} invalid"));
+            assert_eq!(reclaimable_file_bytes(&malformed), None, "{field}");
+        }
+    }
+
+    #[test]
     fn workload_pool_observations_require_a_bounded_kernel_group() {
         let directory = tempfile::tempdir().unwrap();
         let pool = crate::config::WorkloadPool {
@@ -276,8 +323,20 @@ mod tests {
         std::fs::write(directory.path().join("memory.max"), "1048576").unwrap();
         let observed = read_pool_at(&pool, directory.path()).unwrap();
         assert_eq!(observed.current_bytes, 512);
+        assert_eq!(observed.reclaimable_file_bytes, 0);
         assert_eq!(observed.high_bytes, observed.max_bytes);
         assert!(!observed.all_workloads_contained);
+        std::fs::write(
+            directory.path().join("memory.stat"),
+            "file 1024\ninactive_file 1024\nshmem 0\nfile_dirty 0\nfile_writeback 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_pool_at(&pool, directory.path())
+                .unwrap()
+                .reclaimable_file_bytes,
+            512
+        );
         std::fs::write(directory.path().join("memory.high"), "900000").unwrap();
         assert_eq!(read_pool_at(&pool, directory.path()).unwrap().high_bytes, 900000);
     }
