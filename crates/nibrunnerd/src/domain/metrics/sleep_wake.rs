@@ -134,7 +134,11 @@ const REFUSALS: [&str; 9] = [
     "abandoned",
 ];
 const SLEEP_PHASES: [SleepPhase; 3] = [SleepPhase::Late, SleepPhase::Flush, SleepPhase::Total];
-const SLEEP_REASONS: [SleepReason; 2] = [SleepReason::Quiet, SleepReason::LivedLongEnough];
+const SLEEP_REASONS: [SleepReason; 3] = [
+    SleepReason::Quiet,
+    SleepReason::LivedLongEnough,
+    SleepReason::MemoryPressure,
+];
 const SLEEP_OUTCOMES: [SleepOutcome; 3] = [SleepOutcome::Slept, SleepOutcome::Refused, SleepOutcome::Failed];
 
 /// What one app has been through, kept while the document names it.

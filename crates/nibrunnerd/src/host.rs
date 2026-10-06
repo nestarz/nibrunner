@@ -62,6 +62,39 @@ impl Host {
         &self,
         app_id: &AppId,
         wanted: protocol::InstanceResources,
+        purpose: crate::domain::reconcile::pressure::ReclaimPurpose,
+    ) -> Result<crate::state::MemoryReservation, u64> {
+        let first = self.reserve_memory_once(app_id, wanted).await;
+        if first.is_ok()
+            || !self
+                .config
+                .memory_admission
+                .as_ref()
+                .is_some_and(|config| config.reclaim)
+        {
+            return first;
+        }
+        let Ok(_reclaiming) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.state.reclaim.lock()).await
+        else {
+            return first;
+        };
+        let mut result = self.reserve_memory_once(app_id, wanted).await;
+        for _ in 0..4 {
+            if result.is_ok()
+                || !crate::domain::reconcile::pressure::reclaim_one(self, purpose, Some(app_id)).await
+            {
+                return result;
+            }
+            result = self.reserve_memory_once(app_id, wanted).await;
+        }
+        result
+    }
+
+    async fn reserve_memory_once(
+        &self,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
     ) -> Result<crate::state::MemoryReservation, u64> {
         let Some(policy) = &self.config.memory_admission else {
             return self

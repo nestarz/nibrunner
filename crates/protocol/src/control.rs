@@ -404,6 +404,12 @@ pub struct ReportedInstance {
 pub struct ReportedMemory {
     pub measured_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
+    /// Resident mappings, with shared pages divided among their users. Snapshot pages may be
+    /// charged to the process that wrote them rather than this VM's cgroup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proportional_set_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ReportedMemoryLimits>,
     pub current_bytes: u64,
     pub peak_bytes: Option<u64>,

@@ -21,6 +21,7 @@ app_concurrent = 16
 
 [memory_admission]
 mode = "observe"
+reclaim = false
 headroom_mib = 1024
 
 [vm_budgets.default]

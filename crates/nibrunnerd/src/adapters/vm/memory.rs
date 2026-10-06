@@ -104,6 +104,11 @@ fn read_cgroup(path: &Path) -> Option<ReportedMemory> {
     let pressure = std::fs::read_to_string(path.join("memory.pressure")).ok()?;
     Some(ReportedMemory {
         measured_at: crate::clock::now_timestamp(),
+        cgroup: path
+            .strip_prefix("/sys/fs/cgroup")
+            .ok()
+            .map(|relative| format!("/{}", relative.display())),
+        proportional_set_bytes: None,
         limits: limits(path),
         current_bytes: number(path, "memory.current")?,
         peak_bytes: number(path, "memory.peak"),
@@ -117,12 +122,41 @@ fn read_cgroup(path: &Path) -> Option<ReportedMemory> {
 
 pub(super) fn read_process(pid: i32) -> Option<ReportedMemory> {
     let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    read_cgroup(&cgroup_path(&membership)?)
+    let mut memory = read_cgroup(&cgroup_path(&membership)?)?;
+    memory.proportional_set_bytes = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|text| proportional_set_bytes(&text));
+    Some(memory)
+}
+
+fn proportional_set_bytes(text: &str) -> Option<u64> {
+    let value = text.lines().find_map(|line| line.strip_prefix("Pss:"))?;
+    let mut parts = value.split_whitespace();
+    let kib = parts.next()?.parse::<u64>().ok()?;
+    (parts.next()? == "kB" && parts.next().is_none())
+        .then(|| kib.checked_mul(1024))
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proportional_memory_reads_only_the_total_with_known_units() {
+        assert_eq!(
+            proportional_set_bytes("Rss: 4096 kB\nPss: 2048 kB\nPss_Anon: 1024 kB\n"),
+            Some(2 << 20)
+        );
+        for text in [
+            "Pss_Anon: 1024 kB",
+            "Pss: 2 MB",
+            "Pss: 18446744073709551615 kB",
+            "Pss: no kB",
+        ] {
+            assert_eq!(proportional_set_bytes(text), None);
+        }
+    }
 
     #[test]
     fn memory_priorities_protect_production_and_throttle_disposable_work_without_lowering_hard_limits() {

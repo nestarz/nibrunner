@@ -76,6 +76,15 @@ async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
         };
         let console = std::fs::read_to_string(processes.console_path(&app)).unwrap_or_default();
         processes.stop(&app).await;
+        let memory = observed
+            .as_ref()
+            .unwrap_or_else(|| panic!("the scope did not start: {console}"));
+        let cgroup = memory.cgroup.as_ref().expect("the cgroup path is reported");
+        assert_eq!(
+            std::path::Path::new(cgroup).parent(),
+            Some(std::path::Path::new("/"))
+        );
+        assert!(memory.proportional_set_bytes.is_some_and(|bytes| bytes > 0));
         let limits = observed
             .and_then(|m| m.limits)
             .unwrap_or_else(|| panic!("the scope did not start: {console}"));
