@@ -109,9 +109,44 @@ Cancelling the caller leaves the snapshot task running with its reservation and 
 lock until it completes. Memory samples also verify the VM's process start time before and after
 reading the cgroup and PSS, so a reused PID cannot supply another process's working set.
 
-Adaptive admission can admit guests whose combined ceilings exceed physical RAM. It does not yet
-coordinate external builds or guarantee capacity for simultaneous growth. Keep observation mode
-until the workload and pressure handling are validated.
+Adaptive admission can admit guests whose combined ceilings exceed physical RAM. External work
+must use the reservation API below; unregistered builds are not coordinated. Admission does not
+guarantee capacity for simultaneous growth. Keep observation mode until the workload and pressure
+handling are validated.
+
+### External memory reservations
+
+`memory.sock` in the host runtime directory accepts root-local requests from a process in a
+service or scope cgroup. Each JSON frame has a four-byte, big-endian length prefix and is limited
+to 16 KiB. The request and reply types are in `protocol::memory`.
+
+Before starting an external service, send:
+
+```json
+{
+  "operation": "acquire",
+  "id": "03ae9139-c7fc-4ad4-a94b-6e3c81d3b406",
+  "unit": "example-build.service",
+  "memory_mib": 1024
+}
+```
+
+Use a new UUID for each operation. Start work only after `status: granted`, with its cgroup
+`MemoryMax` set to the granted budget. A `waiting` reply names the capacity or service condition
+to retry. Repeating the same request from the same process returns the same grant.
+Changing its owner, unit or budget is rejected.
+
+After the service exits, send `{"operation":"release","id":"03ae9139-c7fc-4ad4-a94b-6e3c81d3b406"}`.
+Release waits for an inactive or failed unit with no queued job and no live processes.
+Disconnecting does not release capacity. Reservations are written before the grant and restored
+before app admission after a daemon restart. Automatic cleanup also waits for the owner process
+and its cgroup to exit, so an orphaned launcher cannot start work after its budget was released.
+A corrupt ledger prevents startup instead of discarding reservations.
+
+External grants share the app reservation lock. They always require fresh physical headroom;
+strict and observation modes also enforce the configured host budget. They hold their full
+grant until release. Existing build tools must connect to this API before adaptive admission
+can account for them.
 
 ### Reclaim before refusing capacity
 

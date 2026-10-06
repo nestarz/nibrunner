@@ -23,6 +23,100 @@ fn commands() -> Arc<dyn CommandRunner> {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn real_build_services_hold_memory_until_their_work_has_exited() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    let mut host = nibrunnerd::test_support::test_host().await;
+    Arc::get_mut(&mut host.host).unwrap().commands = commands();
+    std::fs::create_dir_all(&host.config.runtime_dir).unwrap();
+    let service = nibrunnerd::memory_service::MemoryService::restore(host.arc().clone()).unwrap();
+    let server = service.serve().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let socket = host.config.runtime_dir.join(protocol::memory::SOCKET_NAME);
+    let unit = format!("nibrunner-memory-client-{id}");
+    let executable = std::env::current_exe().unwrap();
+    let result = commands()
+        .run(nibrunnerd::ports::CommandRequest::new(&[
+            "systemd-run",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--unit",
+            &unit,
+            "--property=RuntimeMaxSec=30",
+            "--setenv=NIBRUNNER_INTEGRATION=1",
+            &format!("--setenv=NIBRUNNER_MEMORY_TEST_SOCKET={}", socket.display()),
+            &format!("--setenv=NIBRUNNER_MEMORY_TEST_ID={id}"),
+            executable.to_str().unwrap(),
+            "--exact",
+            "memory_lease_client_process",
+            "--nocapture",
+        ]))
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(result.code, 0, "{}\n{}", result.stdout, result.stderr);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_lease_client_process() {
+    use protocol::memory::{Reply, Request};
+    use std::io::{Read, Write};
+    let Ok(socket) = std::env::var("NIBRUNNER_MEMORY_TEST_SOCKET") else {
+        return;
+    };
+    require_root();
+    let id = std::env::var("NIBRUNNER_MEMORY_TEST_ID").unwrap();
+    let unit = format!("nibrunner-memory-work-{id}.service");
+    let request = |request: Request| -> Reply {
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+        stream.write_all(&bytes).unwrap();
+        let mut length = [0; 4];
+        stream.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let acquire = Request::Acquire {
+        id: id.clone(),
+        unit: unit.clone(),
+        memory_mib: 32.try_into().unwrap(),
+    };
+    assert!(matches!(request(acquire.clone()), Reply::Granted { .. }));
+    assert!(matches!(request(acquire), Reply::Granted { .. }));
+    assert!(std::process::Command::new("systemd-run")
+        .args([
+            "--unit",
+            &unit,
+            "--collect",
+            "--property=MemoryMax=32M",
+            "--property=RuntimeMaxSec=20",
+            "/bin/sleep",
+            "20"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let busy = request(Request::Release { id: id.clone() });
+    let stopped = std::process::Command::new("systemctl")
+        .args(["stop", &unit])
+        .status()
+        .unwrap();
+    assert!(matches!(busy, Reply::Waiting { .. }), "{busy:?}");
+    assert!(stopped.success());
+    assert_eq!(request(Request::Release { id }), Reply::Released);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
     if !enabled() {
         return;

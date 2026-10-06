@@ -60,26 +60,42 @@ struct ReservedMemory {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ReservationOwner {
+    App(AppId),
+    External(String),
+}
+
 #[derive(Default)]
 struct MemoryReservations {
     generation: u64,
-    held: BTreeMap<AppId, ReservedMemory>,
+    held: BTreeMap<ReservationOwner, ReservedMemory>,
 }
 
 type SharedReservations = Arc<Mutex<MemoryReservations>>;
 
 pub(crate) struct MemoryReservation {
-    app_id: AppId,
+    owner: Option<ReservationOwner>,
     reservations: SharedReservations,
+}
+
+impl MemoryReservation {
+    pub(crate) fn retain(mut self) {
+        // A persisted external lease outlives its listener and is released only after verified exit.
+        self.owner = None;
+    }
 }
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
+        let Some(owner) = &self.owner else {
+            return;
+        };
         let mut reservations = self
             .reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        reservations.held.remove(&self.app_id);
+        reservations.held.remove(owner);
         reservations.generation = reservations.generation.wrapping_add(1);
     }
 }
@@ -190,6 +206,87 @@ impl HostState {
             crate::domain::memory_admission::MemoryReadings,
         )>,
     ) -> Result<MemoryReservation, u64> {
+        self.reserve_for_owner(
+            capacity_mib,
+            ReservationOwner::App(app_id.clone()),
+            wanted,
+            operation,
+            measured,
+        )
+        .await
+    }
+
+    pub(crate) async fn reserve_external(
+        &self,
+        capacity_mib: u64,
+        id: &str,
+        memory_mib: std::num::NonZeroU32,
+        measured: (
+            crate::config::MemoryAdmissionMode,
+            crate::domain::memory_admission::MemoryReadings,
+        ),
+    ) -> Result<MemoryReservation, u64> {
+        self.reserve_for_owner(
+            capacity_mib,
+            ReservationOwner::External(id.into()),
+            protocol::InstanceResources {
+                memory_mib: memory_mib.get(),
+                vcpu_count: 0,
+            },
+            crate::domain::memory_admission::MemoryOperation::Start,
+            Some(measured),
+        )
+        .await
+    }
+
+    pub(crate) fn restore_external(&self, id: &str, memory_mib: std::num::NonZeroU32) {
+        let owner = ReservationOwner::External(id.into());
+        let mut reservations = self
+            .memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reservations.held.insert(
+            owner.clone(),
+            ReservedMemory {
+                resources: protocol::InstanceResources {
+                    memory_mib: memory_mib.get(),
+                    vcpu_count: 0,
+                },
+                bytes: u64::from(memory_mib.get()) * 1_048_576,
+            },
+        );
+        reservations.generation = reservations.generation.wrapping_add(1);
+    }
+
+    pub(crate) fn release_external(&self, id: &str) {
+        let mut reservations = self
+            .memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reservations
+            .held
+            .remove(&ReservationOwner::External(id.into()))
+            .is_some()
+        {
+            reservations.generation = reservations.generation.wrapping_add(1);
+        }
+    }
+
+    async fn reserve_for_owner(
+        &self,
+        capacity_mib: u64,
+        owner: ReservationOwner,
+        wanted: protocol::InstanceResources,
+        operation: crate::domain::memory_admission::MemoryOperation,
+        measured: Option<(
+            crate::config::MemoryAdmissionMode,
+            crate::domain::memory_admission::MemoryReadings,
+        )>,
+    ) -> Result<MemoryReservation, u64> {
+        let app_id = match &owner {
+            ReservationOwner::App(app) => Some(app),
+            ReservationOwner::External(_) => None,
+        };
         let snapshot = self.snapshot.read().await;
         let mut reservations = self
             .memory_reservations
@@ -198,7 +295,12 @@ impl HostState {
         let records: Vec<_> = snapshot
             .records
             .values()
-            .filter(|record| &record.app_id != app_id && !reservations.held.contains_key(&record.app_id))
+            .filter(|record| {
+                Some(&record.app_id) != app_id
+                    && !reservations
+                        .held
+                        .contains_key(&ReservationOwner::App(record.app_id.clone()))
+            })
             .cloned()
             .collect();
         let mut committed = crate::domain::report::capacity::committed_resources(&records);
@@ -211,9 +313,9 @@ impl HostState {
             crate::domain::memory_admission::MemoryOperation::Snapshot => 0,
         };
         let mut shortfall = strict_shortfall;
-        let mut bytes = (u64::from(wanted.memory_mib) + 64) * 1_048_576;
+        let mut bytes = (u64::from(wanted.memory_mib) + if app_id.is_some() { 64 } else { 0 }) * 1_048_576;
         if measured.as_ref().is_some_and(|(mode, readings)| {
-            *mode == crate::config::MemoryAdmissionMode::Adaptive
+            (*mode == crate::config::MemoryAdmissionMode::Adaptive || app_id.is_none())
                 && !readings.is_fresh(crate::clock::now_ms())
         }) {
             return Err(bytes.div_ceil(1_048_576));
@@ -225,23 +327,30 @@ impl HostState {
                 // A completed allocation can outlive its guard. Old working sets cannot discount it.
                 readings.apps.clear();
             }
-            bytes = readings.ceiling(app_id, wanted);
+            bytes = app_id.map_or(bytes, |app| readings.ceiling(app, wanted));
             let reserved_bytes = reservations
                 .held
                 .values()
                 .fold(0u64, |total, held| total.saturating_add(held.bytes));
             let measured_shortfall = readings.shortfall_mib(capacity_mib, &records, reserved_bytes, bytes);
-            tracing::info!(%app_id, ?mode, strict_shortfall_mib = strict_shortfall,
-                measured_shortfall_mib = measured_shortfall, "memory admission evaluated");
+            tracing::info!(
+                ?owner,
+                ?mode,
+                strict_shortfall_mib = strict_shortfall,
+                measured_shortfall_mib = measured_shortfall,
+                "memory admission evaluated"
+            );
             if mode == crate::config::MemoryAdmissionMode::Adaptive {
                 shortfall = measured_shortfall;
+            } else if app_id.is_none() {
+                shortfall = strict_shortfall.max(measured_shortfall);
             }
         }
         if shortfall > 0 {
             return Err(shortfall);
         }
         reservations.held.insert(
-            app_id.clone(),
+            owner.clone(),
             ReservedMemory {
                 resources: wanted,
                 bytes,
@@ -249,7 +358,7 @@ impl HostState {
         );
         reservations.generation = reservations.generation.wrapping_add(1);
         Ok(MemoryReservation {
-            app_id: app_id.clone(),
+            owner: Some(owner),
             reservations: self.memory_reservations.clone(),
         })
     }
@@ -510,6 +619,68 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[tokio::test]
+    async fn builds_and_apps_cannot_reserve_the_same_capacity_or_replace_each_other() {
+        use crate::config::MemoryAdmissionMode::{Adaptive, Observe};
+        for mode in [Observe, Adaptive] {
+            let state = HostState::shared();
+            let build = state
+                .reserve_external(
+                    512,
+                    app_id().as_str(),
+                    512.try_into().unwrap(),
+                    measured(mode, 8192).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(state
+                .reserve_with_readings(
+                    512,
+                    &app_id(),
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    measured(mode, 8192),
+                )
+                .await
+                .is_err());
+            drop(build);
+            let app = state
+                .reserve_memory(512, &app_id(), protocol::DEFAULT_INSTANCE_RESOURCES)
+                .await
+                .unwrap();
+            assert!(state
+                .reserve_external(
+                    512,
+                    app_id().as_str(),
+                    512.try_into().unwrap(),
+                    measured(mode, 8192).unwrap(),
+                )
+                .await
+                .is_err());
+            drop(app);
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_need_physical_headroom_even_when_app_admission_only_observes() {
+        use crate::config::MemoryAdmissionMode::Observe;
+        let state = HostState::shared();
+        let memory = 512.try_into().unwrap();
+        assert!(state
+            .reserve_external(8192, "build", memory, measured(Observe, 1200).unwrap())
+            .await
+            .is_err());
+        let mut stale = measured(Observe, 8192).unwrap();
+        stale.1.measured_at_ms = crate::clock::now_ms() - 5001;
+        assert!(state
+            .reserve_external(8192, "build", memory, stale)
+            .await
+            .is_err());
+        assert!(state
+            .reserve_external(8192, "build", memory, measured(Observe, 8192).unwrap())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
