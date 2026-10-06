@@ -85,6 +85,8 @@ admission uses a fresh measured resident footprint and reserves the full budget 
 or snapshot. Their original idle deadline still applies, and
 memory pressure can select them for earlier snapshots. Within each priority, frozen apps are
 selected before running apps.
+Under pressure or blocked admission, eligible running apps enter the frozen tier first. This
+can release memory without the full guest reservation that snapshot creation requires.
 
 The daemon records freeze intent before pausing, including snapshot creation, and recovers it
 after a restart. A refused snapshot clears that intent only after guest recovery. Health and
