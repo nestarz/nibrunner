@@ -104,11 +104,16 @@ pub fn host_boot_id_or_session() -> String {
 
 pub struct VmProcesses {
     policy: Arc<crate::runtime_policy::RuntimePolicy>,
+    pool_slice: Option<String>,
     runtime_dir: PathBuf,
     boot_id: String,
 }
 
 impl VmProcesses {
+    pub fn with_pool(mut self, pool: Option<&crate::config::WorkloadPool>) -> Self {
+        self.pool_slice = pool.map(|pool| pool.slice.clone());
+        self
+    }
     pub fn with_budgets(runtime_dir: PathBuf, budgets: Option<crate::config::VmBudgets>) -> Self {
         Self::with_policy(
             runtime_dir,
@@ -123,15 +128,24 @@ impl VmProcesses {
         }
     }
 
-    fn command(&self, app_id: &AppId, binary: &Path) -> tokio::process::Command {
+    fn command(&self, app_id: &AppId, binary: &Path) -> std::io::Result<tokio::process::Command> {
         let Some(budget) = self.policy.vm_budget(app_id) else {
-            return tokio::process::Command::new(binary);
+            if self.pool_slice.is_some() {
+                return Err(std::io::Error::other(
+                    "a workload pool requires an explicit VM budget",
+                ));
+            }
+            return Ok(tokio::process::Command::new(binary));
         };
         let mut command = tokio::process::Command::new("systemd-run");
         let memory = super::memory::Controls::for_budget(&budget);
         // Scope mode execs the VMM in place; a fresh unit name avoids waiting for the old scope to be collected.
         command
-            .args(["--scope", "--quiet", "--collect", "--slice=-.slice"])
+            .args(["--scope", "--quiet", "--collect"])
+            .arg(format!(
+                "--slice={}",
+                self.pool_slice.as_deref().unwrap_or("-.slice")
+            ))
             .arg(format!("--property=CPUQuota={}%", budget.cpu_percent))
             .arg(format!("--property=MemoryLow={}", memory.low))
             .arg(format!("--property=MemoryHigh={}", memory.high))
@@ -139,12 +153,13 @@ impl VmProcesses {
             .arg(format!("--property=MemorySwapMax={}", memory.swap))
             .arg("--")
             .arg(binary);
-        command
+        Ok(command)
     }
 
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
             policy: Arc::default(),
+            pool_slice: None,
             runtime_dir,
             boot_id: host_boot_id_or_session(),
         }
@@ -285,7 +300,7 @@ impl VmProcesses {
         let _ = std::fs::remove_file(working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME));
 
         let console = std::fs::File::create(self.console_path(app_id))?;
-        let mut command = self.command(app_id, binary);
+        let mut command = self.command(app_id, binary)?;
 
         command
             .arg("--api-sock")
@@ -358,6 +373,7 @@ impl VmProcesses {
 
         let processes = Self {
             policy: self.policy.clone(),
+            pool_slice: self.pool_slice.clone(),
             runtime_dir: self.runtime_dir.clone(),
             boot_id: self.boot_id.clone(),
         };
@@ -438,6 +454,7 @@ mod tests {
     fn processes(directory: &Path) -> VmProcesses {
         VmProcesses {
             policy: Arc::default(),
+            pool_slice: None,
             runtime_dir: directory.to_path_buf(),
             boot_id: "boot-1".into(),
         }
@@ -486,6 +503,7 @@ mod tests {
         assert_eq!(
             direct
                 .command(&app_id(), Path::new("/bin/firecracker"))
+                .unwrap()
                 .as_std()
                 .get_program(),
             "/bin/firecracker"
@@ -501,7 +519,7 @@ mod tests {
                 apps: Default::default(),
             }),
         );
-        let command = scoped.command(&app_id(), Path::new("/bin/firecracker"));
+        let command = scoped.command(&app_id(), Path::new("/bin/firecracker")).unwrap();
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -515,10 +533,42 @@ mod tests {
         assert_eq!(args.last(), Some(&"/bin/firecracker"));
     }
 
+    #[tokio::test]
+    async fn a_workload_pool_scopes_bounded_vms_and_refuses_an_unbounded_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = crate::config::WorkloadPool {
+            slice: "workloads.slice".into(),
+            memory_mib: 4096.try_into().unwrap(),
+        };
+        let processes = VmProcesses::new(root.path().into()).with_pool(Some(&pool));
+        let error = processes
+            .spawn(&app_id(), Path::new("/bin/false"), root.path(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit VM budget"));
+        processes
+            .policy
+            .replace_instances(&[crate::test_support::desired_instance(|_| {})]);
+        let command = processes
+            .command(&app_id(), Path::new("/bin/firecracker"))
+            .unwrap();
+        assert_eq!(command.as_std().get_program(), "systemd-run");
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "--slice=workloads.slice"));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg.to_str().unwrap().starts_with("--property=MemoryMax=")));
+    }
+
     #[test]
     fn reloaded_budgets_are_used_by_the_next_process_without_changing_a_prepared_command() {
         let processes = VmProcesses::new(PathBuf::from("/run/nibrunner"));
-        let before = processes.command(&app_id(), Path::new("/bin/firecracker"));
+        let before = processes
+            .command(&app_id(), Path::new("/bin/firecracker"))
+            .unwrap();
         processes.policy.replace(
             None,
             Some(crate::config::VmBudgets {
@@ -530,7 +580,9 @@ mod tests {
                 apps: Default::default(),
             }),
         );
-        let after = processes.command(&app_id(), Path::new("/bin/firecracker"));
+        let after = processes
+            .command(&app_id(), Path::new("/bin/firecracker"))
+            .unwrap();
         assert_eq!(before.as_std().get_program(), "/bin/firecracker");
         assert_eq!(after.as_std().get_program(), "systemd-run");
         assert!(after
@@ -556,7 +608,9 @@ mod tests {
                     memory: None,
                 });
             })]);
-        let command = processes.command(&app_id(), Path::new("/bin/firecracker"));
+        let command = processes
+            .command(&app_id(), Path::new("/bin/firecracker"))
+            .unwrap();
         assert_eq!(command.as_std().get_program(), "systemd-run");
         assert!(command
             .as_std()

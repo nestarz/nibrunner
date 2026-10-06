@@ -114,6 +114,42 @@ must use the reservation API below; unregistered builds are not coordinated. Adm
 guarantee capacity for simultaneous growth. Keep observation mode until the workload and pressure
 handling are validated.
 
+### A bounded workload pool
+
+A shared parent cgroup limits combined growth from VMs and external builds. Create and start a
+root-level systemd slice before configuring it:
+
+```toml
+[memory_admission.pool]
+slice = "workloads.slice"
+memory_mib = 4096
+```
+
+The slice name can contain letters, digits and underscores. Its kernel `memory.max` must be a
+positive number no larger than `memory_mib`; an absent or unbounded group prevents daemon startup.
+The orchestrator owns the slice and its limits. Set `memory.high` below `memory.max` to start
+reclaim before exhaustion. Leave physical RAM outside this pool for host services and compressed
+swap storage. Do not count logical swap capacity as RAM.
+
+New VMs start in child scopes with their own limits and OOM priorities. External clients must
+start their bounded service or slice inside this pool before requesting a reservation. Keep the
+daemon, proxy and other control services outside it. Configure parent `memory.low` as well as
+production child limits so that the hierarchy permits production protection. This is best-effort
+protection, not immunity from OOM.
+
+Admission checks both physical headroom and the parent group's remaining space below
+`memory.high`. Unknown usage in the parent consumes that space too. Pool pressure triggers the
+same quiet-app reclaim policy even while the host has free RAM elsewhere. Recovery requires an
+additional margin before reclaim stops.
+
+Existing VMs remain in their original scopes until they sleep and wake. While any live VM or
+external lease is outside the pool, starts reserve full host cgroup ceilings, including VM
+overhead, even in adaptive mode. A snapshot of a legacy VM outside the pool checks physical
+headroom without charging the new pool; otherwise a smaller pool could prevent migration. Once all workloads are contained, adaptive admission can use
+working-set estimates. Missing or stale pool readings refuse new reservations in both modes.
+The parent's hard limit contains combined spikes; it can still kill a workload if reclaim cannot
+keep up. Validate priorities and overload behavior before enabling adaptive admission.
+
 ### External memory reservations
 
 `memory.sock` in the host runtime directory accepts root-local requests from a process in a

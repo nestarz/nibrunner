@@ -8,6 +8,50 @@ const TRANSITION_TIMEOUT: Duration = Duration::from_secs(1);
 const RECLAIM_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_RECLAIM_BYTES: u64 = 64 * 1_048_576;
 
+pub(crate) fn read_pool(
+    pool: &crate::config::WorkloadPool,
+) -> io::Result<crate::domain::memory_admission::PoolMemory> {
+    let path = cgroup_path(&format!("0::{}", pool.membership()))
+        .ok_or_else(|| io::Error::other("invalid workload pool membership"))?;
+    read_pool_at(pool, &path)
+}
+
+fn read_pool_at(
+    pool: &crate::config::WorkloadPool,
+    path: &Path,
+) -> io::Result<crate::domain::memory_admission::PoolMemory> {
+    let original = std::fs::metadata(path)?;
+    let read = |name| std::fs::read_to_string(path.join(name));
+    let number = |name| read(name)?.trim().parse::<u64>().map_err(io::Error::other);
+    let max_bytes = number("memory.max")?;
+    if max_bytes == 0 || max_bytes > u64::from(pool.memory_mib.get()) * 1_048_576 {
+        return Err(io::Error::other(
+            "workload pool exceeds its configured hard limit",
+        ));
+    }
+    let high = read("memory.high")?;
+    let high_bytes = if high.trim() == "max" {
+        max_bytes
+    } else {
+        high.trim()
+            .parse::<u64>()
+            .map_err(io::Error::other)?
+            .min(max_bytes)
+    };
+    let current_bytes = number("memory.current")?;
+    let current = std::fs::metadata(path)?;
+    if current.dev() != original.dev() || current.ino() != original.ino() {
+        return Err(io::Error::other("workload pool changed during observation"));
+    }
+    Ok(crate::domain::memory_admission::PoolMemory {
+        membership: pool.membership(),
+        current_bytes,
+        high_bytes,
+        max_bytes,
+        all_workloads_contained: false,
+    })
+}
+
 pub(crate) fn cgroup_path(membership: &str) -> Option<PathBuf> {
     let relative = membership.lines().find_map(|line| line.strip_prefix("0::/"))?;
     let path = Path::new(relative);
@@ -30,6 +74,13 @@ pub(crate) struct MemoryGroup {
 }
 
 impl MemoryGroup {
+    pub(crate) fn within(&self, pool: &crate::domain::memory_admission::PoolMemory) -> bool {
+        self.within_membership(&pool.membership)
+    }
+
+    pub(crate) fn within_membership(&self, parent: &str) -> bool {
+        Path::new(&self.membership).starts_with(parent) && self.membership != parent
+    }
     pub(crate) fn capture(owner: &str, unit: &str) -> Option<Self> {
         let owner = cgroup_path(&format!("0::{owner}"))?;
         let path = owner
@@ -207,6 +258,29 @@ impl Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_pool_observations_require_a_bounded_kernel_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = crate::config::WorkloadPool {
+            slice: "workloads.slice".into(),
+            memory_mib: 1.try_into().unwrap(),
+        };
+        assert!(read_pool_at(&pool, directory.path()).is_err());
+        std::fs::write(directory.path().join("memory.high"), "max").unwrap();
+        std::fs::write(directory.path().join("memory.current"), "512").unwrap();
+        for limit in ["max", "0", "1048577", "broken"] {
+            std::fs::write(directory.path().join("memory.max"), limit).unwrap();
+            assert!(read_pool_at(&pool, directory.path()).is_err(), "{limit}");
+        }
+        std::fs::write(directory.path().join("memory.max"), "1048576").unwrap();
+        let observed = read_pool_at(&pool, directory.path()).unwrap();
+        assert_eq!(observed.current_bytes, 512);
+        assert_eq!(observed.high_bytes, observed.max_bytes);
+        assert!(!observed.all_workloads_contained);
+        std::fs::write(directory.path().join("memory.high"), "900000").unwrap();
+        assert_eq!(read_pool_at(&pool, directory.path()).unwrap().high_bytes, 900000);
+    }
 
     #[test]
     fn only_resident_anonymous_memory_in_the_original_bounded_group_is_discounted() {

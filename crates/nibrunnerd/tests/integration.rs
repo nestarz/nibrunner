@@ -296,6 +296,155 @@ async fn a_real_systemd_scope_starts_with_the_requested_memory_controls() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn workload_pool_allocation_process() {
+    if !std::path::Path::new("allocate.marker").exists() {
+        return;
+    }
+    let mut allocation = vec![0u8; 200 * 1_048_576];
+    for page in allocation.chunks_mut(4096) {
+        page[0] = 1;
+    }
+    std::fs::write("ready.marker", b"").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    std::hint::black_box(&allocation);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_shared_workload_pool_contains_a_spike_and_prefers_production_over_preview() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use nibrunnerd::adapters::vm::process::VmProcesses;
+    use nibrunnerd::config::{VmBudget, VmBudgets, WorkloadPool};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Slice(String);
+    impl Drop for Slice {
+        fn drop(&mut self) {
+            for operation in ["stop", "revert"] {
+                let _ = std::process::Command::new("systemctl")
+                    .args([operation, &self.0])
+                    .status();
+            }
+        }
+    }
+    let slice = Slice(format!("nibpooltest{}.slice", uuid::Uuid::new_v4().simple()));
+    for args in [
+        vec![
+            "set-property",
+            "--runtime",
+            &slice.0,
+            "MemoryMax=384M",
+            "MemoryHigh=infinity",
+            "MemoryLow=384M",
+            "MemorySwapMax=0",
+        ],
+        vec!["start", &slice.0],
+    ] {
+        let output = std::process::Command::new("systemctl")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let helper = root.path().join("helper.sh");
+    let quoted = executable.to_str().unwrap().replace('\'', "'\"'\"'");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\nexec '{quoted}' --exact workload_pool_allocation_process --nocapture\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let budget = |priority| VmBudget {
+        cpu_percent: 100.try_into().unwrap(),
+        memory_mib: 256.try_into().unwrap(),
+        memory: Some(protocol::MemoryPolicy {
+            target_mib: 256.try_into().unwrap(),
+            swap_mib: 0,
+            priority,
+        }),
+    };
+    let production = protocol::AppId::parse("pool-production").unwrap();
+    let preview = protocol::AppId::parse("pool-preview").unwrap();
+    let pool = WorkloadPool {
+        slice: slice.0.clone(),
+        memory_mib: 384.try_into().unwrap(),
+    };
+    let processes = VmProcesses::with_budgets(
+        root.path().join("run"),
+        Some(VmBudgets {
+            default: budget(protocol::MemoryPriority::Preview),
+            apps: [(production.clone(), budget(protocol::MemoryPriority::Production))].into(),
+        }),
+    )
+    .with_pool(Some(&pool));
+    for app in [&production, &preview] {
+        let directory = root.path().join(app.as_str());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("allocate.marker"), b"").unwrap();
+        processes.spawn(app, &helper, &directory, None).await.unwrap();
+        if app == &production {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !directory.join("ready.marker").exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "production did not allocate: {}",
+                    std::fs::read_to_string(processes.console_path(app)).unwrap_or_default()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+    let parent = std::path::Path::new("/sys/fs/cgroup").join(&slice.0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let parent_ooms = loop {
+        let events = std::fs::read_to_string(parent.join("memory.events.local")).unwrap();
+        let parent_ooms = events
+            .lines()
+            .find_map(|line| line.strip_prefix("oom "))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        if parent_ooms > 0 || tokio::time::Instant::now() >= deadline {
+            break parent_ooms;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let production_active = processes.status(&production).active;
+    let production_memory = processes.memory(&production);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while processes.status(&preview).active && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let preview_active = processes.status(&preview).active;
+    processes.stop(&production).await;
+    processes.stop(&preview).await;
+    assert!(
+        parent_ooms > 0,
+        "the combined allocations must reach the parent limit"
+    );
+    assert!(
+        production_active,
+        "the production process must survive the preview spike"
+    );
+    assert!(!preview_active, "the preview must be the OOM victim");
+    let memory = production_memory.unwrap();
+    assert!(memory.cgroup.unwrap().starts_with(&format!("/{}/", slice.0)));
+    let limits = memory.limits.unwrap();
+    assert_eq!(limits.max_bytes, Some(256 * 1_048_576));
+    assert_eq!(limits.low_bytes, 256 * 1_048_576);
+}
+
 /// Volumes as files under `directory`, over a store holding `archive` for whichever volume asks.
 fn local_volumes(
     directory: &std::path::Path,

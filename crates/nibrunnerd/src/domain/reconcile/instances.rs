@@ -1242,6 +1242,7 @@ mod tests {
         let mut host = test_host().await;
         Arc::get_mut(&mut host.host).unwrap().config.memory_admission =
             Some(crate::config::MemoryAdmission {
+                pool: None,
                 mode: crate::config::MemoryAdmissionMode::Adaptive,
                 headroom_mib: 1024.try_into().unwrap(),
                 reclaim: true,

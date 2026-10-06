@@ -128,6 +128,9 @@ pub enum MemoryAdmissionMode {
 #[serde(deny_unknown_fields)]
 pub struct MemoryAdmission {
     pub mode: MemoryAdmissionMode,
+    /// A dedicated root-level systemd slice, already limited by the host's orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<WorkloadPool>,
     /// Freeze quiet on-request apps before their traffic-idle snapshot deadline. Omit to disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze_after_ms: Option<std::num::NonZeroU64>,
@@ -136,6 +139,37 @@ pub struct MemoryAdmission {
     pub reclaim: bool,
     /// Physical memory held back for the host and bursts; swap never increases this capacity.
     pub headroom_mib: std::num::NonZeroU32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadPool {
+    #[schemars(pattern(r"^[A-Za-z0-9_]+\.slice$"))]
+    pub slice: String,
+    /// The largest permitted memory.max of the shared slice, including every descendant.
+    pub memory_mib: std::num::NonZeroU32,
+}
+
+impl WorkloadPool {
+    pub(crate) fn membership(&self) -> String {
+        format!("/{}", self.slice)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let valid = self.slice.strip_suffix(".slice").is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+        if !valid {
+            return Err(ConfigError::invalid(
+                "memory_admission.pool.slice",
+                "a root-level slice named with letters, digits or underscores",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Where the world reaches an app on this host.
@@ -683,6 +717,13 @@ impl HostConfig {
     }
 
     fn from_document(document: &file::ConfigFile) -> Result<Self, ConfigError> {
+        if let Some(pool) = document
+            .memory_admission
+            .as_ref()
+            .and_then(|policy| policy.pool.as_ref())
+        {
+            pool.validate()?;
+        }
         let max_apps = apps("max_apps", required("max_apps", document.max_apps)?)?;
         let paths = required("paths", document.paths.as_ref())?;
         let state_dir = absolute(
@@ -951,6 +992,7 @@ impl HostConfig {
             }),
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2),
             memory_admission: Some(MemoryAdmission {
+                pool: None,
                 mode: MemoryAdmissionMode::Observe,
                 freeze_after_ms: None,
                 reclaim: false,
@@ -2438,6 +2480,35 @@ keep_mib_per_app = 64
         /// rewritten, which a rewrite that misses leaves accepted, and so caught below.
         fn zerofs(section: &str) -> String {
             document(&[("volumes.backend", "\"zerofs\"")], section)
+        }
+
+        #[test]
+        fn workload_pool_names_are_root_level_and_limits_are_nonzero() {
+            let validator = validator();
+            for (slice, memory_mib, accepted) in [
+                ("workloads.slice", 4096, true),
+                ("mf_workloads2.slice", 4096, true),
+                ("workloads.slice", 0, false),
+                ("parent-child.slice", 4096, false),
+                ("-.slice", 4096, false),
+                ("../workloads.slice", 4096, false),
+                ("workloads.service", 4096, false),
+                (".slice", 4096, false),
+            ] {
+                let text = document(&[], &format!(
+                    "[memory_admission]\nmode = \"observe\"\nheadroom_mib = 1024\nreclaim = true\n[memory_admission.pool]\nslice = {slice:?}\nmemory_mib = {memory_mib}"
+                ));
+                assert_eq!(HostConfig::from_toml(&text).is_ok(), accepted, "{text}");
+                assert_eq!(
+                    validator.is_valid(&json(&text)),
+                    accepted,
+                    "{text}: {:?}",
+                    validator
+                        .iter_errors(&json(&text))
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                );
+            }
         }
 
         #[test]

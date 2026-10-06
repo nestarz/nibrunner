@@ -213,6 +213,23 @@ impl MemoryService {
                         preferred: memory_mib,
                     }),
                 };
+                if self
+                    .host
+                    .config
+                    .memory_admission
+                    .as_ref()
+                    .and_then(|policy| policy.pool.as_ref())
+                    .is_some_and(|pool| {
+                        !lease
+                            .group
+                            .as_ref()
+                            .is_some_and(|group| group.within_membership(&pool.membership()))
+                    })
+                {
+                    return Ok(Reply::Rejected {
+                        reason: "start the bounded service or slice inside the workload pool before requesting memory".into(),
+                    });
+                }
                 if let Some(existing) = held.leases.get(&id) {
                     return Ok(
                         if existing.owner == lease.owner
@@ -502,6 +519,39 @@ mod tests {
     fn seed(host: &Arc<Host>) {
         crate::json_store::write_json(&host.config.state_dir.join("external-memory.json"), &ledger())
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_configured_pool_refuses_external_work_without_a_child_cgroup() {
+        let mut host = test_host().await;
+        Arc::get_mut(&mut host.host).unwrap().config.memory_admission =
+            Some(crate::config::MemoryAdmission {
+                mode: crate::config::MemoryAdmissionMode::Observe,
+                headroom_mib: 1024.try_into().unwrap(),
+                reclaim: true,
+                freeze_after_ms: None,
+                pool: Some(crate::config::WorkloadPool {
+                    slice: "workloads.slice".into(),
+                    memory_mib: 4096.try_into().unwrap(),
+                }),
+            });
+        let service = MemoryService::restore_for_boot(host.arc().clone(), "boot-1".into()).unwrap();
+        let generation = host.state.memory_generation();
+        let reply = service
+            .handle(
+                owner(),
+                Request::Acquire {
+                    id: ID.into(),
+                    unit: UNIT.into(),
+                    memory_mib: 512.try_into().unwrap(),
+                    minimum_mib: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reply, Reply::Rejected { reason } if reason.contains("inside the workload pool")));
+        assert_eq!(host.state.memory_generation(), generation);
+        assert!(service.held.lock().await.leases.is_empty());
     }
 
     #[tokio::test]

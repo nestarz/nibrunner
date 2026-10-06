@@ -309,6 +309,18 @@ impl HostState {
             .collect()
     }
 
+    pub(crate) fn external_groups_within(&self, pool: &crate::domain::memory_admission::PoolMemory) -> bool {
+        self.memory_reservations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .held
+            .iter()
+            .all(|(owner, held)| {
+                !matches!(owner, ReservationOwner::External(_))
+                    || held.group.as_ref().is_some_and(|group| group.within(pool))
+            })
+    }
+
     async fn reserve_for_owner(
         &self,
         capacity_mib: u64,
@@ -352,7 +364,9 @@ impl HostState {
         let mut shortfall = strict_shortfall;
         let mut bytes = (u64::from(wanted.memory_mib) + if app_id.is_some() { 64 } else { 0 }) * 1_048_576;
         if measured.as_ref().is_some_and(|(mode, readings)| {
-            (*mode == crate::config::MemoryAdmissionMode::Adaptive || app_id.is_none())
+            (*mode == crate::config::MemoryAdmissionMode::Adaptive
+                || app_id.is_none()
+                || readings.pool.is_some())
                 && !readings.is_fresh(crate::clock::now_ms())
         }) {
             return Err(bytes.div_ceil(1_048_576));
@@ -364,6 +378,9 @@ impl HostState {
                 // A completed allocation can outlive its guard. Old working sets cannot discount it.
                 readings.apps.clear();
                 readings.external_resident_bytes.clear();
+                if let Some(pool) = &mut readings.pool {
+                    pool.all_workloads_contained = false;
+                }
             }
             bytes = app_id.map_or(bytes, |app| readings.ceiling(app, wanted));
             let reserved_bytes = reservations
@@ -382,22 +399,49 @@ impl HostState {
                 };
                 total.saturating_add(resident)
             });
+            let snapshot_outside_pool = operation
+                == crate::domain::memory_admission::MemoryOperation::Snapshot
+                && readings.pool.as_ref().is_some_and(|pool| {
+                    app_id
+                        .and_then(|app| readings.apps.get(app))
+                        .and_then(|memory| memory.cgroup.as_deref())
+                        .is_some_and(|group| !pool.contains(group))
+                });
+            // Legacy scopes must be able to drain even when their ceilings exceed the new pool.
+            if snapshot_outside_pool {
+                readings.pool = None;
+            }
             let measured_shortfall = readings.shortfall_mib(
-                capacity_mib,
+                if snapshot_outside_pool {
+                    u64::MAX
+                } else {
+                    capacity_mib
+                },
                 &records,
                 reserved_bytes,
                 resident_reserved_bytes,
                 bytes,
             );
+            let effective_adaptive = mode == crate::config::MemoryAdmissionMode::Adaptive
+                && readings
+                    .pool
+                    .as_ref()
+                    .is_none_or(|pool| pool.all_workloads_contained);
             tracing::info!(
                 ?owner,
                 ?mode,
+                effective_adaptive,
+                snapshot_outside_pool,
                 strict_shortfall_mib = strict_shortfall,
                 measured_shortfall_mib = measured_shortfall,
                 "memory admission evaluated"
             );
-            if mode == crate::config::MemoryAdmissionMode::Adaptive {
+            if effective_adaptive || snapshot_outside_pool {
                 shortfall = measured_shortfall;
+            } else if readings.pool.is_some() {
+                shortfall = strict_shortfall
+                    .max(measured_shortfall)
+                    .max(readings.strict_pool_shortfall_mib(&records, reserved_bytes, bytes));
             } else if app_id.is_none() {
                 shortfall = strict_shortfall.max(measured_shortfall);
             }
@@ -596,6 +640,7 @@ mod tests {
         Some((
             mode,
             crate::domain::memory_admission::MemoryReadings {
+                pool: None,
                 reservation_generation: 0,
                 external_resident_bytes: BTreeMap::new(),
                 available_bytes: available_mib * 1_048_576,
@@ -650,6 +695,7 @@ mod tests {
     fn frozen_readings(state: &HostState) -> crate::domain::memory_admission::MemoryReadings {
         use protocol::{ReportedMemory, ReportedMemoryLimits};
         crate::domain::memory_admission::MemoryReadings {
+            pool: None,
             reservation_generation: state.memory_generation(),
             external_resident_bytes: BTreeMap::new(),
             available_bytes: 1500 * 1_048_576,
@@ -678,6 +724,102 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[tokio::test]
+    async fn adaptive_pool_admission_waits_for_legacy_workloads_to_move_inside() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(1));
+            }))
+            .await;
+        let next = AppId::parse("next-app").unwrap();
+        for (contained, allowed) in [(false, false), (true, true)] {
+            let mut readings = frozen_readings(&state);
+            readings.available_bytes = 8192 * 1_048_576;
+            readings.pool = Some(crate::domain::memory_admission::PoolMemory {
+                membership: "/workloads.slice".into(),
+                current_bytes: 64 * 1_048_576,
+                high_bytes: 1800 * 1_048_576,
+                max_bytes: 2048 * 1_048_576,
+                all_workloads_contained: contained,
+            });
+            let result = state
+                .reserve_with_readings(
+                    8192,
+                    &next,
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    Some((Adaptive, readings)),
+                )
+                .await;
+            assert_eq!(result.is_ok(), allowed);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshots_can_drain_into_a_smaller_pool_but_still_need_physical_headroom() {
+        use crate::config::MemoryAdmissionMode::Observe;
+        use crate::domain::memory_admission::MemoryOperation::Snapshot;
+        let state = HostState::shared();
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Frozen;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(1));
+            }))
+            .await;
+        for (available, membership, allowed) in [
+            (8192, "/legacy.scope", true),
+            (1024, "/legacy.scope", false),
+            (8192, "/workloads.slice/app.scope", false),
+        ] {
+            let mut readings = frozen_readings(&state);
+            readings.available_bytes = available * 1_048_576;
+            readings.apps.get_mut(&app_id()).unwrap().cgroup = Some(membership.into());
+            readings.pool = Some(crate::domain::memory_admission::PoolMemory {
+                membership: "/workloads.slice".into(),
+                current_bytes: 1024 * 1_048_576,
+                high_bytes: 900 * 1_048_576,
+                max_bytes: 1024 * 1_048_576,
+                all_workloads_contained: false,
+            });
+            let result = state
+                .reserve_for_operation(
+                    1024,
+                    &app_id(),
+                    protocol::DEFAULT_INSTANCE_RESOURCES,
+                    Snapshot,
+                    Some((Observe, readings)),
+                )
+                .await;
+            assert_eq!(result.is_ok(), allowed, "{available}: {membership}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_observed_pool_refuses_stale_capacity_readings() {
+        use crate::config::MemoryAdmissionMode::Observe;
+        let state = HostState::shared();
+        let (mode, mut readings) = measured(Observe, 8192).unwrap();
+        readings.measured_at_ms -= 5001;
+        readings.pool = Some(crate::domain::memory_admission::PoolMemory {
+            membership: "/workloads.slice".into(),
+            current_bytes: 0,
+            high_bytes: 1800 * 1_048_576,
+            max_bytes: 2048 * 1_048_576,
+            all_workloads_contained: true,
+        });
+        assert!(state
+            .reserve_with_readings(
+                8192,
+                &app_id(),
+                protocol::DEFAULT_INSTANCE_RESOURCES,
+                Some((mode, readings))
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
