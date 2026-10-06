@@ -122,7 +122,7 @@ fn valid_id(id: &str) -> bool {
 fn valid_unit(unit: &str) -> bool {
     unit.len() <= 200
         && unit.len() > ".service".len()
-        && unit.ends_with(".service")
+        && (unit.ends_with(".service") || unit.ends_with(".slice"))
         && unit.as_bytes()[0].is_ascii_alphanumeric()
         && unit
             .bytes()
@@ -186,7 +186,7 @@ impl MemoryService {
             } => {
                 if !valid_id(&id) || !valid_unit(&unit) {
                     return Ok(Reply::Rejected {
-                        reason: "a lease needs a canonical UUID and a service unit name".into(),
+                        reason: "a lease needs a canonical UUID and a service or slice unit name".into(),
                     });
                 }
                 if minimum_mib.is_some_and(|minimum| minimum > memory_mib) {
@@ -338,13 +338,15 @@ impl MemoryService {
             .collect();
         let value = |key| properties.get(key).copied();
         if !matches!(value("LoadState"), Some("loaded" | "not-found"))
-            || !matches!(value("ActiveState"), Some("inactive" | "failed"))
+            || !(matches!(value("ActiveState"), Some("inactive" | "failed"))
+                || (unit.ends_with(".slice") && value("ActiveState") == Some("active")))
             || value("Job") != Some("")
         {
             return Ok(false);
         }
         match value("ControlGroup") {
-            Some("") => Ok(response.code == 0 || value("LoadState") == Some("not-found")),
+            Some("") => Ok(value("ActiveState") != Some("active")
+                && (response.code == 0 || value("LoadState") == Some("not-found"))),
             Some(group) if response.code == 0 => {
                 let path = crate::adapters::cgroup::cgroup_path(&format!("0::{group}"))
                     .ok_or_else(|| io::Error::other("the service has an invalid cgroup"))?;
@@ -643,6 +645,7 @@ mod tests {
     #[test]
     fn unit_names_and_owner_groups_cannot_escape_into_paths_options_or_shared_slices() {
         assert!(valid_unit(UNIT));
+        assert!(valid_unit("mfbuild-0123456789abcdef.slice"));
         for invalid in [
             "-test.service",
             "../test.service",

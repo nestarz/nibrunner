@@ -140,7 +140,10 @@ The reply gives the actual budget to enforce. Grants never fall below the minimu
 continue to require the full requested budget. Retrying a flexible request returns its original grant.
 
 After the service exits, send `{"operation":"release","id":"03ae9139-c7fc-4ad4-a94b-6e3c81d3b406"}`.
-Release waits for an inactive or failed unit with no queued job and no live processes.
+Release waits for an inactive or failed service with no queued job and no live processes.
+A build with several services can name their shared `.slice` instead. Apply the granted limit
+to that slice, including the build parent. An active slice keeps its reservation until its
+whole cgroup is empty and it has no queued job.
 Disconnecting does not release capacity. Reservations are written before the grant and restored
 before app admission after a daemon restart. Automatic cleanup also waits for the owner process
 and its cgroup to exit, so an orphaned launcher cannot start work after its budget was released.
