@@ -404,16 +404,23 @@ fn cached_file_memory_client_process() {
     for page in allocation.chunks_mut(4096) {
         page[0] = 1;
     }
-    std::hint::black_box(&allocation);
+    // Hierarchical memory.stat counters are batched; enforcement can reclaim before
+    // the next read reports the lower inactive-file total.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cached() >= cached_before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         cached() < cached_before,
-        "allocation must reclaim cached file pages"
+        "allocation must reclaim cached file pages: before {cached_before}, after {}",
+        cached()
     );
     for name in ["memory.events.local", "memory.events"] {
         let events = std::fs::read_to_string(parent.join(name)).unwrap();
         assert!(events.lines().any(|line| line == "oom 0"), "{events}");
         assert!(events.lines().any(|line| line == "oom_kill 0"), "{events}");
     }
+    std::hint::black_box(&allocation);
 }
 
 #[cfg(target_os = "linux")]

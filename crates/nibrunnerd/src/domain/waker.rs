@@ -11,6 +11,8 @@ use crate::host::Host;
 use crate::ports::{WakeFailure, WakeRefusal, Waker};
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(5);
+const MEMORY_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const MEMORY_SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 
 type Outcome = Result<(), WakeRefusal>;
 type Coalescing = BTreeMap<AppId, (broadcast::Sender<Outcome>, u64)>;
@@ -38,14 +40,33 @@ impl AppWaker {
         app_id: &AppId,
         wanted: &protocol::InstanceResources,
     ) -> Result<crate::state::MemoryReservation, WakeRefusal> {
-        self.host
-            .reserve_memory(
-                app_id,
-                *wanted,
-                crate::domain::reconcile::pressure::ReclaimPurpose::Wake,
-            )
-            .await
-            .map_err(|shortfall_mib| WakeRefusal::NoRoom { shortfall_mib })
+        let deadline = tokio::time::Instant::now() + MEMORY_SETTLE_TIMEOUT;
+        loop {
+            let generation = self.host.state.memory_generation();
+            let shortfall_mib = match self
+                .host
+                .reserve_memory(
+                    app_id,
+                    *wanted,
+                    crate::domain::reconcile::pressure::ReclaimPurpose::Wake,
+                )
+                .await
+            {
+                Ok(reservation) => return Ok(reservation),
+                Err(shortfall) => shortfall,
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(WakeRefusal::NoRoom { shortfall_mib });
+            }
+            if generation != self.host.state.memory_generation() {
+                continue;
+            }
+            if !self.host.state.other_memory_transitions(app_id).await {
+                return Err(WakeRefusal::NoRoom { shortfall_mib });
+            }
+            tokio::time::sleep_until((tokio::time::Instant::now() + MEMORY_SETTLE_INTERVAL).min(deadline))
+                .await;
+        }
     }
 
     async fn boot(&self, app_id: &AppId) -> Outcome {
@@ -323,6 +344,83 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use protocol::InstanceState;
+
+    #[tokio::test]
+    async fn a_wake_waits_for_another_memory_reservation_to_settle() {
+        let mut host = test_host().await;
+        tokio::time::pause();
+        let resources = protocol::DEFAULT_INSTANCE_RESOURCES;
+        Arc::get_mut(&mut host.host).unwrap().guest_memory_mib = u64::from(resources.memory_mib);
+        let other = AppId::parse("other").unwrap();
+        let reservation = host
+            .state
+            .reserve_memory(host.guest_memory_mib, &other, resources)
+            .await
+            .unwrap();
+        let waker = AppWaker::new(host.arc().clone());
+        let pending = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(reservation);
+        });
+        let started = tokio::time::Instant::now();
+        let granted = waker.reserve_room(&app_id(), &resources).await;
+        assert!(granted.is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(started.elapsed() < MEMORY_SETTLE_TIMEOUT);
+        pending.await.unwrap();
+        assert!(host.vms.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wake_bounds_its_wait_for_a_memory_transition_that_never_finishes() {
+        let mut host = test_host().await;
+        tokio::time::pause();
+        let resources = protocol::DEFAULT_INSTANCE_RESOURCES;
+        Arc::get_mut(&mut host.host).unwrap().guest_memory_mib = u64::from(resources.memory_mib);
+        let other = AppId::parse("other").unwrap();
+        let _reservation = host
+            .state
+            .reserve_memory(host.guest_memory_mib, &other, resources)
+            .await
+            .unwrap();
+        let waker = AppWaker::new(host.arc().clone());
+        let started = tokio::time::Instant::now();
+        let result = waker.reserve_room(&app_id(), &resources).await;
+        assert!(matches!(result, Err(WakeRefusal::NoRoom { .. })));
+        assert!(
+            (MEMORY_SETTLE_TIMEOUT..=MEMORY_SETTLE_TIMEOUT + MEMORY_SETTLE_INTERVAL)
+                .contains(&started.elapsed())
+        );
+        assert!(host.vms.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wake_waits_for_another_starting_record_after_its_reservation_is_released() {
+        let mut host = test_host().await;
+        tokio::time::pause();
+        let resources = protocol::DEFAULT_INSTANCE_RESOURCES;
+        Arc::get_mut(&mut host.host).unwrap().guest_memory_mib = u64::from(resources.memory_mib);
+        let other = AppId::parse("other").unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.app_id = other.clone();
+                record.state = InstanceState::Starting;
+            }))
+            .await;
+        let pending = tokio::spawn({
+            let state = host.state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                state
+                    .update_record(&other, |record| record.state = InstanceState::Idle)
+                    .await;
+            }
+        });
+        let waker = AppWaker::new(host.arc().clone());
+        assert!(waker.reserve_room(&app_id(), &resources).await.is_ok());
+        pending.await.unwrap();
+        assert!(host.vms.calls().is_empty());
+    }
 
     #[tokio::test]
     async fn concurrent_requests_to_a_frozen_app_share_one_thaw_and_wait_for_readiness() {

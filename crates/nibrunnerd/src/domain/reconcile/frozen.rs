@@ -68,11 +68,16 @@ async fn freeze_one(host: &Host, app: &AppId, after_ms: i64) -> bool {
     snapshot.freeze_attempted_at_ms.insert(app.clone(), now);
     snapshot.snapshotting.insert(app.clone());
     drop(snapshot);
+    freeze_marked(host, app, held).await;
+    true
+}
+
+pub(super) async fn freeze_marked(host: &Host, app: &AppId, held: tokio::sync::OwnedMutexGuard<()>) -> bool {
     let _transition = crate::state::InstanceTransition::new(host.state.clone(), app.clone(), held);
     super::network::apply_network(host).await;
     if !host.state.snapshot().await.isolated {
         tracing::warn!(%app, "freeze waits until incoming traffic can reach the activator");
-        return true;
+        return false;
     }
     host.router.close_connections_to(app).await;
     let result = host.vms.freeze(app).await;
@@ -98,7 +103,7 @@ async fn freeze_one(host: &Host, app: &AppId, after_ms: i64) -> bool {
     host.state.mark_snapshotting(app, false).await;
     super::network::apply_network(host).await;
     host.state.signal_report();
-    true
+    frozen
 }
 
 pub(crate) async fn apply(host: &Host) {

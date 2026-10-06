@@ -143,6 +143,23 @@ pub struct HostState {
 }
 
 impl HostState {
+    pub(crate) async fn other_memory_transitions(&self, app: &AppId) -> bool {
+        let snapshot = self.snapshot.read().await;
+        if snapshot
+            .records
+            .values()
+            .any(|record| &record.app_id != app && record.state == protocol::InstanceState::Starting)
+        {
+            return true;
+        }
+        self.memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .held
+            .keys()
+            .any(|owner| matches!(owner, ReservationOwner::App(id) if id != app))
+    }
+
     pub(crate) fn memory_generation(&self) -> u64 {
         self.memory_reservations
             .lock()

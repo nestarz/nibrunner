@@ -118,6 +118,7 @@ fn eligible(
 ) -> bool {
     record.on_request
         && record.desired_running
+        && record.expired_at_ms.is_none()
         // Established raw flows bypass proxy request accounting, including between packets.
         && record.ports.is_empty()
         && matches!(record.state, InstanceState::Running | InstanceState::Frozen)
@@ -236,10 +237,27 @@ pub(crate) async fn reclaim_one(
         {
             continue;
         }
+        let freeze_first = record.state == InstanceState::Running
+            && host
+                .config
+                .memory_admission
+                .as_ref()
+                .is_some_and(|policy| policy.freeze_after_ms.is_some());
         snapshot.memory_pressure.attempted_at.insert(app.clone(), now);
+        if freeze_first {
+            snapshot.freeze_attempted_at_ms.insert(app.clone(), now);
+        }
         snapshot.snapshotting.insert(app.clone());
         drop(snapshot);
         tracing::info!(app_id = %app, ?purpose, "reclaiming a quiet workload's memory");
+        // A full snapshot faults the entire guest back in. Pause and reclaim first so
+        // memory pressure does not require another full guest reservation to make progress.
+        if freeze_first {
+            if super::frozen::freeze_marked(host, &app, transition).await {
+                return true;
+            }
+            continue;
+        }
         host.metrics
             .sleep_wake
             .sleep_due(SleepReason::MemoryPressure, std::time::Duration::ZERO);
@@ -557,6 +575,48 @@ mod tests {
             InstanceState::Running
         );
         assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+    }
+
+    #[tokio::test]
+    async fn pressure_can_freeze_without_reserving_a_full_snapshot_and_preserves_open_requests() {
+        let mut host = workloads().await;
+        let inner = std::sync::Arc::get_mut(&mut host.host).unwrap();
+        inner.guest_memory_mib = 0;
+        inner.config.memory_admission = Some(crate::config::MemoryAdmission {
+            pool: None,
+            mode: crate::config::MemoryAdmissionMode::Observe,
+            freeze_after_ms: Some(60_000.try_into().unwrap()),
+            reclaim: true,
+            headroom_mib: 1024.try_into().unwrap(),
+        });
+        let preview = AppId::parse("preview").unwrap();
+        let production = AppId::parse("production").unwrap();
+        let request = host.metrics.proxy.open(&preview);
+        let _reclaiming = host.state.reclaim.lock().await;
+        assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+        assert!(host.vms.calls().is_empty());
+        drop(request);
+        assert!(reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+        assert_eq!(host.vms.calls(), [crate::ports::VmCall::Freeze]);
+        assert_eq!(
+            host.state.record(&preview).await.unwrap().state,
+            InstanceState::Frozen
+        );
+        assert_eq!(
+            host.state.record(&production).await.unwrap().state,
+            InstanceState::Running
+        );
+        assert!(!host.state.is_snapshotting(&preview).await);
+        assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+        host.state
+            .modify(|snapshot| snapshot.memory_pressure.attempted_at.clear())
+            .await;
+        assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+        assert_eq!(host.vms.calls(), [crate::ports::VmCall::Freeze]);
+        assert_eq!(
+            host.state.record(&preview).await.unwrap().state,
+            InstanceState::Frozen
+        );
     }
 
     #[tokio::test]

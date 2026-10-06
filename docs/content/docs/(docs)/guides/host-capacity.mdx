@@ -202,10 +202,16 @@ their full reservation. A service created after its grant also keeps the full re
 ### Reclaim before refusing capacity
 
 `reclaim = true` enables reclaim independently of admission mode. Omit it or set it to `false`
-to disable automatic reclaim. A refused start first tries to snapshot quiet on-request apps,
-then retries admission after each successful sleep, up to four apps. Deployment admission
+to disable automatic reclaim. A refused start reclaims quiet on-request apps,
+then retries admission after each successful transition, up to four apps. When the frozen tier
+is enabled, running candidates freeze and reclaim before snapshot admission. Already-frozen
+candidates can snapshot when a full guest reservation fits. Without the frozen tier, candidates
+go directly to snapshot admission. Deployment admission
 protects production apps; request-triggered wakes can reclaim idle production as a last resort.
 The reclaim lock waits at most 30 seconds. Snapshot time is additional.
+When another VM is starting or holds a memory reservation, a request-triggered wake retries
+admission for up to ten seconds while that transition settles. Every retry uses fresh readings
+and the same headroom and pool limits. A persistent shortfall still refuses the wake.
 
 The activity pass also reclaims one app when `MemAvailable` falls below headroom, or memory PSI
 over ten seconds reaches 10 percent `some` or 1 percent `full`. Recovery requires headroom plus
