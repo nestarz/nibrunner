@@ -76,9 +76,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
 
+    fn private_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
     #[test]
     fn a_unix_channel_requires_a_private_directory_owned_by_its_runtime() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_directory();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             listen_at(ChannelTransport::Unix, Channel::Control, directory.path()).unwrap_err(),
@@ -89,7 +95,7 @@ mod tests {
 
     #[test]
     fn unix_channels_keep_stream_bytes_private_and_do_not_inherit_across_exec() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_directory();
         for channel in [Channel::Control, Channel::Filesystem, Channel::Logs] {
             let listener = listen_at(ChannelTransport::Unix, channel, directory.path()).unwrap();
             let endpoint = ChannelTransport::Unix.endpoint(directory.path(), channel);
@@ -97,7 +103,10 @@ mod tests {
                 std::fs::metadata(&endpoint.path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            assert!(listen_at(ChannelTransport::Unix, channel, directory.path()).is_err());
+            assert_eq!(
+                listen_at(ChannelTransport::Unix, channel, directory.path()).unwrap_err(),
+                nix::errno::Errno::EADDRINUSE
+            );
             let client = dial_at(ChannelTransport::Unix, channel, directory.path()).unwrap();
             let accepted = accept_one(&listener).unwrap();
             assert_ne!(
@@ -119,14 +128,20 @@ mod tests {
 
     #[test]
     fn unix_channels_never_replace_existing_files_or_follow_socket_symlinks() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_directory();
         let endpoint = ChannelTransport::Unix.endpoint(directory.path(), Channel::Control);
         std::fs::write(&endpoint.path, b"keep").unwrap();
-        assert!(listen_at(ChannelTransport::Unix, Channel::Control, directory.path()).is_err());
+        assert_eq!(
+            listen_at(ChannelTransport::Unix, Channel::Control, directory.path()).unwrap_err(),
+            nix::errno::Errno::EADDRINUSE
+        );
         assert_eq!(std::fs::read(&endpoint.path).unwrap(), b"keep");
         std::fs::remove_file(&endpoint.path).unwrap();
         std::os::unix::fs::symlink("elsewhere", &endpoint.path).unwrap();
-        assert!(listen_at(ChannelTransport::Unix, Channel::Control, directory.path()).is_err());
+        assert_eq!(
+            listen_at(ChannelTransport::Unix, Channel::Control, directory.path()).unwrap_err(),
+            nix::errno::Errno::EADDRINUSE
+        );
         assert!(endpoint.path.is_symlink());
     }
 }
