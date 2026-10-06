@@ -143,7 +143,9 @@ impl AppActivator {
         // to the pause, and a request handed to it then is paused with it, so it goes to the
         // waker, which waits for the snapshot and restores from it.
         let guest = SocketAddr::from((record.guest_ipv4.addr(), record.http_port.get()));
-        if record.is_idle() || self.state.is_snapshotting(&app_id).await || !accepts_a_connection(guest).await
+        if record.needs_wake()
+            || self.state.is_snapshotting(&app_id).await
+            || !accepts_a_connection(guest).await
         {
             if let Err(refusal) = self.waker.wake(&app_id).await {
                 match refusal {

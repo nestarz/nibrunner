@@ -128,6 +128,9 @@ pub enum MemoryAdmissionMode {
 #[serde(deny_unknown_fields)]
 pub struct MemoryAdmission {
     pub mode: MemoryAdmissionMode,
+    /// Freeze quiet on-request apps before their traffic-idle snapshot deadline. Omit to disable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_after_ms: Option<std::num::NonZeroU64>,
     /// Suspend eligible quiet workloads before refusing starts and when physical memory is low.
     #[serde(default)]
     pub reclaim: bool,
@@ -949,6 +952,7 @@ impl HostConfig {
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2),
             memory_admission: Some(MemoryAdmission {
                 mode: MemoryAdmissionMode::Observe,
+                freeze_after_ms: None,
                 reclaim: false,
                 headroom_mib: std::num::NonZeroU32::new(1024).expect("positive headroom"),
             }),

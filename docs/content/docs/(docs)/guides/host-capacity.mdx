@@ -121,6 +121,11 @@ since start or restore. Only traffic-idle policies qualify. Apps with a transiti
 are skipped, and each attempt has a 60-second cooldown. Active streams and always-running work
 are protected. Snapshots preserve rollback state, but disk latency still affects sleep and wake.
 
+The optional [frozen tier](/docs/guides/sleep-and-wake#frozen-tier) keeps recently quiet VMs
+paused in memory before their snapshot deadline. It can reclaim pages into configured host
+swap without first writing a full snapshot. Frozen VMs remain accounted for in admission;
+compressed swap is not additional guaranteed capacity.
+
 ## Changing it
 
 1. Edit `max_apps`.

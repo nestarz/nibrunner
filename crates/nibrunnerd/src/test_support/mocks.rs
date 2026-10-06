@@ -99,6 +99,8 @@ pub struct VmmSpy {
     removed_taps: Arc<Mutex<Vec<String>>>,
     present_taps: Arc<Mutex<Vec<String>>>,
     status: Arc<Mutex<VmStatus>>,
+    frozen: Arc<Mutex<BTreeMap<AppId, bool>>>,
+    on_thaw: Arc<Mutex<Option<VmError>>>,
     on_boot: Arc<Mutex<Option<VmError>>>,
     on_sleep: Arc<Mutex<Option<VmError>>>,
     on_wake: Arc<Mutex<Option<VmError>>>,
@@ -113,6 +115,8 @@ impl Default for VmmSpy {
             removed_taps: shared(Vec::new()),
             present_taps: shared(Vec::new()),
             status: shared(VmStatus::default()),
+            frozen: shared(BTreeMap::new()),
+            on_thaw: shared(None),
             on_boot: shared(None),
             on_sleep: shared(None),
             on_wake: shared(None),
@@ -141,6 +145,10 @@ impl VmmSpy {
 
     pub fn refuse_wake(&self, error: VmError) {
         *self.on_wake.lock().expect("no panic holds this lock") = Some(error);
+    }
+
+    pub fn refuse_thaw(&self, error: VmError) {
+        *self.on_thaw.lock().expect("no panic holds this lock") = Some(error);
     }
 
     pub fn set_verdict(&self, verdict: impl Into<String>) {
@@ -181,6 +189,27 @@ pub fn vmm() -> (Arc<MockVmm>, VmmSpy) {
         push(&calls, VmCall::Wake);
         held(&on_wake).map_or(Ok(()), Err)
     });
+    let (calls, frozen) = (spy.calls.clone(), spy.frozen.clone());
+    vms.expect_freeze().returning(move |app| {
+        push(&calls, VmCall::Freeze);
+        frozen
+            .lock()
+            .expect("no panic holds this lock")
+            .insert(app.clone(), true);
+        Ok(())
+    });
+    let (calls, frozen, on_thaw) = (spy.calls.clone(), spy.frozen.clone(), spy.on_thaw.clone());
+    vms.expect_thaw().returning(move |app| {
+        push(&calls, VmCall::Thaw);
+        if let Some(error) = held(&on_thaw) {
+            return Err(error);
+        }
+        frozen
+            .lock()
+            .expect("no panic holds this lock")
+            .insert(app.clone(), false);
+        Ok(())
+    });
     let calls = spy.calls.clone();
     vms.expect_stop().returning(move |_| {
         push(&calls, VmCall::Stop);
@@ -207,9 +236,22 @@ pub fn vmm() -> (Arc<MockVmm>, VmmSpy) {
             .collect()
     });
     let status = spy.status.clone();
+    let frozen = spy.frozen.clone();
     vms.expect_statuses().returning(move |app_ids: &[AppId]| {
         let status = held(&status);
-        app_ids.iter().map(|app_id| (app_id.clone(), status)).collect()
+        let frozen = held(&frozen);
+        app_ids
+            .iter()
+            .map(|app_id| {
+                (
+                    app_id.clone(),
+                    VmStatus {
+                        frozen: frozen.get(app_id).copied().unwrap_or(status.frozen),
+                        ..status
+                    },
+                )
+            })
+            .collect()
     });
     let adopted = spy.adopted.clone();
     vms.expect_adopted_app_ids().returning(move || held(&adopted));

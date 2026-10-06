@@ -137,7 +137,7 @@ async fn list(
         });
     }
     host.state.mark_active(app_id, crate::clock::now_ms()).await;
-    if record.is_idle() || host.state.is_snapshotting(app_id).await {
+    if record.needs_wake() || host.state.is_snapshotting(app_id).await {
         host.waker
             .wake(app_id)
             .await

@@ -165,6 +165,10 @@ impl InstanceRecord {
         self.state == InstanceState::Idle
     }
 
+    pub fn needs_wake(&self) -> bool {
+        matches!(self.state, InstanceState::Idle | InstanceState::Frozen)
+    }
+
     pub fn grace_inputs(&self, now_ms: i64) -> GraceInputs<'_> {
         GraceInputs {
             health_check: &self.health_check,

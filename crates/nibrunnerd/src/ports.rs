@@ -159,6 +159,7 @@ impl VmError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
+    Thawed,
     Restored,
     AlreadyRunning,
     ColdBoot,
@@ -167,6 +168,7 @@ pub enum WakeOutcome {
 impl WakeOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
+            WakeOutcome::Thawed => "thawed",
             WakeOutcome::Restored => "restored",
             WakeOutcome::AlreadyRunning => "already-running",
             WakeOutcome::ColdBoot => "cold-boot",
@@ -180,6 +182,12 @@ pub trait Vmm: Send + Sync {
     async fn boot(&self, request: BootRequest) -> Result<(), VmError>;
     async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError>;
     async fn wake(&self, request: SuspendRequest) -> Result<(), VmError>;
+    async fn freeze(&self, _app_id: &AppId) -> Result<(), VmError> {
+        Err(VmError::Host("this runtime cannot freeze workloads".into()))
+    }
+    async fn thaw(&self, _app_id: &AppId) -> Result<(), VmError> {
+        Err(VmError::Host("this runtime cannot thaw workloads".into()))
+    }
     async fn reclaim(&self, _app_id: &AppId) -> Result<(), VmError> {
         Ok(())
     }
@@ -356,6 +364,8 @@ pub trait LogSink: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmCall {
+    Freeze,
+    Thaw,
     Boot,
     Sleep,
     Wake,

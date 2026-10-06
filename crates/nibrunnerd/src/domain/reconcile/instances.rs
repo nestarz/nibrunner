@@ -510,7 +510,8 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
     };
 
     let status = host.vms.statuses(std::slice::from_ref(&desired.app_id)).await;
-    if status.get(&desired.app_id).copied().unwrap_or(UNKNOWN_VM).active {
+    let status = status.get(&desired.app_id).copied().unwrap_or(UNKNOWN_VM);
+    if status.active && !status.frozen {
         return Ok(WakeOutcome::AlreadyRunning);
     }
 
@@ -538,6 +539,23 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
 
     host.state.mark_active(&desired.app_id, now_ms()).await;
 
+    if status.active && status.frozen {
+        host.vms
+            .thaw(&desired.app_id)
+            .await
+            .map_err(|error| would_not_start(error.message()))?;
+        host.state
+            .update_record(&desired.app_id, |record| {
+                record.state = InstanceState::Starting;
+                record.started_at = Some(now_timestamp());
+                record.stop_requested = false;
+                record.message = None;
+            })
+            .await;
+        host.state.mark_active(&desired.app_id, now_ms()).await;
+        host.state.probe_at_once(&desired.app_id).await;
+        return Ok(WakeOutcome::Thawed);
+    }
     let request = SuspendRequest {
         app_id: desired.app_id.clone(),
         deployment_id: desired.deployment_id.clone(),
@@ -642,7 +660,7 @@ async fn settle(host: &Arc<Host>, record: InstanceRecord, status: VmStatus, due:
     if record.expired_at_ms.is_some() {
         return;
     }
-    let health = if status.active && due {
+    let health = if status.active && !status.frozen && due {
         let probed = std::time::Instant::now();
         let outcome = if asks_the_port(&record.health, &record.health_check) {
             crate::domain::health::probe::probe_instance(
@@ -1477,6 +1495,7 @@ mod tests {
         host.vms.set_status(VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: Some(VmExit::Code(137)),
@@ -1510,6 +1529,7 @@ mod tests {
         host.vms.set_status(VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: true,
             started_this_boot: true,
             exit: Some(VmExit::Signal(libc::SIGKILL)),
@@ -1541,6 +1561,7 @@ mod tests {
             host.vms.set_status(VmStatus {
                 loaded: true,
                 active: false,
+                frozen: false,
                 failed: false,
                 started_this_boot: true,
                 exit: Some(VmExit::Code(1)),
@@ -1644,6 +1665,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: true,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: None,

@@ -23,6 +23,7 @@ impl VmExit {
 pub struct VmStatus {
     pub loaded: bool,
     pub active: bool,
+    pub frozen: bool,
     pub failed: bool,
     pub started_this_boot: bool,
     pub exit: Option<VmExit>,
@@ -31,6 +32,7 @@ pub struct VmStatus {
 pub const UNKNOWN_VM: VmStatus = VmStatus {
     loaded: false,
     active: false,
+    frozen: false,
     failed: false,
     started_this_boot: false,
     exit: None,
@@ -75,6 +77,7 @@ mod tests {
             VmStatus {
                 loaded: true,
                 active: false,
+                frozen: false,
                 failed: false,
                 started_this_boot: false,
                 exit: None,

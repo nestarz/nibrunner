@@ -30,6 +30,7 @@ pub struct HostSnapshot {
     // an app quiet.
     pub last_measured_at_ms: BTreeMap<AppId, i64>,
     pub reclaimed_at_ms: BTreeMap<AppId, i64>,
+    pub(crate) freeze_attempted_at_ms: BTreeMap<AppId, i64>,
     pub(crate) memory_pressure: crate::domain::reconcile::pressure::PressureState,
     pub volume_usage: BTreeMap<AppId, FilesystemUsage>,
     pub compute_usage: BTreeMap<AppId, ComputeUsage>,

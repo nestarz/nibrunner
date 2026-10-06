@@ -54,6 +54,7 @@ mod tests {
         VmStatus {
             loaded: true,
             active: false,
+            frozen: false,
             failed: false,
             started_this_boot: true,
             exit: Some(VmExit::Code(0)),
