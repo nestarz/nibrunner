@@ -114,6 +114,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_startup_history_preserves_a_running_hosts_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        let migrations = tempfile::tempdir().unwrap();
+        std::fs::write(
+            migrations.path().join("0001_host_state.sql"),
+            include_str!("../../../migrations/0001_host_state.sql"),
+        )
+        .unwrap();
+        sqlx::migrate::Migrator::new(migrations.path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into slots (app_id, slot) values ('app-1', 7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let upgraded = open(&path).await.unwrap();
+        let slot: i64 = sqlx::query_scalar("select slot from slots where app_id = 'app-1'")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+        assert_eq!(slot, 7);
+        let profiles: i64 = sqlx::query_scalar("select count(*) from memory_profiles")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+        assert_eq!(profiles, 0);
+    }
+
+    #[tokio::test]
     async fn a_writer_waits_its_turn_and_a_commit_does_not_wait_for_the_disk() {
         let (_directory, pool) = opened().await;
         let busy_timeout_ms: i64 = sqlx::query_scalar("pragma busy_timeout")

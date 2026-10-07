@@ -4,6 +4,7 @@ pub mod deleted_volumes_repository;
 pub mod host_identity_repository;
 pub mod instances_repository;
 mod last_written;
+pub(crate) mod memory_profiles_repository;
 pub mod meters_repository;
 pub mod slots_repository;
 
@@ -21,6 +22,7 @@ use crate::repositories::slots_repository::{SlotRepository, SqliteSlots};
 
 pub struct Repositories {
     pub instances: Arc<dyn InstanceRepository>,
+    pub(crate) memory_profiles: Arc<dyn memory_profiles_repository::MemoryProfileRepository>,
     pub slots: Arc<dyn SlotRepository>,
     pub activity: Arc<dyn ActivityRepository>,
     pub meters: Arc<dyn MeterRepository>,
@@ -33,6 +35,9 @@ impl Repositories {
     pub fn sqlite(pool: SqlitePool) -> Self {
         Self {
             instances: Arc::new(SqliteInstances::new(pool.clone())),
+            memory_profiles: Arc::new(memory_profiles_repository::SqliteMemoryProfiles::new(
+                pool.clone(),
+            )),
             slots: Arc::new(SqliteSlots::new(pool.clone())),
             activity: Arc::new(SqliteActivity::new(pool.clone())),
             meters: Arc::new(SqliteMeters::new(pool.clone())),
