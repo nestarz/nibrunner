@@ -184,6 +184,32 @@ async fn apply_holds(host: &Host, plan: &ReconcilePlan) {
     }
 }
 
+async fn unready_boots(host: &Host) -> usize {
+    let (starting, failed) = {
+        let snapshot = host.state.locked_snapshot().await;
+        let starting = snapshot
+            .records
+            .values()
+            .filter(|record| record.state == InstanceState::Starting)
+            .count();
+        let failed: Vec<_> = snapshot
+            .records
+            .values()
+            .filter(|record| record.state == InstanceState::Failed && !record.health.ever_healthy)
+            .map(|record| record.app_id.clone())
+            .collect();
+        (starting, failed)
+    };
+    starting
+        + host
+            .vms
+            .statuses(&failed)
+            .await
+            .values()
+            .filter(|status| status.active)
+            .count()
+}
+
 async fn apply_starts(host: &Arc<Host>, plan: &ReconcilePlan) {
     let starts: Vec<_> = plan
         .instances
@@ -213,15 +239,7 @@ async fn apply_starts(host: &Arc<Host>, plan: &ReconcilePlan) {
     for desired in starts {
         let _transition = host.state.transition(&desired.app_id).await;
         if let Some(limit) = host.config.max_concurrent_vm_starts {
-            let starting = host
-                .state
-                .locked_snapshot()
-                .await
-                .records
-                .values()
-                .filter(|record| record.state == InstanceState::Starting)
-                .count();
-            if starting >= usize::from(limit.get()) {
+            if unready_boots(host).await >= usize::from(limit.get()) {
                 instances::wait_for_start_slot(host, desired).await;
                 continue;
             }
@@ -1291,6 +1309,38 @@ mod tests {
 
     const WAITING_FOR_ONE_MORE: &str =
         "waiting to be started: its host is 256 MiB short of the memory it needs";
+
+    #[tokio::test]
+    async fn a_live_guest_that_missed_readiness_keeps_its_boot_slot_until_it_stops() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let mut host = test_host().await;
+        Arc::get_mut(&mut host.host)
+            .unwrap()
+            .config
+            .max_concurrent_vm_starts = 1.try_into().ok();
+        let wave = on_request_apps(2);
+        reconcile(host.arc(), &wave, Trigger::Change).await;
+        host.state
+            .update_record(&nth_app(1), |record| record.state = InstanceState::Failed)
+            .await;
+        host.vms.set_status(running_vm());
+        let queued = ReconcilePlan {
+            instances: vec![InstancePlan::Start {
+                desired: wave.instances[1].clone(),
+            }],
+            ..ReconcilePlan::default()
+        };
+        apply_starts(&host.arc(), &queued).await;
+        assert_eq!(boots(&host), 1);
+        assert_eq!(
+            host.state.record(&nth_app(2)).await.unwrap().state,
+            InstanceState::Pending
+        );
+
+        host.vms.set_status(UNKNOWN_VM);
+        apply_starts(&host.arc(), &queued).await;
+        assert_eq!(boots(&host), 2);
+    }
 
     #[tokio::test]
     async fn a_start_wave_waits_for_readiness_before_reusing_a_configured_boot_slot() {
