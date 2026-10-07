@@ -1330,7 +1330,7 @@ mod tests {
             }],
             ..ReconcilePlan::default()
         };
-        apply_starts(&host.arc(), &queued).await;
+        apply_starts(host.arc(), &queued).await;
         assert_eq!(boots(&host), 1);
         assert_eq!(
             host.state.record(&nth_app(2)).await.unwrap().state,
@@ -1338,7 +1338,7 @@ mod tests {
         );
 
         host.vms.set_status(UNKNOWN_VM);
-        apply_starts(&host.arc(), &queued).await;
+        apply_starts(host.arc(), &queued).await;
         assert_eq!(boots(&host), 2);
     }
 
