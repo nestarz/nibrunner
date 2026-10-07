@@ -222,6 +222,9 @@ impl MemoryReadings {
     fn growth_bytes(&self, record: &InstanceRecord) -> u64 {
         let ceiling = self.ceiling(&record.app_id, record.resources);
         let Some(memory) = self.resident_memory(record) else {
+            if record.state == InstanceState::Starting && record.memory_peak_bytes.is_some() {
+                return self.wake_target_bytes(record);
+            }
             return ceiling;
         };
         if record.state == InstanceState::Frozen {
@@ -507,6 +510,28 @@ mod tests {
         assert_eq!(
             observed.shortfall_mib(8192, &[running()], 512 * BYTES_PER_MIB, 0, 512 * BYTES_PER_MIB),
             704
+        );
+    }
+
+    #[test]
+    fn a_known_boot_keeps_its_startup_target_until_fresh_running_measurements_arrive() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        observed.pool = Some(pool(300));
+        let mut record = running();
+        record.state = InstanceState::Starting;
+        record.memory_peak_bytes = Some(512 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&record), 640 * BYTES_PER_MIB);
+        assert_eq!(observed.anonymous_resident_bytes(&record), 0);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record.clone()], 640 * BYTES_PER_MIB, 0, 0),
+            0
+        );
+        record.memory_peak_bytes = None;
+        assert_eq!(observed.growth_bytes(&record), 2048 * BYTES_PER_MIB);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record], 640 * BYTES_PER_MIB, 0, 0),
+            1188
         );
     }
 
