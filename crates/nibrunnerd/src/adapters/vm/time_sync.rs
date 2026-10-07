@@ -64,6 +64,18 @@ pub(super) async fn freeze_tenant(path: &Path) -> Result<(), VmError> {
     Ok(())
 }
 
+pub(super) async fn shutdown(path: &Path) -> Result<(), VmError> {
+    let mut wire = connect(path).await?;
+    wire.get_mut()
+        .write_all(format!("{}\n", guest_contract::control::TENANT_STOP_REQUEST).as_bytes())
+        .await
+        .map_err(failed)?;
+    if line(&mut wire).await? != "OK" {
+        return Err(failed("the guest refused shutdown"));
+    }
+    Ok(())
+}
+
 pub(super) async fn reclaim(path: &Path) -> Result<(), VmError> {
     let mut wire = connect(path).await?;
     wire.get_mut()
@@ -124,6 +136,25 @@ mod tests {
                 wire.get_mut().write_all(reply.as_bytes()).await.unwrap();
             });
             assert_eq!(reclaim(&socket).await.is_ok(), reply == "OK\n");
+            answer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_requires_acknowledgement_from_the_guest_control_channel() {
+        for reply in ["OK\n", "REFUSED\n", ""] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("control.vsock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let answer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut wire = BufReader::new(stream);
+                assert_eq!(line(&mut wire).await.unwrap(), "CONNECT 51001");
+                wire.get_mut().write_all(b"OK 1234\n").await.unwrap();
+                assert_eq!(line(&mut wire).await.unwrap(), "STOP");
+                wire.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            });
+            assert_eq!(shutdown(&socket).await.is_ok(), reply == "OK\n");
             answer.await.unwrap();
         }
     }

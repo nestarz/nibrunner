@@ -73,7 +73,6 @@ pub(crate) fn supervise(
             ceiling.limit_bytes,
         ) {
             Watched::ShutdownRequested => {
-                stop(tenant);
                 return Outcome::ShutdownRequested;
             }
             Watched::Exited { exit, because } => {
@@ -131,7 +130,10 @@ fn watch(
         output.forward(forwarder);
         forwarder.reconnect_if_due();
         match wait_for_signal(Duration::ZERO) {
-            Arrived::Shutdown => return Watched::ShutdownRequested,
+            Arrived::Shutdown => {
+                stop(tenant, &mut output, forwarder);
+                return Watched::ShutdownRequested;
+            }
             Arrived::ChildDied | Arrived::Nothing => {
                 if let Some(exit) = reap_until(tenant) {
                     output.forward(forwarder);
@@ -309,18 +311,22 @@ fn wait_for_signal(within: Duration) -> Arrived {
     }
 }
 
-fn stop(tenant: Pid) {
+fn stop(tenant: Pid, output: &mut TenantOutput, forwarder: &mut Forwarder) {
     let _ = nix::sys::signal::kill(tenant, Signal::SIGTERM);
     let deadline = Instant::now() + Duration::from_millis(u64::from(SHUTDOWN_GRACE_MS));
     while Instant::now() < deadline {
+        output.forward(forwarder);
+        forwarder.reconnect_if_due();
         if reap_until(tenant).is_some() {
+            output.forward(forwarder);
             return;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        output.wait(None, Duration::from_millis(20));
     }
     log("the tenant did not stop in time and was killed");
     let _ = nix::sys::signal::kill(tenant, Signal::SIGKILL);
     let _ = waitpid(tenant, None);
+    output.forward(forwarder);
 }
 
 fn spawn(config: &InstanceConfig, ceiling: &Ceiling) -> Option<Tenant> {
@@ -593,12 +599,14 @@ mod tests {
         let _one = one_tenant_at_a_time();
         let (_dir, sink) = sink();
         let tenant = tenant_that(|stdout, _| {
+            block_signals();
             say(stdout, b"up\n");
-            loop {
-                unsafe { libc::pause() };
-            }
+            let mut shutdown = SigSet::empty();
+            shutdown.add(Signal::SIGTERM);
+            shutdown.wait().unwrap();
+            say(stdout, &vec![b'x'; 2 * PIPE_CAPACITY as usize]);
+            say(stdout, b"flushed\n");
         });
-        let pid = tenant.pid;
         // At this thread, since it is the one blocking the signal: the process's other threads
         // would take one sent to the process and end it. Through a usize because musl's
         // pthread_t is a pointer, which cannot cross into the thread that sends.
@@ -609,14 +617,15 @@ mod tests {
         });
         let (ended, took) = watched(tenant, &sink);
         assert_eq!(asked.join().unwrap(), 0);
-        let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
-        let _ = waitpid(pid, None);
         assert_eq!(ended, Watched::ShutdownRequested);
         assert!(
-            took < Duration::from_secs(1),
+            took < Duration::from_secs(3),
             "the signal took {took:?} to notice"
         );
-        assert_eq!(payload_of(&frames_in(&sink), TenantLogStream::Stdout), b"up\n");
+        let output = payload_of(&frames_in(&sink), TenantLogStream::Stdout);
+        assert!(output.starts_with(b"up\n"));
+        assert!(output.ends_with(b"flushed\n"));
+        assert_eq!(output.len(), 2 * PIPE_CAPACITY as usize + 11);
     }
 
     #[test]
