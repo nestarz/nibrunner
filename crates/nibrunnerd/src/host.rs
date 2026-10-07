@@ -169,7 +169,23 @@ impl Host {
             }
         };
         let mode = policy.map_or(crate::config::MemoryAdmissionMode::Observe, |policy| policy.mode);
+        let startup = if let Some(app) = additional_app {
+            let desired = self
+                .cache
+                .lock()
+                .await
+                .latest()
+                .and_then(|desired| desired.instances.iter().find(|i| &i.app_id == app))
+                .cloned();
+            match desired {
+                Some(desired) => Some(self.state.startup_memory(&desired).await),
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut readings = crate::domain::memory_admission::MemoryReadings {
+            startup,
             pool,
             reservation_generation,
             available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
@@ -249,7 +265,11 @@ impl Host {
 
     pub(crate) async fn write_down(&self) -> Result<(), crate::domain::store::StoreError> {
         let _writing = self.state.persistence.lock().await;
-        let snapshot = self.state.snapshot().await;
+        let mut snapshot = self.state.snapshot().await;
+        crate::domain::memory_admission::prune_profiles(
+            &mut snapshot.memory_profiles,
+            crate::clock::now_ms(),
+        );
         let records: Vec<_> = snapshot.records.values().cloned().collect();
         let (assignments, cursor) = {
             let allocator = self.allocator.lock().await;
@@ -257,6 +277,10 @@ impl Host {
         };
 
         self.repositories.slots.replace_all(&assignments, cursor).await?;
+        self.repositories
+            .memory_profiles
+            .replace_all(&snapshot.memory_profiles)
+            .await?;
         self.repositories.instances.replace_all(&records).await?;
         self.repositories
             .activity
@@ -278,6 +302,15 @@ impl Host {
                 record.expiry_since_ms = Some(crate::clock::now_ms());
             }
         }
+        let mut memory_profiles = self.repositories.memory_profiles.all().await.unwrap_or_default();
+        for record in &records {
+            crate::domain::memory_admission::remember_profile(
+                &mut memory_profiles,
+                record,
+                crate::clock::now_ms(),
+            );
+        }
+        crate::domain::memory_admission::prune_profiles(&mut memory_profiles, crate::clock::now_ms());
         let last_active = self.repositories.activity.all().await.unwrap_or_default();
         let meters = self.repositories.meters.all().await.unwrap_or_default();
         let deleted = self.repositories.deleted_volumes.all().await.unwrap_or_default();
@@ -298,6 +331,7 @@ impl Host {
                     .into_iter()
                     .map(|record| (record.app_id.clone(), record))
                     .collect();
+                snapshot.memory_profiles = memory_profiles;
                 snapshot.last_active_at_ms = last_active;
                 snapshot.meters = meters;
                 snapshot.deleted_volumes = deleted;
@@ -400,7 +434,12 @@ mod tests {
         deleted_volumes: MockDeletedVolumeRepository,
         identity: MockHostIdentityRepository,
     ) -> Repositories {
+        let mut profiles =
+            crate::repositories::memory_profiles_repository::MockMemoryProfileRepository::new();
+        profiles.expect_all().returning(|| Ok(Default::default()));
+        profiles.expect_replace_all().returning(|_| Ok(()));
         Repositories {
+            memory_profiles: Arc::new(profiles),
             instances: Arc::new(instances),
             slots: Arc::new(slots),
             activity: Arc::new(activity),

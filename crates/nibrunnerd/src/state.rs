@@ -14,6 +14,7 @@ use crate::domain::report::InstanceRecord;
 #[derive(Debug, Default, Clone)]
 pub struct HostSnapshot {
     pub records: BTreeMap<AppId, InstanceRecord>,
+    pub(crate) memory_profiles: crate::domain::memory_admission::MemoryProfiles,
     // Only ever this daemon's own account of what it set out on: a restart starts each over,
     // and so is measured as one.
     pub deploys: BTreeMap<AppId, Deploy>,
@@ -409,16 +410,37 @@ impl HostState {
                 && readings.reservation_generation == reservations.generation
                 && operation == crate::domain::memory_admission::MemoryOperation::Start
             {
-                if let Some(record) = app_id.and_then(|app| snapshot.records.get(app)).filter(|record| {
-                    matches!(
-                        record.state,
-                        protocol::InstanceState::Idle
-                            | protocol::InstanceState::Frozen
-                            | protocol::InstanceState::Running
-                    )
-                }) {
-                    bytes = readings.wake_target_bytes(record);
-                }
+                let current = app_id
+                    .and_then(|app| snapshot.records.get(app))
+                    .filter(|record| {
+                        record.resources == wanted
+                            && readings.startup.as_ref().is_none_or(|startup| {
+                                startup.deployment_id == record.deployment_id && startup.resources == wanted
+                            })
+                            && matches!(
+                                record.state,
+                                protocol::InstanceState::Pending
+                                    | protocol::InstanceState::Starting
+                                    | protocol::InstanceState::Idle
+                                    | protocol::InstanceState::Frozen
+                                    | protocol::InstanceState::Running
+                            )
+                    })
+                    .map(|record| readings.wake_target_bytes(record));
+                let historical = app_id.and_then(|app| {
+                    readings
+                        .startup
+                        .as_ref()
+                        .filter(|startup| startup.resources == wanted)
+                        .and_then(|startup| startup.peak_bytes)
+                        .map(|peak| {
+                            crate::domain::memory_admission::target_from_peak(
+                                readings.ceiling(app, wanted),
+                                peak,
+                            )
+                        })
+                });
+                bytes = current.into_iter().chain(historical).max().unwrap_or(bytes);
             }
             let reserved_bytes = reservations
                 .held
@@ -554,6 +576,22 @@ impl HostState {
         change(&mut *self.snapshot.write().await)
     }
 
+    pub(crate) async fn startup_memory(
+        &self,
+        desired: &protocol::DesiredInstance,
+    ) -> crate::domain::memory_admission::StartupMemory {
+        let snapshot = self.snapshot.read().await;
+        let peak_bytes = snapshot
+            .memory_profiles
+            .get(&(desired.app_id.clone(), desired.deployment_id.clone()))
+            .and_then(|p| p.peak_for(desired.config.resources, crate::clock::now_ms()));
+        crate::domain::memory_admission::StartupMemory {
+            deployment_id: desired.deployment_id.clone(),
+            resources: desired.config.resources,
+            peak_bytes,
+        }
+    }
+
     pub async fn put_record(&self, mut record: InstanceRecord) {
         let mut snapshot = self.snapshot.write().await;
         if let Some(previous) = snapshot.records.get(&record.app_id) {
@@ -565,12 +603,27 @@ impl HostState {
                 record.state = protocol::InstanceState::Expired;
             }
         }
+        crate::domain::memory_admission::restore_profile(
+            &snapshot.memory_profiles,
+            &mut record,
+            crate::clock::now_ms(),
+        );
+        crate::domain::memory_admission::remember_profile(
+            &mut snapshot.memory_profiles,
+            &record,
+            crate::clock::now_ms(),
+        );
         snapshot.records.insert(record.app_id.clone(), record);
     }
 
     pub async fn update_record(&self, app_id: &AppId, change: impl FnOnce(&mut InstanceRecord)) {
         let mut snapshot = self.snapshot.write().await;
-        if let Some(record) = snapshot.records.get_mut(app_id) {
+        let HostSnapshot {
+            records,
+            memory_profiles,
+            ..
+        } = &mut *snapshot;
+        if let Some(record) = records.get_mut(app_id) {
             let terminal = record.expired_at_ms;
             let deployment = record.deployment_id.clone();
             change(record);
@@ -578,11 +631,23 @@ impl HostState {
                 record.expired_at_ms = terminal;
                 record.state = protocol::InstanceState::Expired;
             }
+            crate::domain::memory_admission::remember_profile(
+                memory_profiles,
+                record,
+                crate::clock::now_ms(),
+            );
         }
     }
 
     pub async fn drop_record(&self, app_id: &AppId) {
-        self.snapshot.write().await.records.remove(app_id);
+        let mut snapshot = self.snapshot.write().await;
+        if let Some(record) = snapshot.records.remove(app_id) {
+            crate::domain::memory_admission::remember_profile(
+                &mut snapshot.memory_profiles,
+                &record,
+                crate::clock::now_ms(),
+            );
+        }
     }
 
     /// Admit and count the request under the same lock that makes expiry terminal.
@@ -688,6 +753,7 @@ mod tests {
         Some((
             mode,
             crate::domain::memory_admission::MemoryReadings {
+                startup: None,
                 pool: None,
                 reservation_generation: 0,
                 external_resident_bytes: BTreeMap::new(),
@@ -744,6 +810,7 @@ mod tests {
     fn frozen_readings(state: &HostState) -> crate::domain::memory_admission::MemoryReadings {
         use protocol::{ReportedMemory, ReportedMemoryLimits};
         crate::domain::memory_admission::MemoryReadings {
+            startup: None,
             pool: None,
             reservation_generation: state.memory_generation(),
             external_resident_bytes: BTreeMap::new(),
@@ -989,6 +1056,105 @@ mod tests {
             host.state.record(&app_id()).await.unwrap().memory_peak_bytes,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_removed_revision_keeps_its_measured_start_grant_across_restart() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let host = crate::test_support::test_host().await;
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Running;
+                record.memory_peak_bytes = Some(512 * 1_048_576);
+            }))
+            .await;
+        host.state.drop_record(&app_id()).await;
+        host.persist().await;
+        assert!(host.repositories.instances.all().await.unwrap().is_empty());
+        host.state.modify(|s| s.memory_profiles.clear()).await;
+        host.load().await;
+        host.state
+            .put_record(instance_record(|record| record.state = InstanceState::Pending))
+            .await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().memory_peak_bytes,
+            Some(512 * 1_048_576)
+        );
+        let mut readings = frozen_readings(&host.state);
+        readings.available_bytes = 1800 * 1_048_576;
+        assert!(host
+            .state
+            .reserve_with_readings(
+                8192,
+                &app_id(),
+                protocol::DEFAULT_INSTANCE_RESOURCES,
+                Some((Adaptive, readings))
+            )
+            .await
+            .is_ok());
+        host.state.drop_record(&app_id()).await;
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Pending;
+                record.deployment_id = protocol::DeploymentId::parse("different-deployment").unwrap();
+            }))
+            .await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().memory_peak_bytes,
+            None
+        );
+        let mut readings = frozen_readings(&host.state);
+        readings.available_bytes = 1800 * 1_048_576;
+        assert!(host
+            .state
+            .reserve_with_readings(
+                8192,
+                &app_id(),
+                protocol::DEFAULT_INSTANCE_RESOURCES,
+                Some((Adaptive, readings))
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_cold_start_uses_history_before_a_record_exists_and_a_replacement_does_not_use_the_old_peak() {
+        use crate::config::MemoryAdmissionMode::Adaptive;
+        let state = HostState::shared();
+        let desired = crate::test_support::desired_instance(|_| {});
+        state
+            .put_record(instance_record(|r| r.memory_peak_bytes = Some(512 * 1_048_576)))
+            .await;
+        state.drop_record(&app_id()).await;
+        let mut readings = frozen_readings(&state);
+        readings.available_bytes = 1800 * 1_048_576;
+        readings.startup = Some(state.startup_memory(&desired).await);
+        assert!(state
+            .reserve_with_readings(
+                8192,
+                &app_id(),
+                desired.config.resources,
+                Some((Adaptive, readings))
+            )
+            .await
+            .is_ok());
+        state
+            .put_record(instance_record(|r| r.memory_peak_bytes = Some(512 * 1_048_576)))
+            .await;
+        let mut replacement = desired;
+        replacement.deployment_id = protocol::DeploymentId::parse("new-deployment").unwrap();
+        let mut readings = frozen_readings(&state);
+        readings.available_bytes = 1800 * 1_048_576;
+        readings.startup = Some(state.startup_memory(&replacement).await);
+        assert!(state
+            .reserve_with_readings(
+                8192,
+                &app_id(),
+                replacement.config.resources,
+                Some((Adaptive, readings))
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
