@@ -340,6 +340,26 @@ pub async fn hold_instance(host: &Host, desired: &DesiredInstance) {
 /// `started_at` goes too, or the status loop would read it as that guest having failed rather
 /// than this one waiting.
 pub async fn wait_for_room(host: &Host, desired: &DesiredInstance, shortfall_mib: u64) {
+    wait_to_start(
+        host,
+        desired,
+        StateMessage::new(format!(
+            "waiting to be started: its host is {shortfall_mib} MiB short of the memory it needs"
+        )),
+    )
+    .await;
+}
+
+pub(super) async fn wait_for_start_slot(host: &Host, desired: &DesiredInstance) {
+    wait_to_start(
+        host,
+        desired,
+        StateMessage::new("waiting to be started: another guest is still becoming ready"),
+    )
+    .await;
+}
+
+async fn wait_to_start(host: &Host, desired: &DesiredInstance, message: StateMessage) {
     let Ok(slot) = host.slot_for(&desired.app_id).await else {
         tracing::error!(app_id = %desired.app_id, "this host has no slot left to answer for the app");
         return;
@@ -354,9 +374,7 @@ pub async fn wait_for_room(host: &Host, desired: &DesiredInstance, shortfall_mib
     waiting.stop_requested = false;
     waiting.started_at = None;
     waiting.start_attempts = NO_START_ATTEMPTS;
-    waiting.message = Some(StateMessage::new(format!(
-        "waiting to be started: its host is {shortfall_mib} MiB short of the memory it needs"
-    )));
+    waiting.message = Some(message);
     host.state.put_record(waiting).await;
 }
 
