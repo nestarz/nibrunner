@@ -390,6 +390,13 @@ impl VmProcesses {
         Ok(record)
     }
 
+    pub fn request_stop(&self, app_id: &AppId) {
+        if let Some(mut record) = self.read_record(app_id) {
+            record.stop_requested = true;
+            let _ = self.write_record(&record);
+        }
+    }
+
     pub async fn stop(&self, app_id: &AppId) {
         let Some(mut record) = self.read_record(app_id) else {
             return;

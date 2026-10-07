@@ -38,6 +38,12 @@ fn answer(connection: OwnedFd, reclaimer: &mut crate::reclaim::Reclaimer) {
     if wire.read_line(&mut request).is_err() {
         return;
     }
+    if request.trim() == guest_contract::control::TENANT_STOP_REQUEST {
+        if wire.get_mut().write_all(b"OK\n").is_ok() {
+            let _ = nix::sys::signal::kill(nix::unistd::getppid(), nix::sys::signal::Signal::SIGTERM);
+        }
+        return;
+    }
     if request.trim() == guest_contract::control::TENANT_RECLAIM_REQUEST {
         let result = super::memory::reclaim(reclaimer);
         let _ = wire

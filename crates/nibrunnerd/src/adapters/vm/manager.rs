@@ -449,6 +449,33 @@ impl Vmm for VmManager {
 
     async fn stop(&self, app_id: &AppId) -> Result<(), VmError> {
         self.discard_snapshot(app_id);
+        if self.processes.status(app_id).active {
+            self.processes.request_stop(app_id);
+            let shutdown = async {
+                if self.processes.status(app_id).frozen {
+                    self.thaw(app_id).await?;
+                }
+                let control = self
+                    .working_dir_for(app_id)
+                    .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+                time_sync::shutdown(&control).await
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(5), shutdown).await {
+                Ok(Ok(())) => {
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(
+                            guest_contract::control::GUEST_SHUTDOWN_GRACE_MS + 1_000,
+                        );
+                    while self.processes.status(app_id).active && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%app_id, error = %error.message(), "guest shutdown failed; terminating the VMM")
+                }
+                Err(_) => tracing::warn!(%app_id, "guest shutdown timed out; terminating the VMM"),
+            }
+        }
         self.processes.stop(app_id).await;
         Ok(())
     }
@@ -751,7 +778,9 @@ mod tests {
                 if old_init {
                     return;
                 }
-                if request == guest_contract::control::TENANT_FREEZE_REQUEST {
+                if request == guest_contract::control::TENANT_FREEZE_REQUEST
+                    || request == guest_contract::control::TENANT_STOP_REQUEST
+                {
                     wire.get_mut().write_all(b"OK\n").await.unwrap();
                 } else if request.starts_with(guest_contract::control::TENANT_CLOCK_REQUEST) {
                     wire.get_mut().write_all(b"READY\n").await.unwrap();
@@ -898,6 +927,43 @@ mod tests {
         assert_eq!(calls[0], "SLEEP");
         assert!(calls[1].starts_with("WAKE "));
         fixture.manager.processes.stop(&app_id()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_guest_waits_for_its_graceful_exit() {
+        let mut fixture = fixture();
+        let calls = running_fake_vm(&mut fixture, false).await;
+        let pid = fixture.manager.processes.read_record(&app_id()).unwrap().pid;
+        let observed = calls.clone();
+        let guest = tokio::spawn(async move {
+            while !observed.lock().unwrap().iter().any(|call| call == "STOP") {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let pid = nix::unistd::Pid::from_raw(pid);
+            assert!(nix::sys::signal::kill(pid, None).is_ok());
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), fixture.manager.stop(&app_id()))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), guest)
+            .await
+            .unwrap()
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(&calls[..], ["STOP"]);
+        assert!(
+            fixture
+                .manager
+                .processes
+                .read_record(&app_id())
+                .unwrap()
+                .stop_requested
+        );
+        assert!(!fixture.manager.processes.status(&app_id()).active);
     }
 
     #[cfg(unix)]
