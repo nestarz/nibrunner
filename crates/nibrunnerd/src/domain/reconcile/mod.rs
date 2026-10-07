@@ -1310,7 +1310,6 @@ mod tests {
             assert_eq!(waiting.start_attempts, NO_START_ATTEMPTS);
             assert!(waiting.started_at.is_none());
 
-            host.vms.set_status(running_vm());
             reconcile(host.arc(), &wave, Trigger::Tick).await;
             assert_eq!(boots(&host), usize::from(limit));
 
