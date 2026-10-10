@@ -55,6 +55,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                             && record.started_at.is_none()
                             && record.start_attempts == NO_START_ATTEMPTS
                     }),
+                    ran_once: record.is_some_and(|record| record.state == InstanceState::Exited),
                 }
             })
             .collect(),
@@ -1983,6 +1984,111 @@ mod tests {
             let record = host.state.record(&app_id()).await.unwrap();
             assert_eq!(record.state, InstanceState::Failed);
             assert!(record.message.unwrap().as_str().contains("the microVM exited"));
+        }
+    }
+
+    mod a_program_run_once {
+        use super::*;
+        use crate::domain::backoff::AttemptWindow;
+        use protocol::TenantExit;
+
+        fn run_once() -> protocol::HostDesiredState {
+            desired_state(|state| {
+                state.volumes = vec![desired_volume(|_| {})];
+                state.instances = vec![desired_instance(|instance| {
+                    instance.config.restart_policy.max_restarts = 0
+                })];
+            })
+        }
+
+        async fn ended(host: &TestHost, verdict: String) {
+            host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
+            host.vms.set_status(stopped_vm());
+            host.vms.set_verdict(verdict);
+            host.state
+                .put_record(instance_record(|record| {
+                    record.restart_policy.max_restarts = 0;
+                    record.started_at = Some(observed_at());
+                    record.state = InstanceState::Running;
+                    record.start_attempts = AttemptWindow {
+                        attempts: 1,
+                        last_attempt_at_ms: Some(crate::clock::now_ms()),
+                    };
+                }))
+                .await;
+            refresh(host.arc()).await;
+        }
+
+        #[tokio::test]
+        async fn that_exited_is_reported_exited_with_its_code_and_is_not_started_again() {
+            let _serial = ONE_HOST_AT_A_TIME.lock().await;
+            for (exit, status) in [
+                (TenantExit::Code(0), 0),
+                (TenantExit::Code(3), 3),
+                (TenantExit::Signal(9), 137),
+            ] {
+                let host = test_host().await;
+                ended(&host, guest_contract::control::ran_once(exit)).await;
+
+                reconcile(host.arc(), &run_once(), Trigger::Tick).await;
+                refresh(host.arc()).await;
+                reconcile(host.arc(), &run_once(), Trigger::Tick).await;
+
+                assert!(host.vms.calls().is_empty(), "{:?}", host.vms.calls());
+                let record = host.state.record(&app_id()).await.unwrap();
+                assert_eq!(record.state, InstanceState::Exited);
+                assert_eq!(record.last_exit_code, Some(status));
+                assert_eq!(
+                    record.message.unwrap().as_str(),
+                    guest_contract::control::ran_once(exit)
+                );
+                assert_eq!(
+                    host.metrics.health.of(&app_id()).failures,
+                    [0; 8],
+                    "a program that ran once and ended did not fail"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn whose_guest_did_not_say_how_it_ended_is_failed() {
+            let _serial = ONE_HOST_AT_A_TIME.lock().await;
+            let host = test_host().await;
+            ended(
+                &host,
+                "the tenant could not be started at all; shutting the guest down".into(),
+            )
+            .await;
+
+            let record = host.state.record(&app_id()).await.unwrap();
+            assert_eq!(record.state, InstanceState::Failed);
+            assert_eq!(
+                record.last_exit_code,
+                Some(0),
+                "the microVM's own code, as before"
+            );
+        }
+
+        #[tokio::test]
+        async fn is_run_again_by_a_new_deployment() {
+            let _serial = ONE_HOST_AT_A_TIME.lock().await;
+            let host = test_host().await;
+            ended(&host, guest_contract::control::ran_once(TenantExit::Code(0))).await;
+            let redeployed = desired_state(|state| {
+                state.volumes = vec![desired_volume(|_| {})];
+                state.instances = vec![desired_instance(|instance| {
+                    instance.config.restart_policy.max_restarts = 0;
+                    instance.deployment_id = protocol::DeploymentId::parse("dep-2").unwrap();
+                })];
+            });
+
+            reconcile(host.arc(), &redeployed, Trigger::Change).await;
+
+            assert!(host.vms.calls().contains(&VmCall::Boot), "{:?}", host.vms.calls());
+            assert_ne!(
+                host.state.record(&app_id()).await.unwrap().state,
+                InstanceState::Exited
+            );
         }
     }
 }

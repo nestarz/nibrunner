@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use protocol::{
-    AppId, DesiredInstance, DesiredInstanceState, InstanceState, StateMessage, VolumeId, VolumeState,
+    AppId, DesiredInstance, DesiredInstanceState, InstanceState, StateMessage, TenantExit, VolumeId,
+    VolumeState,
 };
 
 use crate::adapters::vm::{VmExit, VmStatus, UNKNOWN_VM};
@@ -654,6 +655,22 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
     }
 }
 
+/// How the tenant of an instance given no restarts ended, read off the console of a guest that
+/// went down by itself. Read once: the state it settles the record in is kept, and a guest that
+/// said nothing of it is failed, as one with a budget would be.
+async fn ran_once(host: &Host, record: &InstanceRecord, status: &VmStatus) -> Option<TenantExit> {
+    let went_down_by_itself = !status.active && record.started_at.is_some() && !record.stop_requested;
+    let settled = matches!(record.state, InstanceState::Exited | InstanceState::Failed);
+    if record.restart_policy.max_restarts != 0 || !went_down_by_itself || settled {
+        return None;
+    }
+    host.vms
+        .guest_verdict(&record.app_id)
+        .await
+        .as_deref()
+        .and_then(guest_contract::control::ran_once_exit)
+}
+
 /// The sentence an unhealthy instance carries, and nothing for any other state.
 fn unwell(state: InstanceState, health: &HealthTracker, record: &InstanceRecord) -> Option<StateMessage> {
     (state == InstanceState::Unhealthy)
@@ -757,6 +774,7 @@ async fn settle(host: &Arc<Host>, record: InstanceRecord, status: VmStatus, due:
         record.health.clone()
     };
 
+    let ran_once = ran_once(host, &record, &status).await;
     let state = evaluate_instance_state(&LifecycleInputs {
         unit: &status,
         tracker: &health,
@@ -768,6 +786,7 @@ async fn settle(host: &Arc<Host>, record: InstanceRecord, status: VmStatus, due:
         started_at_ms: record.started_at.as_ref().map(protocol::Timestamp::epoch_ms),
         now_ms,
         current: record.state,
+        ran_once,
     });
 
     if state == record.state {
@@ -793,7 +812,10 @@ async fn settle(host: &Arc<Host>, record: InstanceRecord, status: VmStatus, due:
         InstanceState::Unhealthy => host.metrics.health.went_unhealthy(&record.app_id),
         _ => {}
     }
-    let message = verdict(host, state, &status, &health, &record).await;
+    let message = match ran_once {
+        Some(exit) => Some(StateMessage::new(guest_contract::control::ran_once(exit))),
+        None => verdict(host, state, &status, &health, &record).await,
+    };
     let exited = state == InstanceState::Failed && !status.active;
     // A guest that stayed up for the policy's resetAfterMs has earned its app a fresh window: the
     // boot after it owes no backoff and has the whole budget. One that exited sooner keeps its
@@ -810,7 +832,9 @@ async fn settle(host: &Arc<Host>, record: InstanceRecord, status: VmStatus, due:
             }
             latest.health = health;
             latest.state = state;
-            if let Some(exit) = status.exit.filter(|_| !status.active) {
+            if let Some(exit) = ran_once {
+                latest.last_exit_code = Some(exit.status());
+            } else if let Some(exit) = status.exit.filter(|_| !status.active) {
                 // A microVM killed under a signal has no exit code, and the code of an earlier
                 // exit is not this one's.
                 latest.last_exit_code = match exit {
