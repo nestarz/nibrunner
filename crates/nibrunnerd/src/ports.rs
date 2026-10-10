@@ -233,6 +233,8 @@ pub enum ArtifactError {
     NotAnImage { digest: Sha256Digest },
     #[error("{entry} is not in the archive {url} serves")]
     NotInArchive { url: DownloadUrl, entry: String },
+    #[error("{entry} in the archive {url} serves is not a regular file, so it is no program to run")]
+    NotAFile { url: DownloadUrl, entry: String },
     #[error("the layer image could not be built: {0}")]
     Unpackable(String),
 }
