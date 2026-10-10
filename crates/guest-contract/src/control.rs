@@ -1,3 +1,5 @@
+use protocol::TenantExit;
+
 pub const FREEZE_REQUEST: &str = "FREEZE\n";
 pub const FREEZE_HELD: &str = "OK";
 pub const TENANT_FREEZE_REQUEST: &str = "SLEEP";
@@ -12,6 +14,10 @@ pub const TENANT_CLOCK_RELEASED: &str = "OK";
 pub const GUEST_SHUTDOWN_GRACE_MS: u64 = 10_000;
 
 pub const GUEST_LOG_PREFIX: &str = "[nibrun] ";
+
+const RAN_ONCE: &str = "the tenant ran once and ";
+const EXITED_WITH_CODE: &str = "exited with code ";
+const KILLED_BY_SIGNAL: &str = "was killed by signal ";
 
 const KERNEL_PANIC: &str = "Kernel panic - not syncing: ";
 const KERNEL_REBOOT: &str = "reboot: ";
@@ -41,6 +47,29 @@ pub fn exit_reason(console: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The last line init writes for a tenant run once (`maxRestarts: 0`), which the host reads back
+/// off the console through [`exit_reason`] to report the instance exited with the tenant's own
+/// status rather than the microVM's.
+pub fn ran_once(exit: TenantExit) -> String {
+    match exit {
+        TenantExit::Code(code) => format!("{RAN_ONCE}{EXITED_WITH_CODE}{code}"),
+        TenantExit::Signal(signal) => format!("{RAN_ONCE}{KILLED_BY_SIGNAL}{signal}"),
+    }
+}
+
+/// How the tenant run once ended, when the guest's reason for going down is [`ran_once`]'s line.
+pub fn ran_once_exit(reason: &str) -> Option<TenantExit> {
+    let ended = reason.strip_prefix(RAN_ONCE)?;
+    if let Some(code) = ended.strip_prefix(EXITED_WITH_CODE) {
+        return code.parse().ok().map(TenantExit::Code);
+    }
+    ended
+        .strip_prefix(KILLED_BY_SIGNAL)?
+        .parse()
+        .ok()
+        .map(TenantExit::Signal)
 }
 
 // The kernel stamps its lines `[   15.736786] `; init's own `[nibrun] ` is not a stamp.
@@ -113,6 +142,34 @@ mod tests {
             None
         );
         assert_eq!(exit_reason(""), None);
+    }
+
+    #[test]
+    fn a_tenant_run_once_is_read_back_off_the_console_with_how_it_ended() {
+        for exit in [TenantExit::Code(0), TenantExit::Code(3), TenantExit::Signal(9)] {
+            let console = [
+                "[nibrun] starting /app/build as uid 65534 in /data, with 2990 MiB to spend".to_string(),
+                format!("{GUEST_LOG_PREFIX}{}", ran_once(exit)),
+                "[   15.736786] reboot: Restarting system".to_string(),
+                String::new(),
+            ]
+            .join("\n");
+            assert_eq!(
+                exit_reason(&console).as_deref().and_then(ran_once_exit),
+                Some(exit)
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_other_than_a_run_once_ending_carries_no_exit() {
+        for reason in [
+            "the tenant used its 5 restarts without staying up; shutting the guest down",
+            "the tenant ran once and exited with code three",
+            "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+        ] {
+            assert_eq!(ran_once_exit(reason), None, "{reason}");
+        }
     }
 
     #[test]

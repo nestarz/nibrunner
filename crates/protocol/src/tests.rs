@@ -219,6 +219,23 @@ fn a_report_written_before_a_tenant_had_ever_restarted_still_reads_back() {
 }
 
 #[test]
+fn a_program_run_once_that_ended_reads_as_exited_with_its_code() {
+    let reported = serde_json::json!({
+        "appId": "job-1",
+        "deploymentId": "dep-1",
+        "state": "exited",
+        "restartCount": 0,
+        "lastExitCode": 3
+    });
+    let read: ReportedInstance = serde_json::from_value(reported.clone()).unwrap();
+    assert_eq!(read.state, InstanceState::Exited);
+    assert_eq!(read.last_exit_code, Some(3));
+    assert_eq!(serde_json::to_value(&read).unwrap(), reported);
+    assert_eq!(InstanceState::Exited.as_str(), "exited");
+    assert!(INSTANCE_STATES.contains(&InstanceState::Exited));
+}
+
+#[test]
 fn a_tenant_restart_is_written_flat_with_how_the_tenant_ended_named_by_kind() {
     let restart = ReportedRestart {
         at: Timestamp::parse("2026-09-14T10:00:00.000Z").unwrap(),
@@ -937,6 +954,14 @@ mod schema {
         let document = reported_json();
         let errors: Vec<String> = validator.iter_errors(&document).map(|e| e.to_string()).collect();
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn the_reported_state_schema_accepts_an_exited_instance() {
+        let validator = validator(crate::schema::reported_state());
+        let document = with(reported_json(), "/instances/0/state", serde_json::json!("exited"));
+        assert!(serde_json::from_value::<HostReportedState>(document.clone()).is_ok());
+        assert!(validator.is_valid(&document));
     }
 
     #[test]
