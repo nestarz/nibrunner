@@ -59,7 +59,13 @@ pub struct StoredObject {
 /// all of them. The kind says what the object is, and so what the host does with it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[cfg_attr(feature = "schema", schemars(!try_from, transform = desired_layer_rules))]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    try_from = "DesiredLayerFields"
+)]
 pub enum DesiredLayer {
     /// A squashfs or ext4 image, attached as it was uploaded.
     Filesystem {
@@ -75,14 +81,105 @@ pub enum DesiredLayer {
     },
     /// One program the host fetches for itself from `url`, so that nothing has to be put in the
     /// store first. `digest` is the program's: of the response, or of `zipEntry` inside it when the
-    /// URL serves a zip. Nothing is made from the bytes before they match it.
+    /// URL serves a zip, or of `tarEntry` inside it when the URL serves a `.tar.xz`. Nothing is
+    /// made from the bytes before they match it. At most one of the two entries is named.
     DownloadedExecutable {
         url: DownloadUrl,
         digest: Sha256Digest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zip_entry: Option<ZipEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tar_entry: Option<TarEntry>,
         destination_path: ExecutablePath,
     },
+}
+
+// The same layer, read before it is checked: serde reads a tagged enum whole, so a downloaded
+// program that names two archives to look in is refused here rather than by whichever reader
+// happened to look first.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+enum DesiredLayerFields {
+    Filesystem {
+        #[serde(flatten)]
+        object: StoredObject,
+    },
+    Executable {
+        #[serde(flatten)]
+        object: StoredObject,
+        destination_path: ExecutablePath,
+    },
+    DownloadedExecutable {
+        url: DownloadUrl,
+        digest: Sha256Digest,
+        #[serde(default)]
+        zip_entry: Option<ZipEntry>,
+        #[serde(default)]
+        tar_entry: Option<TarEntry>,
+        destination_path: ExecutablePath,
+    },
+}
+
+impl TryFrom<DesiredLayerFields> for DesiredLayer {
+    type Error = InvalidValue;
+
+    fn try_from(fields: DesiredLayerFields) -> Result<Self, Self::Error> {
+        Ok(match fields {
+            DesiredLayerFields::Filesystem { object } => DesiredLayer::Filesystem { object },
+            DesiredLayerFields::Executable {
+                object,
+                destination_path,
+            } => DesiredLayer::Executable {
+                object,
+                destination_path,
+            },
+            DesiredLayerFields::DownloadedExecutable {
+                zip_entry: Some(_),
+                tar_entry: Some(_),
+                ..
+            } => {
+                return Err(InvalidValue::new_public(
+                    "a downloaded program is taken from a zipEntry or a tarEntry; name one",
+                ))
+            }
+            DesiredLayerFields::DownloadedExecutable {
+                url,
+                digest,
+                zip_entry,
+                tar_entry,
+                destination_path,
+            } => DesiredLayer::DownloadedExecutable {
+                url,
+                digest,
+                zip_entry,
+                tar_entry,
+                destination_path,
+            },
+        })
+    }
+}
+
+// What `TryFrom<DesiredLayerFields>` refuses, said in the schema's words.
+#[cfg(feature = "schema")]
+fn desired_layer_rules(schema: &mut schemars::Schema) {
+    let downloaded = schema
+        .get_mut("oneOf")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|kinds| {
+            kinds.iter_mut().find(|kind| {
+                kind.pointer("/properties/kind/const") == Some(&serde_json::json!("downloaded-executable"))
+            })
+        })
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(downloaded) = downloaded {
+        downloaded.insert(
+            "not".into(),
+            serde_json::json!({
+                "required": ["zipEntry", "tarEntry"],
+                "properties": { "zipEntry": { "type": "string" }, "tarEntry": { "type": "string" } }
+            }),
+        );
+    }
 }
 
 impl DesiredLayer {

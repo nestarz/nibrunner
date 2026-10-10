@@ -669,6 +669,41 @@ mod schema {
     }
 
     #[test]
+    fn archive_entry_schema_and_parser_agree_that_a_download_is_taken_from_at_most_one_archive() {
+        let validator = validator(crate::schema::desired_state());
+        let entries = |zip: Option<&str>, tar: Option<&str>| {
+            let mut layer = downloaded_layer_json();
+            if let Some(zip) = zip {
+                layer["zipEntry"] = zip.into();
+            }
+            if let Some(tar) = tar {
+                layer["tarEntry"] = tar.into();
+            }
+            with(desired_json(), "/instances/0/layers/1", layer)
+        };
+        let cases = [
+            (entries(None, None), true),
+            (entries(Some("tool"), None), true),
+            (entries(None, Some("zig-x86_64-linux-0.15.1/zig")), true),
+            (entries(Some("tool"), Some("tool")), false),
+            (entries(None, Some("/absolute/zig")), false),
+            (entries(None, Some("")), false),
+        ];
+        for (document, accepted) in cases {
+            assert_eq!(
+                serde_json::from_value::<HostDesiredState>(document.clone()).is_ok(),
+                accepted,
+                "the parser on {document}"
+            );
+            assert_eq!(
+                validator.is_valid(&document),
+                accepted,
+                "the schema on {document}"
+            );
+        }
+    }
+
+    #[test]
     fn the_desired_state_schema_accepts_what_the_parser_accepts() {
         let validator = validator(crate::schema::desired_state());
         let accepted = [
@@ -991,4 +1026,49 @@ fn instance_limits_are_optional_nonzero_and_strict() {
     assert!(serde_json::to_value(parsed).unwrap()["instances"][0]
         .get("limits")
         .is_none());
+}
+
+fn downloaded_layer_json() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "downloaded-executable",
+        "url": "https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz",
+        "digest": "d".repeat(64),
+        "destinationPath": "/opt/zig/zig"
+    })
+}
+
+#[test]
+fn a_program_inside_a_tar_xz_is_named_by_its_tar_entry_and_writes_back_as_it_was_read() {
+    let mut layer = downloaded_layer_json();
+    layer["tarEntry"] = "zig-x86_64-linux-0.15.1/zig".into();
+    let parsed: DesiredLayer = serde_json::from_value(layer.clone()).unwrap();
+    let DesiredLayer::DownloadedExecutable {
+        zip_entry, tar_entry, ..
+    } = &parsed
+    else {
+        panic!("read as another kind: {parsed:?}");
+    };
+    assert_eq!(zip_entry, &None);
+    assert_eq!(
+        tar_entry.as_ref().map(TarEntry::as_str),
+        Some("zig-x86_64-linux-0.15.1/zig")
+    );
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), layer);
+}
+
+#[test]
+fn a_downloaded_program_that_names_no_archive_says_nothing_of_either() {
+    let parsed: DesiredLayer = serde_json::from_value(downloaded_layer_json()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), downloaded_layer_json());
+}
+
+#[test]
+fn a_downloaded_program_named_inside_both_a_zip_and_a_tar_is_refused() {
+    let mut layer = downloaded_layer_json();
+    layer["zipEntry"] = "tool".into();
+    layer["tarEntry"] = "tool".into();
+    let refused = serde_json::from_value::<DesiredLayer>(layer)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("name one"), "{refused}");
 }
