@@ -302,7 +302,10 @@ fn plan_instances(desired: &HostDesiredState, observed: &ObservedState) -> Vec<I
             plan_instance(
                 wanted,
                 observed_by_id.get(&wanted.app_id).copied(),
-                lost_volumes.contains(&wanted.volume_id),
+                wanted
+                    .volume_id
+                    .as_ref()
+                    .is_some_and(|id| lost_volumes.contains(id)),
             )
         })
         .collect();
@@ -346,8 +349,12 @@ fn plan_volumes(desired: &HostDesiredState, observed: &ObservedState) -> Vec<Vol
             .or_default()
             .push(instance.app_id.clone());
     }
-    for instance in &desired.instances {
-        used_by.entry(instance.volume_id.clone()).or_default();
+    for volume_id in desired
+        .instances
+        .iter()
+        .filter_map(|instance| instance.volume_id.as_ref())
+    {
+        used_by.entry(volume_id.clone()).or_default();
     }
     // A volume the document no longer names goes the way an instance it no longer names does,
     // once nothing needs it: a running guest keeps its disk until the stop has landed, and an app
@@ -419,7 +426,7 @@ fn plan_volumes(desired: &HostDesiredState, observed: &ObservedState) -> Vec<Vol
             || wanted_apps.contains(&instance.app_id)
             || desired_ids.contains(id)
             || kept_for.contains(id)
-            || desired.instances.iter().any(|i| i.volume_id == *id)
+            || desired.instances.iter().any(|i| i.volume_id.as_ref() == Some(id))
             || observed
                 .instances
                 .iter()
@@ -934,7 +941,7 @@ mod tests {
                         desired_instance(|_| {}),
                         desired_instance(|instance| {
                             instance.app_id = AppId::parse("app-2").unwrap();
-                            instance.volume_id = VolumeId::parse("vol-2").unwrap();
+                            instance.volume_id = Some(VolumeId::parse("vol-2").unwrap());
                         }),
                     ]
                 }),
@@ -978,6 +985,52 @@ mod tests {
                     reason: InstanceStopReason::DesiredStopped
                 }]
             );
+        }
+    }
+
+    mod scratch {
+        use super::*;
+
+        fn scratch_instance() -> DesiredInstance {
+            desired_instance(|instance| {
+                instance.volume_id = None;
+                instance.scratch = Some(protocol::Scratch::Memory {
+                    mib: std::num::NonZeroU32::new(64).unwrap(),
+                });
+            })
+        }
+
+        #[test]
+        fn an_instance_with_a_scratch_is_started_with_no_volume_planned_for_it() {
+            let result = plan(
+                desired_state(|state| {
+                    state.volumes = vec![];
+                    state.instances = vec![scratch_instance()];
+                }),
+                observed_state(|_| {}),
+            );
+            assert!(result.volumes.is_empty(), "{:?}", result.volumes);
+            assert_eq!(
+                result.instances,
+                vec![InstancePlan::Start {
+                    desired: scratch_instance()
+                }]
+            );
+        }
+
+        #[test]
+        fn a_dead_disk_is_no_reason_to_recover_an_instance_that_writes_to_a_scratch() {
+            let result = plan(
+                desired_state(|state| {
+                    state.volumes = vec![];
+                    state.instances = vec![scratch_instance()];
+                }),
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| instance.volume_id = None)];
+                    state.volumes = vec![observed_volume(|volume| volume.attached = false)];
+                }),
+            );
+            assert_eq!(result.instances, vec![InstancePlan::None { app_id: app_id() }]);
         }
     }
 

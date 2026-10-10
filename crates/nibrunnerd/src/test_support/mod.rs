@@ -146,7 +146,8 @@ pub fn desired_instance(edit: impl FnOnce(&mut DesiredInstance)) -> DesiredInsta
     let mut value = DesiredInstance {
         app_id: app_id(),
         deployment_id: deployment_id(),
-        volume_id: volume_id(),
+        volume_id: Some(volume_id()),
+        scratch: None,
         desired_state: DesiredInstanceState::Running,
         idle_timeout_ms: None,
         expiry: None,
@@ -339,7 +340,7 @@ pub fn record_fields() -> RecordFields {
         ports: vec![],
         app_id: app_id(),
         deployment_id: deployment_id(),
-        volume_id: volume_id(),
+        volume_id: Some(volume_id()),
         hostnames: vec![app_hostname()],
         host_port: slot.host_port,
         http_port: DEFAULT_HTTP_PORT,

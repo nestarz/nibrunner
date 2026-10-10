@@ -3,15 +3,43 @@ title: Volumes
 description: What a volume starts with, where volumes are stored, and how to back one up.
 ---
 
-Every app has one volume. It is the writable top of the app's root filesystem: all writes go
-there, and it is the only thing that gets backed up. Declare it in `volumes` and point the
-instance at it with `volumeId`.
+An app has one volume or one scratch. Either is the writable top of the app's root filesystem: all
+writes go there. A volume is declared in `volumes`, pointed at with `volumeId`, and is the only
+thing that gets backed up. A scratch is named on the instance and is gone with its microVM.
 
 ```json
 "volumes": [
   { "volumeId": "vol-1", "appId": "app-1", "sizeBytes": 8589934592, "desiredState": "present" }
 ]
 ```
+
+## Scratch instead of a volume
+
+An instance that keeps nothing names `scratch` in place of `volumeId`, and the document lists no
+volume for it:
+
+```json
+"instances": [
+  { "appId": "app-1", "scratch": { "kind": "memory", "mib": 512 }, "...": "..." }
+]
+```
+
+| `kind` | Where the writes go | What it costs |
+| --- | --- | --- |
+| `memory` | A tmpfs of `mib` in the guest | The guest's memory: `mib` may not exceed `config.resources.memoryMib`, and what is written counts against the tenant's ceiling |
+| `disk` | A sparse ext4 file of `mib`, made under `paths.state_dir` | The host's disk, as it is written |
+
+- A scratch starts empty at every cold boot, so a restart, a replacement, a new `deploymentId` or
+  a stop and start all start from nothing.
+- It is kept through sleep and wake: a memory scratch is in the snapshot, and a disk scratch
+  stays on the host until the microVM is stopped.
+- It is never reported in `volumes`, never checkpointed and never exported.
+
+<Callout title="Sizing a memory scratch">
+  A memory scratch is part of the guest's RAM, so size `config.resources.memoryMib` — and
+  `limits.memoryMib`, if you set it — to hold the program and the scratch together. The host adds
+  nothing for it on its own.
+</Callout>
 
 ## Seeding a volume from an archive
 

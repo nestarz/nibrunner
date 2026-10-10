@@ -10,7 +10,7 @@ mod transport;
 use std::process::ExitCode;
 
 use guest_contract::instance_env::{parse_instance_env, InstanceConfig, CONFIG_MAX_BYTES};
-use guest_contract::paths;
+use guest_contract::paths::{self, WritableRoot};
 
 const TENANT_UMASK: libc::mode_t = 0o022;
 
@@ -110,17 +110,21 @@ fn write_resolv_conf(config: &InstanceConfig) -> Result<(), String> {
 }
 
 /// The root the program runs in: this image at the bottom, the document's layers over it in
-/// order, the volume writable over all of them.
+/// order, the volume or the scratch writable over all of them.
 fn stack_root(config: &InstanceConfig) -> Result<(), String> {
     let failed = |error: mounts::MountFailed| error.to_string();
     mounts::base(paths::BASE_MOUNT).map_err(failed)?;
     let mut lowers = vec![paths::BASE_MOUNT.to_string()];
     for index in 0..config.layers {
         let target = paths::layer_mount(index);
-        mounts::layer(&paths::layer_device(index), &target).map_err(failed)?;
+        mounts::layer(&paths::layer_device(index, config.writable), &target).map_err(failed)?;
         lowers.push(target);
     }
-    mounts::volume(paths::VOLUME_DEVICE, paths::VOLUME_MOUNT).map_err(failed)?;
+    match config.writable {
+        WritableRoot::VolumeDrive => mounts::volume(paths::VOLUME_DEVICE, paths::VOLUME_MOUNT),
+        WritableRoot::Memory { mib } => mounts::memory_scratch(mib, paths::VOLUME_MOUNT),
+    }
+    .map_err(failed)?;
     mounts::overlay(
         &lowers,
         paths::VOLUME_UPPER_DIR,
@@ -149,8 +153,12 @@ fn stack_root(config: &InstanceConfig) -> Result<(), String> {
         ));
     }
     log(&format!(
-        "root stacked: this image, {} layer(s), the volume on top",
-        config.layers
+        "root stacked: this image, {} layer(s), {} on top",
+        config.layers,
+        match config.writable {
+            WritableRoot::VolumeDrive => "the volume".to_string(),
+            WritableRoot::Memory { mib } => format!("a scratch of {mib} MiB in memory"),
+        }
     ));
     Ok(())
 }

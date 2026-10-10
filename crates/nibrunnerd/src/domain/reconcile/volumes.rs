@@ -23,7 +23,7 @@ pub fn volume_owners(
 ) -> BTreeMap<VolumeId, AppId> {
     let mut owners: BTreeMap<VolumeId, AppId> = records
         .values()
-        .map(|record| (record.volume_id.clone(), record.app_id.clone()))
+        .filter_map(|record| Some((record.volume_id.clone()?, record.app_id.clone())))
         .collect();
     for volume in &desired.volumes {
         owners.insert(volume.volume_id.clone(), volume.app_id.clone());
@@ -247,7 +247,9 @@ async fn tear_down_volume(host: &Host, desired: &protocol::DesiredVolume) {
     match torn_down {
         Ok(()) => {
             if host.state.record(&desired.app_id).await.is_some_and(|r| {
-                r.expired_at_ms.is_some() && r.volume_id == desired.volume_id && r.hostnames.is_empty()
+                r.expired_at_ms.is_some()
+                    && r.volume_id.as_ref() == Some(&desired.volume_id)
+                    && r.hostnames.is_empty()
             }) {
                 host.state.drop_record(&desired.app_id).await;
             }

@@ -1,11 +1,25 @@
 pub const CONFIG_DEVICE: &str = "/dev/vdb";
 pub const VOLUME_DEVICE: &str = "/dev/vdc";
 
-// vda, vdb and vdc are the three every guest has; the layers are the drives after them.
+// vda and vdb are the two every guest has, and vdc is the volume when there is a drive for it; the
+// layers are the drives after whichever came last.
 const FIRST_LAYER_DEVICE_INDEX: u8 = 3;
 
-pub fn layer_device(index: usize) -> String {
-    let letter = (b'a' + FIRST_LAYER_DEVICE_INDEX + index as u8) as char;
+/// Where the writable root comes from, and so where the layers start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritableRoot {
+    /// The volume drive at `VOLUME_DEVICE`: an app's volume, or a scratch on the host's disk.
+    VolumeDrive,
+    /// A tmpfs of this many MiB, and no drive for it.
+    Memory { mib: u32 },
+}
+
+pub fn layer_device(index: usize, writable: WritableRoot) -> String {
+    let first = match writable {
+        WritableRoot::VolumeDrive => FIRST_LAYER_DEVICE_INDEX,
+        WritableRoot::Memory { .. } => FIRST_LAYER_DEVICE_INDEX - 1,
+    };
+    let letter = (b'a' + first + index as u8) as char;
     format!("/dev/vd{letter}")
 }
 
@@ -34,3 +48,16 @@ pub const RESOLV_CONF: &str = "/mnt/root/etc/resolv.conf";
 
 pub const TENANT_UID: u32 = 65534;
 pub const TENANT_GID: u32 = 65534;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layers_follow_the_volume_drive_and_take_its_place_when_the_root_is_written_to_memory() {
+        assert_eq!(layer_device(0, WritableRoot::VolumeDrive), "/dev/vdd");
+        assert_eq!(layer_device(1, WritableRoot::VolumeDrive), "/dev/vde");
+        assert_eq!(layer_device(0, WritableRoot::Memory { mib: 64 }), VOLUME_DEVICE);
+        assert_eq!(layer_device(1, WritableRoot::Memory { mib: 64 }), "/dev/vdd");
+    }
+}

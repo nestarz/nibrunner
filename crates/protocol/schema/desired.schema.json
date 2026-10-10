@@ -285,9 +285,27 @@
             }
           ]
         },
+        "scratch": {
+          "description": "What the instance writes to when it has no volume.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scratch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "volumeId": {
-          "description": "One of this document's `volumes`, mounted in the guest as the app's data directory.",
-          "$ref": "#/$defs/VolumeId"
+          "description": "One of this document's `volumes`, stacked writable over the layers. Absent when `scratch`\nis named instead; one of the two always is.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "allOf": [
@@ -309,6 +327,20 @@
               }
             }
           }
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "volumeId"
+              ]
+            },
+            {
+              "required": [
+                "scratch"
+              ]
+            }
+          ]
         }
       ],
       "if": {
@@ -332,7 +364,6 @@
       "required": [
         "appId",
         "deploymentId",
-        "volumeId",
         "desiredState",
         "layers",
         "config",
@@ -375,7 +406,7 @@
       ]
     },
     "DesiredLayer": {
-      "description": "One read-only layer of the root filesystem an instance boots into. Layers stack in the order\nthe document lists them, first at the bottom, and the app's volume is stacked writable over\nall of them. The kind says what the object is, and so what the host does with it.",
+      "description": "One read-only layer of the root filesystem an instance boots into. Layers stack in the order\nthe document lists them, first at the bottom, and the app's volume — or its scratch — is\nstacked writable over all of them. The kind says what the object is, and so what the host does with it.",
       "oneOf": [
         {
           "description": "A squashfs or ext4 image, attached as it was uploaded.",
@@ -887,6 +918,49 @@
       "description": "between 1 and 128 printable characters, without spaces",
       "type": "string",
       "pattern": "^[\\x21-\\x7e]{1,128}$"
+    },
+    "Scratch": {
+      "description": "A writable root that lives and dies with the microVM, in place of a volume: it starts empty at\nevery cold boot, is kept through a sleep because the snapshot keeps what the guest held, and is\ngone once the instance is stopped, replaced or expired. It is never a volume: never reported,\nnever checkpointed, never exported.",
+      "oneOf": [
+        {
+          "description": "A tmpfs in the guest's own memory, so what is written to it is paid for out of\n`config.resources.memoryMib`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "memory"
+            },
+            "mib": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "kind",
+            "mib"
+          ]
+        },
+        {
+          "description": "A sparse ext4 file the host makes at every cold boot and deletes once the microVM is gone,\nso what is written to it costs the host's disk rather than the guest's memory.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "disk"
+            },
+            "mib": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "kind",
+            "mib"
+          ]
+        }
+      ]
     },
     "Sha256Digest": {
       "description": "a lowercase hex sha-256",

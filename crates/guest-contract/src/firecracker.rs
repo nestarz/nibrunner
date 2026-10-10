@@ -1,10 +1,12 @@
 use protocol::{InstanceResources, Ipv4Address};
 use serde::{Deserialize, Serialize};
 
-/// The drives every guest has, in the order they are attached: the host's root, the config
-/// image, the app's volume. The layers follow, one drive each, so these three sit at the same
-/// device however many there are.
-pub const FIXED_DRIVE_IDS: [&str; 3] = ["rootfs", "config", "data"];
+/// The drives every guest has, in the order they are attached: the host's root and the config
+/// image. The app's volume, or its scratch on disk, is the data drive after them; the layers follow,
+/// one drive each. A scratch in memory is no drive at all, so a guest that has one finds its layers
+/// one drive sooner, and the config drive tells it so.
+pub const FIXED_DRIVE_IDS: [&str; 2] = ["rootfs", "config"];
+pub const DATA_DRIVE_ID: &str = "data";
 
 pub fn layer_drive_id(index: usize) -> String {
     format!("layer{index}")
@@ -113,7 +115,8 @@ pub struct VmPaths {
     pub kernel_path: String,
     pub rootfs_path: String,
     pub instance_config_image_path: String,
-    pub data_device_path: String,
+    /// Absent for a guest whose writable root is a scratch in its own memory.
+    pub data_device_path: Option<String>,
     /// Bottom layer first, as the document listed them.
     pub layer_image_paths: Vec<String>,
 }
@@ -151,16 +154,16 @@ pub fn render_firecracker_config(
         drives: [
             read_only_drive(FIXED_DRIVE_IDS[0], &paths.rootfs_path, true),
             read_only_drive(FIXED_DRIVE_IDS[1], &paths.instance_config_image_path, false),
-            FirecrackerDrive {
-                drive_id: FIXED_DRIVE_IDS[2].to_string(),
-                path_on_host: paths.data_device_path.clone(),
-                is_root_device: false,
-                is_read_only: false,
-                cache_type: CacheType::Writeback,
-                io_engine: IoEngine::Sync,
-            },
         ]
         .into_iter()
+        .chain(paths.data_device_path.as_ref().map(|path| FirecrackerDrive {
+            drive_id: DATA_DRIVE_ID.to_string(),
+            path_on_host: path.clone(),
+            is_root_device: false,
+            is_read_only: false,
+            cache_type: CacheType::Writeback,
+            io_engine: IoEngine::Sync,
+        }))
         .chain(
             paths
                 .layer_image_paths
@@ -212,7 +215,7 @@ mod tests {
             kernel_path: "/opt/nibrun/bin/guest-image/vmlinux".into(),
             rootfs_path: "/opt/nibrun/bin/guest-image/rootfs.ext4".into(),
             instance_config_image_path: "/var/lib/nibrun/vm/inst-1/config.squashfs".into(),
-            data_device_path: "/dev/nbd3".into(),
+            data_device_path: Some("/dev/nbd3".into()),
             layer_image_paths: vec![
                 "/var/lib/nibrun/artifacts/base/layer.img".into(),
                 "/var/lib/nibrun/artifacts/abc/packed-0123456789abcdef.squashfs".into(),
@@ -244,16 +247,35 @@ mod tests {
             vec![
                 p.rootfs_path,
                 p.instance_config_image_path,
-                p.data_device_path,
+                p.data_device_path.unwrap(),
                 p.layer_image_paths[0].clone(),
                 p.layer_image_paths[1].clone(),
             ]
         );
         assert_eq!(rendered.drives.iter().filter(|d| d.is_root_device).count(), 1);
         assert!(rendered.drives[0].is_root_device);
-        for (index, drive) in rendered.drives[FIXED_DRIVE_IDS.len()..].iter().enumerate() {
+        for (index, drive) in rendered.drives[FIXED_DRIVE_IDS.len() + 1..].iter().enumerate() {
             assert_eq!(drive.drive_id, layer_drive_id(index));
         }
+    }
+
+    #[test]
+    fn a_guest_with_a_scratch_in_memory_has_no_data_drive_and_its_layers_come_one_drive_sooner() {
+        let rendered = render_firecracker_config(
+            DEFAULT_INSTANCE_RESOURCES,
+            &VmPaths {
+                data_device_path: None,
+                ..paths()
+            },
+            &network(),
+            &VmVsock {
+                guest_cid: 6,
+                path: "logs.vsock".into(),
+            },
+        );
+        let ids: Vec<&str> = rendered.drives.iter().map(|d| d.drive_id.as_str()).collect();
+        assert_eq!(ids, ["rootfs", "config", "layer0", "layer1"]);
+        assert!(rendered.drives.iter().all(|d| d.is_read_only));
     }
 
     #[test]
@@ -262,7 +284,7 @@ mod tests {
         let data = &drives[2];
         assert_eq!(data.cache_type, CacheType::Writeback);
         assert!(!data.is_read_only);
-        for drive in drives.iter().filter(|d| d.drive_id != "data") {
+        for drive in drives.iter().filter(|d| d.drive_id != DATA_DRIVE_ID) {
             assert!(drive.is_read_only, "{}", drive.drive_id);
             assert_eq!(drive.cache_type, CacheType::Unsafe);
         }
