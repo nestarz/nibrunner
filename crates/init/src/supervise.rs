@@ -8,6 +8,18 @@ pub(crate) enum Outcome {
     ShutdownRequested,
     RestartBudgetExhausted,
     SpawnFailed,
+    /// The tenant of a document that gave it no restarts ended; how is the instance's result.
+    RanOnce(TenantExit),
+}
+
+/// What the guest ends as once an exit of the tenant is not a restart: a program given no
+/// restarts was run once and is done, where one that had a budget spent it.
+pub(crate) fn ended(config: &InstanceConfig, exit: TenantExit) -> Outcome {
+    if config.max_restarts == 0 {
+        Outcome::RanOnce(exit)
+    } else {
+        Outcome::RestartBudgetExhausted
+    }
 }
 
 /// The restarts a tenant has spent of the budget its document gave it. A tenant that stays up
@@ -166,6 +178,24 @@ mod tests {
             budget.exited(&config, 0, TenantExit::Code(1), ""),
             None,
             "and stays spent"
+        );
+    }
+
+    #[test]
+    fn a_tenant_given_no_restarts_ran_once_and_ends_the_guest_with_how_it_exited() {
+        let config = config(|config| config.max_restarts = 0);
+        let mut budget = Budget::default();
+        for exit in [TenantExit::Code(0), TenantExit::Code(3), TenantExit::Signal(9)] {
+            assert_eq!(budget.exited(&config, 0, exit, ""), None);
+            assert_eq!(ended(&config, exit), Outcome::RanOnce(exit));
+        }
+    }
+
+    #[test]
+    fn a_tenant_that_spent_a_budget_it_had_did_not_run_once() {
+        assert_eq!(
+            ended(&config(|_| {}), TenantExit::Code(0)),
+            Outcome::RestartBudgetExhausted
         );
     }
 

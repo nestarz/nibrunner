@@ -450,6 +450,8 @@ pub struct ReportedInstance {
     /// The durable terminal-expiry decision; absent until this deployment expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expired_at: Option<Timestamp>,
+    /// For an `exited` instance, how its program ended: the code it exited with, or 128 plus the
+    /// signal that killed it. Otherwise the microVM's own exit code, when it went down by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

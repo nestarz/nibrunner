@@ -78,7 +78,7 @@ pub(crate) fn supervise(
             Watched::Exited { exit, because } => {
                 let uptime_ms = started.elapsed().as_millis() as u64;
                 let Some(restart) = budget.exited(config, uptime_ms, exit, &because) else {
-                    return Outcome::RestartBudgetExhausted;
+                    return crate::supervise::ended(config, exit);
                 };
                 announce(&restart, &mut forwarder);
                 if wait_for_signal(Duration::from_millis(restart.backoff_ms)) == Arrived::Shutdown {

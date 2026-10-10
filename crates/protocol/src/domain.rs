@@ -714,9 +714,14 @@ pub enum InstanceState {
     Idle,
     Expired,
     Failed,
+    /// A program run once (`maxRestarts: 0`) that ended on its own, whatever its exit status:
+    /// `lastExitCode` carries that status, and the instance is not started again until it is
+    /// deployed afresh. `failed` stays for a guest that never ran it, or went down without saying
+    /// how it ended.
+    Exited,
 }
 
-pub const INSTANCE_STATES: [InstanceState; 10] = [
+pub const INSTANCE_STATES: [InstanceState; 11] = [
     InstanceState::Pending,
     InstanceState::Starting,
     InstanceState::Running,
@@ -727,6 +732,7 @@ pub const INSTANCE_STATES: [InstanceState; 10] = [
     InstanceState::Idle,
     InstanceState::Expired,
     InstanceState::Failed,
+    InstanceState::Exited,
 ];
 
 impl InstanceState {
@@ -742,6 +748,7 @@ impl InstanceState {
             InstanceState::Idle => "idle",
             InstanceState::Expired => "expired",
             InstanceState::Failed => "failed",
+            InstanceState::Exited => "exited",
         }
     }
 }

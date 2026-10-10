@@ -1,4 +1,4 @@
-use protocol::{HealthCheck, HttpPort, InstanceState, Timestamp};
+use protocol::{HealthCheck, HttpPort, InstanceState, TenantExit, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::adapters::vm::VmStatus;
@@ -133,6 +133,8 @@ pub struct LifecycleInputs<'a> {
     pub started_at_ms: Option<i64>,
     pub now_ms: i64,
     pub current: InstanceState,
+    /// How the tenant ended, when its guest went down saying it had been run once.
+    pub ran_once: Option<TenantExit>,
 }
 
 fn evaluate_stopped_state(inputs: &LifecycleInputs<'_>) -> InstanceState {
@@ -143,6 +145,9 @@ fn evaluate_stopped_state(inputs: &LifecycleInputs<'_>) -> InstanceState {
     };
     if inputs.stop_requested || inputs.snapshotting || !inputs.desired_running {
         return down;
+    }
+    if inputs.ran_once.is_some() || inputs.current == InstanceState::Exited {
+        return InstanceState::Exited;
     }
     if inputs.started_at_ms.is_some() {
         return InstanceState::Failed;
@@ -295,6 +300,7 @@ mod tests {
         snapshotting: bool,
         started_at_ms: Option<i64>,
         current: InstanceState,
+        ran_once: Option<TenantExit>,
     }
 
     impl Default for Evaluate {
@@ -310,6 +316,7 @@ mod tests {
                 snapshotting: false,
                 started_at_ms: Some(STARTED_AT_MS),
                 current: InstanceState::Pending,
+                ran_once: None,
             }
         }
     }
@@ -326,6 +333,7 @@ mod tests {
             started_at_ms: inputs.started_at_ms,
             now_ms: inputs.now_ms,
             current: inputs.current,
+            ran_once: inputs.ran_once,
         })
     }
 
@@ -662,6 +670,44 @@ mod tests {
                 ..Default::default()
             }),
             InstanceState::Stopped
+        );
+    }
+
+    #[test]
+    fn a_program_run_once_that_ended_is_exited_rather_than_failed_and_stays_so() {
+        for exit in [TenantExit::Code(0), TenantExit::Code(3), TenantExit::Signal(9)] {
+            assert_eq!(
+                evaluate(Evaluate {
+                    unit: exited(),
+                    tracker: healthy_then(0),
+                    now_ms: past_grace(),
+                    current: InstanceState::Running,
+                    ran_once: Some(exit),
+                    ..Default::default()
+                }),
+                InstanceState::Exited
+            );
+        }
+        assert_eq!(
+            evaluate(Evaluate {
+                unit: exited(),
+                now_ms: past_grace(),
+                current: InstanceState::Exited,
+                ..Default::default()
+            }),
+            InstanceState::Exited,
+            "the console is read once, and the state it gave is kept"
+        );
+        assert_eq!(
+            evaluate(Evaluate {
+                unit: exited(),
+                now_ms: past_grace(),
+                stop_requested: true,
+                current: InstanceState::Exited,
+                ..Default::default()
+            }),
+            InstanceState::Stopped,
+            "a stop the document asked for is a stop"
         );
     }
 
