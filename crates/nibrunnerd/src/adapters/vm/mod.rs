@@ -4,6 +4,7 @@ pub mod layers;
 pub(crate) mod limits;
 pub mod manager;
 pub mod process;
+pub mod scratch;
 pub mod snapshot;
 mod startup;
 pub mod status;

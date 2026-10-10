@@ -72,6 +72,7 @@ pub(crate) fn config(edit: impl FnOnce(&mut InstanceConfig)) -> InstanceConfig {
     let mut value = InstanceConfig {
         http_port: 3000,
         layers: 1,
+        writable: guest_contract::paths::WritableRoot::VolumeDrive,
         program: "/app/server".to_string(),
         working_directory: "/app".to_string(),
         hostname: None,

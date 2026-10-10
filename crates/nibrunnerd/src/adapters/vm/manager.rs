@@ -17,10 +17,11 @@ use crate::adapters::vm::status::VmStatus;
 use crate::adapters::vm::time_sync;
 use crate::adapters::volumes::VolumeBackend;
 use crate::json_store::{make_directory, write_json};
-use crate::ports::{BootRequest, LogSink, SuspendRequest, VmError, Vmm};
+use crate::ports::{BootRequest, CommandRunner, LogSink, SuspendRequest, VmError, Vmm, Writable};
 use crate::state::SharedState;
 use guest_contract::firecracker::{render_firecracker_config, VmNetwork, VmPaths, VmVsock};
 use guest_contract::instance_env::{render_instance_env, InstanceEnvContent};
+use guest_contract::paths::WritableRoot;
 
 pub const FIRECRACKER_CONFIG_FILENAME: &str = "firecracker.json";
 pub const GUEST_KERNEL_FILENAME: &str = "vmlinux";
@@ -41,6 +42,7 @@ pub struct VmManager {
     pub processes: VmProcesses,
     pub network: Arc<dyn HostNetwork>,
     pub volumes: Arc<dyn VolumeBackend>,
+    pub commands: Arc<dyn CommandRunner>,
     pub logs: Arc<TenantLogReceiver>,
     pub cron_registration: Arc<crate::adapters::cron_registration::CronRegistrationReceiver>,
     pub sink: Arc<dyn LogSink>,
@@ -93,6 +95,22 @@ impl VmManager {
         let _ = std::fs::remove_dir_all(&paths.directory);
     }
 
+    // Beside the staged inputs rather than in the jail, which is rebuilt from them on every boot:
+    // the jailer binds it in as the writable data drive, as it does a volume's image.
+    fn scratch_disk_path(&self, app_id: &AppId) -> PathBuf {
+        self.vm_dir
+            .join(app_id.as_str())
+            .join(super::scratch::SCRATCH_DISK_FILENAME)
+    }
+
+    async fn fresh_scratch_disk(&self, app_id: &AppId, mib: std::num::NonZeroU32) -> Result<String, VmError> {
+        let path = self.scratch_disk_path(app_id);
+        super::scratch::make_disk(self.commands.as_ref(), &path, mib)
+            .await
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        Ok(path.display().to_string())
+    }
+
     async fn stage_inputs(&self, request: &BootRequest) -> Result<PathBuf, VmError> {
         let slot = &request.slot;
         let host = |error: crate::adapters::net::tap::NetworkError| VmError::Host(error.message());
@@ -116,9 +134,20 @@ impl VmManager {
         let working_dir = self.vm_dir.join(request.desired.app_id.as_str());
         make_directory(&working_dir, VM_DIR_MODE).map_err(|error| VmError::Host(error.to_string()))?;
 
+        let (data_device_path, writable) = match &request.writable {
+            Writable::Volume { device_path } => (Some(device_path.clone()), WritableRoot::VolumeDrive),
+            Writable::Scratch(protocol::Scratch::Disk { mib }) => (
+                Some(self.fresh_scratch_disk(&request.desired.app_id, *mib).await?),
+                WritableRoot::VolumeDrive,
+            ),
+            Writable::Scratch(protocol::Scratch::Memory { mib }) => {
+                (None, WritableRoot::Memory { mib: mib.get() })
+            }
+        };
         let rendered = render_instance_env(&InstanceEnvContent {
             http_port: request.desired.config.http_port,
             layers: request.payload.layer_image_paths.len(),
+            writable,
             hostnames: &request.desired.hostnames,
             program: &request.desired.config.command.program,
             working_directory: &request.desired.config.command.working_directory,
@@ -144,7 +173,7 @@ impl VmManager {
                     .display()
                     .to_string(),
                 instance_config_image_path: config_image.display().to_string(),
-                data_device_path: request.data_device_path.clone(),
+                data_device_path,
                 layer_image_paths: request
                     .payload
                     .layer_image_paths
@@ -636,6 +665,9 @@ impl Vmm for VmManager {
     async fn stop(&self, app_id: &AppId) -> Result<(), VmError> {
         self.discard_snapshot(app_id);
         self.processes.stop(app_id).await;
+        if let Err(error) = super::scratch::remove_disk(&self.scratch_disk_path(app_id)) {
+            tracing::warn!(%app_id, %error, "the scratch disk of a stopped microVM could not be deleted");
+        }
         Ok(())
     }
 
@@ -910,6 +942,7 @@ mod tests {
         _directory: tempfile::TempDir,
         manager: VmManager,
         network: mocks::NetworkSpy,
+        commands: mocks::CommandLog,
         state: SharedState,
     }
 
@@ -917,6 +950,7 @@ mod tests {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let root = directory.path();
         let (network, network_spy) = mocks::network();
+        let (commands, command_log) = mocks::commands_formatting();
         let state = HostState::shared();
         let manager = VmManager {
             start_permits: tokio::sync::Semaphore::new(2),
@@ -938,6 +972,7 @@ mod tests {
                     root.join("initial-contents"),
                 ),
             )),
+            commands,
             logs: TenantLogReceiver::new(),
             cron_registration: crate::adapters::cron_registration::CronRegistrationReceiver::new(Arc::new(
                 crate::domain::cron::registry::CronRegistry::new(
@@ -957,6 +992,7 @@ mod tests {
             _directory: directory,
             manager,
             network: network_spy,
+            commands: command_log,
             state,
         }
     }
@@ -1233,7 +1269,9 @@ mod tests {
         BootRequest {
             slot: nft_render::describe_slot(0, desired.app_id.clone()),
             desired,
-            data_device_path: "/dev/loop0".into(),
+            writable: Writable::Volume {
+                device_path: "/dev/loop0".into(),
+            },
             payload: crate::ports::PreparedPayload {
                 layer_image_paths: vec![PathBuf::from("/cache/abc/executable-0123456789abcdef.squashfs")],
                 fetched_bytes: 0,
@@ -1300,6 +1338,110 @@ mod tests {
         let written = config_drive(&fixture.manager.vm_dir.join(app_id().as_str()));
         assert!(written.contains("NIBRUN_HTTP_PORT=3000"));
         assert!(written.contains("NIBRUN_LAYERS=2\n"), "{written}");
+    }
+
+    fn scratch_request(scratch: protocol::Scratch) -> BootRequest {
+        BootRequest {
+            writable: Writable::Scratch(scratch),
+            ..boot_request(desired_instance(|instance| {
+                instance.volume_id = None;
+                instance.scratch = Some(scratch);
+            }))
+        }
+    }
+
+    fn mib(value: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(value).unwrap()
+    }
+
+    fn drive_paths(config_file: &Path) -> Vec<String> {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_file).unwrap()).unwrap();
+        config["drives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|drive| drive["path_on_host"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_memory_scratch_boots_with_no_data_drive_and_tells_the_guest_how_large_its_tmpfs_is() {
+        let fixture = fixture();
+        let request = scratch_request(protocol::Scratch::Memory { mib: mib(512) });
+        let config_file = fixture.manager.stage(&request).await.unwrap().config_file;
+
+        let drives = drive_paths(&config_file);
+        assert_eq!(drives.len(), 3, "{drives:?}");
+        assert!(drives[2].ends_with("executable-0123456789abcdef.squashfs"));
+        let written = config_drive(&fixture.manager.vm_dir.join(app_id().as_str()));
+        assert!(written.contains("NIBRUN_SCRATCH_MIB=512\n"), "{written}");
+        assert!(fixture.commands.commands().is_empty());
+        assert!(!fixture.manager.scratch_disk_path(&app_id()).exists());
+    }
+
+    #[tokio::test]
+    async fn a_disk_scratch_is_a_sparse_ext4_file_made_afresh_in_the_microvms_directory_at_every_boot() {
+        let fixture = fixture();
+        let request = scratch_request(protocol::Scratch::Disk { mib: mib(8192) });
+        let path = fixture.manager.scratch_disk_path(&app_id());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"what the last boot wrote").unwrap();
+
+        let config_file = fixture.manager.stage(&request).await.unwrap().config_file;
+
+        let drives = drive_paths(&config_file);
+        assert_eq!(drives[2], path.display().to_string());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192 * 1024 * 1024);
+        let mut head = [0u8; 24];
+        std::io::Read::read_exact(&mut std::fs::File::open(&path).unwrap(), &mut head).unwrap();
+        assert_eq!(head, [0u8; 24], "the last boot's bytes are gone");
+        let formats = fixture.commands.commands();
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0][0], "mke2fs");
+        assert_eq!(formats[0].last(), Some(&path.display().to_string()));
+        let written = config_drive(&fixture.manager.vm_dir.join(app_id().as_str()));
+        assert!(!written.contains("NIBRUN_SCRATCH_MIB"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn a_disk_scratch_that_cannot_be_formatted_refuses_the_boot() {
+        let mut fixture = fixture();
+        fixture.manager.commands = mocks::commands_answering(|request| {
+            Err(crate::ports::CommandError::failed(
+                request,
+                &crate::ports::CommandResult {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "no space left on device".into(),
+                },
+            ))
+        })
+        .0;
+        let Err(refused) = fixture
+            .manager
+            .stage(&scratch_request(protocol::Scratch::Disk { mib: mib(64) }))
+            .await
+        else {
+            panic!("a scratch disk that could not be formatted was booted");
+        };
+        let refused = refused.message();
+        assert!(refused.contains("scratch disk"), "{refused}");
+        assert!(refused.contains("no space left on device"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_microvm_leaves_no_scratch_disk_behind() {
+        let fixture = fixture();
+        fixture
+            .manager
+            .stage(&scratch_request(protocol::Scratch::Disk { mib: mib(64) }))
+            .await
+            .unwrap();
+        let path = fixture.manager.scratch_disk_path(&app_id());
+        assert!(path.exists());
+        fixture.manager.stop(&app_id()).await.unwrap();
+        assert!(!path.exists());
     }
 
     #[tokio::test]
