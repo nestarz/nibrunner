@@ -243,6 +243,14 @@ pub struct FilesystemConfig {
     pub socket: PathBuf,
 }
 
+/// Where a bundle is assembled, and the store it is put in. Absent on a host that writes none: an
+/// export is cut from a checkpoint, and only the zerofs backend cuts one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportsConfig {
+    pub store_url: String,
+    pub staging_dir: PathBuf,
+}
+
 /// How much of each app's output stays on disk. The newest `keep_bytes_per_app`, in two files:
 /// what the sink writes to, and the one before it. Nothing in this daemon reads them back; they
 /// are there for whoever tails them, and the cap is there because the disk they are on is the one
@@ -295,8 +303,7 @@ pub struct HostConfig {
     pub metrics: Option<MetricsConfig>,
     pub filesystem: Option<FilesystemConfig>,
     pub logs: LogsConfig,
-    pub export_store_url: String,
-    pub export_staging_dir: PathBuf,
+    pub exports: Option<ExportsConfig>,
 }
 
 impl HostConfig {
@@ -370,6 +377,12 @@ mod file {
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     #[schemars(rename = "HostConfig")]
+    #[schemars(extend(
+        "if" = {
+            "properties": { "volumes": { "properties": { "backend": { "const": "zerofs" } } } }
+        },
+        "then" = { "required": ["exports"] }
+    ))]
     pub(super) struct ConfigFile {
         /// Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,7 +410,9 @@ mod file {
         pub(super) artifacts: Option<Artifacts>,
         /// Where volumes live, and how.
         pub(super) volumes: Option<Volumes>,
-        /// Where a checkpoint goes when the document asks for it as a bundle.
+        /// Where a checkpoint goes when the document asks for it as a bundle. Required by the
+        /// `zerofs` backend; absent on `local-file`, which cuts no checkpoint to export.
+        #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) exports: Option<Exports>,
         /// What a guest is denied, by name.
         pub(super) network: Option<Network>,
@@ -794,7 +809,16 @@ impl HostConfig {
         };
 
         let network = required("network", document.network.as_ref())?;
-        let exports = required("exports", document.exports.as_ref())?;
+        let exports = match document.exports.as_ref() {
+            Some(exports) => Some(exports_config(exports)?),
+            None if backend.zerofs().is_some() => {
+                return Err(ConfigError::invalid(
+                    "exports",
+                    "specified, and the zerofs backend writes its bundles where it says",
+                ))
+            }
+            None => None,
+        };
         let artifacts = required("artifacts", document.artifacts.as_ref())?;
 
         let proxy = proxy(document.proxy.as_ref(), max_apps)?;
@@ -850,11 +874,7 @@ impl HostConfig {
             metrics,
             filesystem,
             logs,
-            export_store_url: object_store_url(
-                "exports.store_url",
-                required_str("exports.store_url", &exports.store_url)?,
-            )?,
-            export_staging_dir: path_key("exports.staging_dir", &exports.staging_dir)?,
+            exports,
             state_dir,
             runtime_dir,
         })
@@ -916,8 +936,10 @@ impl HostConfig {
             max_concurrent_vm_starts: None,
             vm_budgets: None,
             logs: LogsConfig::default(),
-            export_store_url: state_dir.join("export-store").display().to_string(),
-            export_staging_dir: state_dir.join("exports"),
+            exports: Some(ExportsConfig {
+                store_url: state_dir.join("export-store").display().to_string(),
+                staging_dir: state_dir.join("exports"),
+            }),
             state_dir,
             runtime_dir,
         }
@@ -1007,8 +1029,10 @@ impl HostConfig {
                 apps: Default::default(),
             }),
             logs: LogsConfig::default(),
-            export_store_url: "s3://nibrunner-exports-eu-west-2-123456789012/exports".to_string(),
-            export_staging_dir: PathBuf::from("/var/lib/nibrunner/exports"),
+            exports: Some(ExportsConfig {
+                store_url: "s3://nibrunner-exports-eu-west-2-123456789012/exports".to_string(),
+                staging_dir: PathBuf::from("/var/lib/nibrunner/exports"),
+            }),
         }
     }
 
@@ -1071,9 +1095,9 @@ impl HostConfig {
                     checkpoint_cache_dir: text(&settings.checkpoint_cache_dir),
                 }),
             }),
-            exports: Some(file::Exports {
-                store_url: Some(self.export_store_url.clone()),
-                staging_dir: text(&self.export_staging_dir),
+            exports: self.exports.as_ref().map(|exports| file::Exports {
+                store_url: Some(exports.store_url.clone()),
+                staging_dir: text(&exports.staging_dir),
             }),
             network: Some(file::Network {
                 host_tcp: (!self.allowed_host_tcp_endpoints.is_empty()).then(|| file::HostTcp {
@@ -1337,6 +1361,16 @@ fn logs(document: Option<&file::Logs>) -> Result<LogsConfig, ConfigError> {
 
 /// Nothing this daemon reads has a value it may leave out: a key that is here is a key the
 /// configuration states, so absence is never a second meaning to work out at startup.
+fn exports_config(exports: &file::Exports) -> Result<ExportsConfig, ConfigError> {
+    Ok(ExportsConfig {
+        store_url: object_store_url(
+            "exports.store_url",
+            required_str("exports.store_url", &exports.store_url)?,
+        )?,
+        staging_dir: path_key("exports.staging_dir", &exports.staging_dir)?,
+    })
+}
+
 fn required<T>(field: &str, value: Option<T>) -> Result<T, ConfigError> {
     value.ok_or_else(|| ConfigError::invalid(field, "specified, and nothing here is optional"))
 }
@@ -1528,8 +1562,8 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// The smallest document this daemon accepts. Every key it reads is in here, because there is
-    /// no key it will supply for itself, so a test about one key starts from the whole document.
+    /// A document with every key this daemon reads in it, because there is no key it will supply
+    /// for itself, so a test about one key starts from the whole document.
     const WHOLE: &str = r#"max_apps = 1000
 
 [paths]
@@ -1724,15 +1758,35 @@ denied_egress_addresses_v6 = []
 
     #[test]
     fn a_section_this_daemon_reads_is_refused_when_the_document_has_none() {
-        for section in ["paths", "artifacts", "volumes", "exports", "network"] {
-            let stripped: String = WHOLE
-                .split("\n\n")
-                .filter(|block| !block.starts_with(&format!("[{section}]")))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let message = refused(&stripped);
+        for section in ["paths", "artifacts", "volumes", "network"] {
+            let message = refused(&without_section(WHOLE, section));
             assert!(message.contains(section), "{section}: {message}");
         }
+    }
+
+    fn without_section(text: &str, section: &str) -> String {
+        text.split("\n\n")
+            .filter(|block| !block.starts_with(&format!("[{section}]")))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    #[test]
+    fn a_local_file_host_with_no_exports_section_starts_and_writes_no_export() {
+        let config = parsed(&without_section(WHOLE, "exports"));
+        assert_eq!(config.volumes, VolumeBackend::LocalFile);
+        assert_eq!(config.exports, None);
+        assert!(!config.to_toml().contains("[exports]"));
+    }
+
+    #[test]
+    fn a_zerofs_host_with_no_exports_section_is_refused_by_name() {
+        let message = refused(&without_section(
+            &document(&[("volumes.backend", "\"zerofs\"")], ZEROFS),
+            "exports",
+        ));
+        assert!(message.contains("exports"), "{message}");
+        assert!(message.contains("zerofs"), "{message}");
     }
 
     #[test]
@@ -2121,7 +2175,10 @@ denied_egress_addresses_v6 = []
             "s3://nibrun/artifacts"
         );
         assert_eq!(
-            parsed(&document(&[("exports.store_url", "\"s3://nibrun-exports\"")], "")).export_store_url,
+            parsed(&document(&[("exports.store_url", "\"s3://nibrun-exports\"")], ""))
+                .exports
+                .unwrap()
+                .store_url,
             "s3://nibrun-exports"
         );
     }
@@ -2251,13 +2308,15 @@ checkpoint_cache_dir = "/data/zerofs-checkpoint"
     #[test]
     fn a_finished_bundle_is_never_kept_inside_the_tree_the_reap_removes() {
         for staging in ["\"/var/lib/nibrunner/exports\"", "\"/mnt/scratch/exports\""] {
-            let config = parsed(&document(&[("exports.staging_dir", staging)], ""));
-            let store = PathBuf::from(&config.export_store_url);
+            let exports = parsed(&document(&[("exports.staging_dir", staging)], ""))
+                .exports
+                .unwrap();
+            let store = PathBuf::from(&exports.store_url);
             assert!(
-                !store.starts_with(&config.export_staging_dir),
+                !store.starts_with(&exports.staging_dir),
                 "{} is inside {}",
                 store.display(),
-                config.export_staging_dir.display()
+                exports.staging_dir.display()
             );
         }
     }
@@ -2357,7 +2416,7 @@ checkpoint_cache_dir = "/data/zerofs-checkpoint"
             config.logs_dir(),
             config.desired_state_file.clone(),
             config.versions_file.clone(),
-            config.export_staging_dir.clone(),
+            config.exports.clone().unwrap().staging_dir,
             config.firecracker_dir.clone(),
         ] {
             assert!(
@@ -2516,6 +2575,7 @@ keep_mib_per_app = 64
             let validator = validator();
             let accepted = [
                 whole(),
+                without_section(WHOLE, "exports"),
                 zerofs(ZEROFS),
                 HostConfig::starter(320).to_toml(),
                 HostConfig::example().to_toml(),
@@ -2598,6 +2658,7 @@ keep_mib_per_app = 64
                 zerofs(""),
                 zerofs(&ZEROFS.replace("cache_disk_gib = 70", "cache_disk_gib = 0")),
                 zerofs(&ZEROFS.replace("s3://filesystems-one/host-1", "filesystems/host-1")),
+                without_section(&zerofs(ZEROFS), "exports"),
             ]);
             for text in broken {
                 HostConfig::from_toml(&text).expect_err(&text);

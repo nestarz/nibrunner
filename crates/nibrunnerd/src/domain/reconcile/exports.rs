@@ -6,6 +6,7 @@ use protocol::{
 use crate::domain::exports::bundle::{dump_volume, write_bundle};
 use crate::domain::exports::freeze::frozen;
 use crate::domain::exports::reader::ReaderDevice;
+use crate::domain::exports::store::ExportStore;
 use crate::domain::metrics::passes::Trigger;
 use crate::domain::metrics::resources::Operation;
 use crate::domain::reconcile::plan::{ExportPlan, ObservedExport, ReconcilePlan};
@@ -70,10 +71,17 @@ async fn write(host: &Host, desired: &DesiredExport) -> ReportedExport {
             "its id does not make a checkpoint name".to_string(),
         );
     };
-    let staging_dir = host.config.export_staging_dir.join(desired.export_id.as_str());
+    let (Some(settings), Some(store)) = (&host.config.exports, &host.exports) else {
+        return failed(
+            desired,
+            None,
+            "this host has no [exports] section in its config.toml, so it writes no bundle".to_string(),
+        );
+    };
+    let staging_dir = settings.staging_dir.join(desired.export_id.as_str());
 
     let writing = std::time::Instant::now();
-    let written = write_inner(host, desired, &checkpoint_id, &staging_dir).await;
+    let written = write_inner(host, store.as_ref(), desired, &checkpoint_id, &staging_dir).await;
     host.metrics
         .resources
         .done(Operation::ExportWrite, written.is_ok(), writing.elapsed());
@@ -103,6 +111,7 @@ async fn write(host: &Host, desired: &DesiredExport) -> ReportedExport {
 
 async fn write_inner(
     host: &Host,
+    store: &dyn ExportStore,
     desired: &DesiredExport,
     checkpoint_id: &CheckpointId,
     staging_dir: &std::path::Path,
@@ -147,7 +156,7 @@ async fn write_inner(
     read?;
 
     let bundle = write_bundle(desired.environment.as_ref(), staging_dir).map_err(|error| error.message())?;
-    host.exports
+    store
         .upload(&bundle.path, &desired.object_key)
         .await
         .map_err(|error| error.message())?;
@@ -215,7 +224,9 @@ async fn reap(host: &Host, plan: &ReconcilePlan) {
     if orphans.is_empty() {
         return;
     }
-    let _ = std::fs::remove_dir_all(&host.config.export_staging_dir);
+    if let Some(exports) = &host.config.exports {
+        let _ = std::fs::remove_dir_all(&exports.staging_dir);
+    }
     let _ = host
         .nbd
         .detach(&nft_render::export_reader_device_path(host.config.max_apps))
@@ -291,6 +302,28 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, ExportState::Failed);
         assert!(host.exports_written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_configured_with_no_exports_refuses_the_export_by_name_before_the_tenant_is_frozen() {
+        let mut volumes = crate::adapters::volumes::MockVolumeBackend::new();
+        volumes.expect_observe_checkpoints().returning(Vec::new);
+        volumes.expect_flush().never();
+        volumes.expect_create_checkpoint().never();
+        let mut host = host_over(volumes).await;
+        let unconfigured = std::sync::Arc::get_mut(&mut host.host).expect("nothing else holds this host yet");
+        unconfigured.config.exports = None;
+        unconfigured.exports = None;
+        let plan = asked_for(host.arc(), vec![wanted(DesiredPresence::Present)]).await;
+
+        apply_exports(host.arc(), &plan, Trigger::Change).await;
+
+        let reports = host.state.snapshot().await.export_reports;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, ExportState::Failed);
+        assert_eq!(reports[0].checkpoint_id, None);
+        let message = reports[0].message.as_ref().unwrap().as_str();
+        assert!(message.contains("[exports]"), "{message}");
     }
 
     #[tokio::test]

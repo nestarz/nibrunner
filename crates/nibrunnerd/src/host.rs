@@ -37,7 +37,7 @@ pub struct Host {
     pub artifacts: Arc<dyn ArtifactStore>,
     pub payloads: Arc<dyn PayloadBuilder>,
     pub repositories: crate::repositories::Repositories,
-    pub exports: Arc<dyn ExportStore>,
+    pub exports: Option<Arc<dyn ExportStore>>,
     pub checkpoint_servers: Option<CheckpointServers>,
     pub nbd: NbdDevices,
     pub commands: Arc<dyn CommandRunner>,

@@ -176,10 +176,15 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         )
     });
 
-    let exports: Arc<dyn crate::domain::exports::store::ExportStore> = Arc::new(
-        crate::domain::exports::store::ObjectExportStore::open(&config.export_store_url)
-            .map_err(|error| StartupError::Config(error.message()))?,
-    );
+    let exports = config
+        .exports
+        .as_ref()
+        .map(|exports| {
+            crate::domain::exports::store::ObjectExportStore::open(&exports.store_url)
+                .map(|store| Arc::new(store) as Arc<dyn crate::domain::exports::store::ExportStore>)
+        })
+        .transpose()
+        .map_err(|error| StartupError::Config(error.message()))?;
     let tls = config
         .proxy
         .http

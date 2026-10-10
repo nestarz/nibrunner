@@ -282,8 +282,10 @@ fn directories(config: &HostConfig) -> Vec<PathBuf> {
         config.state_dir.clone(),
         config.snapshot_dir.clone(),
         config.guest_image_dir.clone(),
-        config.export_staging_dir.clone(),
     ];
+    if let Some(exports) = &config.exports {
+        directories.push(exports.staging_dir.clone());
+    }
     if let Some(settings) = config.volumes.zerofs() {
         directories.push(settings.cache_dir.clone());
         directories.push(settings.checkpoint_cache_dir.clone());
