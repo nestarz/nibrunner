@@ -232,6 +232,24 @@ pub(crate) fn volume(device: &str, target: &str) -> Result<(), MountFailed> {
     )
 }
 
+fn memory_scratch_options(mib: u32) -> String {
+    format!("mode=0755,size={mib}m")
+}
+
+/// The writable root of a guest with no volume. A tmpfs, so it costs the guest's memory, goes with
+/// the guest, and is kept through a sleep only because the snapshot keeps that memory.
+pub(crate) fn memory_scratch(mib: u32, target: &str) -> Result<(), MountFailed> {
+    mounted(
+        "the scratch",
+        "tmpfs",
+        target,
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME,
+        Some(&memory_scratch_options(mib)),
+        Existing::Refuse,
+    )
+}
+
 /// `lowers` bottom first, the way the document lists layers; overlayfs wants the top first.
 pub(crate) fn overlay(lowers: &[String], upper: &str, work: &str, target: &str) -> Result<(), MountFailed> {
     ensure_directory(upper, 0o755)?;
@@ -347,4 +365,14 @@ fn wait_for_device(path: &str) -> Result<(), MountFailed> {
         target: path.to_string(),
         reason: "it never appeared, so it was never attached".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_memory_scratch_is_bounded_by_the_mib_the_document_gave_it() {
+        assert_eq!(memory_scratch_options(512), "mode=0755,size=512m");
+    }
 }

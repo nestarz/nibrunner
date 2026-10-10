@@ -692,6 +692,48 @@ async fn a_volume_is_formatted_holding_the_contents_the_document_gave_it() {
     );
 }
 
+// A disk scratch is a file the guest formats nothing on: the real tool has to leave a filesystem
+// the guest mounts, and leave it sparse, or every job would cost its whole scratch at boot.
+#[tokio::test]
+async fn a_disk_scratch_is_an_ext4_filesystem_that_costs_the_host_only_what_is_written_to_it() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join(nibrunnerd::adapters::vm::scratch::SCRATCH_DISK_FILENAME);
+    std::fs::write(&path, b"what the last boot wrote").unwrap();
+
+    nibrunnerd::adapters::vm::scratch::make_disk(
+        commands().as_ref(),
+        &path,
+        std::num::NonZeroU32::new(1024).unwrap(),
+    )
+    .await
+    .expect("the scratch is made");
+
+    let made = std::fs::metadata(&path).unwrap();
+    assert_eq!(made.len(), 1024 * 1024 * 1024);
+    assert!(
+        made.blocks() * 512 < made.len() / 8,
+        "{} bytes allocated for a fresh scratch",
+        made.blocks() * 512
+    );
+    let stats = debugfs(&path, "stats").await;
+    assert!(stats.contains("0xEF53"), "{stats}");
+    assert!(
+        stats.contains("has_journal") || stats.contains("extent"),
+        "{stats}"
+    );
+
+    nibrunnerd::adapters::vm::scratch::remove_disk(&path).unwrap();
+    assert!(!path.exists());
+    nibrunnerd::adapters::vm::scratch::remove_disk(&path).expect("a scratch already gone is no error");
+}
+
 #[tokio::test]
 async fn the_isolation_ruleset_loads_into_the_kernel() {
     if !enabled() {

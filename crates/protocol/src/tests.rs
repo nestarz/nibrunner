@@ -669,6 +669,62 @@ mod schema {
     }
 
     #[test]
+    fn scratch_schema_and_parser_agree_that_an_instance_writes_to_exactly_one_place() {
+        let validator = validator(crate::schema::desired_state());
+        let memory = serde_json::json!({ "kind": "memory", "mib": 128 });
+        let disk = serde_json::json!({ "kind": "disk", "mib": 8192 });
+        let cases = [
+            (desired_json(), true),
+            (
+                with(
+                    without(desired_json(), "/instances/0/volumeId"),
+                    "/instances/0/scratch",
+                    memory.clone(),
+                ),
+                true,
+            ),
+            (
+                with(
+                    without(desired_json(), "/instances/0/volumeId"),
+                    "/instances/0/scratch",
+                    disk.clone(),
+                ),
+                true,
+            ),
+            (with(desired_json(), "/instances/0/scratch", memory), false),
+            (without(desired_json(), "/instances/0/volumeId"), false),
+            (
+                with(
+                    without(desired_json(), "/instances/0/volumeId"),
+                    "/instances/0/scratch",
+                    serde_json::json!({ "kind": "disk", "mib": 0 }),
+                ),
+                false,
+            ),
+            (
+                with(
+                    without(desired_json(), "/instances/0/volumeId"),
+                    "/instances/0/scratch",
+                    serde_json::json!({ "kind": "tape", "mib": 1 }),
+                ),
+                false,
+            ),
+        ];
+        for (document, accepted) in cases {
+            assert_eq!(
+                serde_json::from_value::<HostDesiredState>(document.clone()).is_ok(),
+                accepted,
+                "the parser on {document}"
+            );
+            assert_eq!(
+                validator.is_valid(&document),
+                accepted,
+                "the schema on {document}"
+            );
+        }
+    }
+
+    #[test]
     fn the_desired_state_schema_accepts_what_the_parser_accepts() {
         let validator = validator(crate::schema::desired_state());
         let accepted = [
@@ -991,4 +1047,72 @@ fn instance_limits_are_optional_nonzero_and_strict() {
     assert!(serde_json::to_value(parsed).unwrap()["instances"][0]
         .get("limits")
         .is_none());
+}
+
+fn scratch_instance(scratch: serde_json::Value) -> serde_json::Value {
+    instance_with(|instance| {
+        instance.as_object_mut().unwrap().remove("volumeId");
+        instance["scratch"] = scratch;
+    })
+}
+
+#[test]
+fn an_instance_with_a_scratch_names_no_volume_and_writes_back_as_it_was_read() {
+    for (scratch, expected) in [
+        (
+            serde_json::json!({ "kind": "memory", "mib": 128 }),
+            Scratch::Memory {
+                mib: std::num::NonZeroU32::new(128).unwrap(),
+            },
+        ),
+        (
+            serde_json::json!({ "kind": "disk", "mib": 8192 }),
+            Scratch::Disk {
+                mib: std::num::NonZeroU32::new(8192).unwrap(),
+            },
+        ),
+    ] {
+        let instance = read(scratch_instance(scratch.clone())).unwrap();
+        assert_eq!(instance.volume_id, None);
+        assert_eq!(instance.scratch, Some(expected));
+        let written = serde_json::to_value(&instance).unwrap();
+        assert!(written.get("volumeId").is_none());
+        assert_eq!(written["scratch"], scratch);
+    }
+}
+
+#[test]
+fn a_document_written_before_scratch_existed_still_names_its_volume() {
+    let instance = read(instance_json()).unwrap();
+    assert_eq!(instance.volume_id, Some(VolumeId::parse("vol-1").unwrap()));
+    assert_eq!(instance.scratch, None);
+    assert!(serde_json::to_value(&instance).unwrap().get("scratch").is_none());
+}
+
+#[test]
+fn an_instance_writes_to_a_volume_or_a_scratch_and_never_to_both_or_neither() {
+    let both =
+        instance_with(|instance| instance["scratch"] = serde_json::json!({ "kind": "disk", "mib": 64 }));
+    let refused = read(both).unwrap_err().to_string();
+    assert!(refused.contains("name one"), "{refused}");
+    let neither = instance_with(|instance| {
+        instance.as_object_mut().unwrap().remove("volumeId");
+    });
+    let refused = read(neither).unwrap_err().to_string();
+    assert!(refused.contains("volumeId or a scratch"), "{refused}");
+}
+
+#[test]
+fn a_memory_scratch_larger_than_the_guest_is_refused_and_a_disk_one_is_not() {
+    let memory = scratch_instance(serde_json::json!({ "kind": "memory", "mib": 257 }));
+    let refused = read(memory).unwrap_err().to_string();
+    assert!(refused.contains("257 MiB cannot fit in the 256 MiB"), "{refused}");
+    read(scratch_instance(
+        serde_json::json!({ "kind": "memory", "mib": 256 }),
+    ))
+    .unwrap();
+    read(scratch_instance(
+        serde_json::json!({ "kind": "disk", "mib": 257 }),
+    ))
+    .unwrap();
 }

@@ -55,8 +55,8 @@ pub struct StoredObject {
 }
 
 /// One read-only layer of the root filesystem an instance boots into. Layers stack in the order
-/// the document lists them, first at the bottom, and the app's volume is stacked writable over
-/// all of them. The kind says what the object is, and so what the host does with it.
+/// the document lists them, first at the bottom, and the app's volume — or its scratch — is
+/// stacked writable over all of them. The kind says what the object is, and so what the host does with it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
@@ -122,6 +122,30 @@ validated_string!(
     }
 );
 
+/// A writable root that lives and dies with the microVM, in place of a volume: it starts empty at
+/// every cold boot, is kept through a sleep because the snapshot keeps what the guest held, and is
+/// gone once the instance is stopped, replaced or expired. It is never a volume: never reported,
+/// never checkpointed, never exported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+pub enum Scratch {
+    /// A tmpfs in the guest's own memory, so what is written to it is paid for out of
+    /// `config.resources.memoryMib`.
+    Memory { mib: std::num::NonZeroU32 },
+    /// A sparse ext4 file the host makes at every cold boot and deletes once the microVM is gone,
+    /// so what is written to it costs the host's disk rather than the guest's memory.
+    Disk { mib: std::num::NonZeroU32 },
+}
+
+impl Scratch {
+    pub fn mib(self) -> std::num::NonZeroU32 {
+        match self {
+            Scratch::Memory { mib } | Scratch::Disk { mib } => mib,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(!try_from, transform = desired_instance_rules))]
@@ -131,8 +155,13 @@ pub struct DesiredInstance {
     /// A running instance is replaced when this changes, and only then: a new layer or config
     /// under the same `deploymentId` is not picked up.
     pub deployment_id: DeploymentId,
-    /// One of this document's `volumes`, mounted in the guest as the app's data directory.
-    pub volume_id: VolumeId,
+    /// One of this document's `volumes`, stacked writable over the layers. Absent when `scratch`
+    /// is named instead; one of the two always is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<VolumeId>,
+    /// What the instance writes to when it has no volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<Scratch>,
     pub desired_state: DesiredInstanceState,
     /// How long an `on-request` instance stays up after its last request before it sleeps: the
     /// older spelling of `activation.sleepWhen`, refused beside it. 300000 when neither is named.
@@ -180,7 +209,10 @@ impl DesiredInstance {
 struct DesiredInstanceFields {
     app_id: AppId,
     deployment_id: DeploymentId,
-    volume_id: VolumeId,
+    #[serde(default)]
+    volume_id: Option<VolumeId>,
+    #[serde(default)]
+    scratch: Option<Scratch>,
     desired_state: DesiredInstanceState,
     #[serde(default)]
     idle_timeout_ms: Option<IdleTimeoutMs>,
@@ -218,6 +250,25 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
                 ));
             }
         }
+        match (&fields.volume_id, fields.scratch) {
+            (Some(_), Some(_)) => {
+                return Err(InvalidValue::new_public(
+                    "volumeId and scratch both say what an instance writes to; name one",
+                ))
+            }
+            (None, None) => {
+                return Err(InvalidValue::new_public(
+                    "an instance names a volumeId or a scratch, because its root has to be written somewhere",
+                ))
+            }
+            (None, Some(Scratch::Memory { mib })) if mib.get() > fields.config.resources.memory_mib => {
+                return Err(InvalidValue::new_public(&format!(
+                    "a memory scratch of {mib} MiB cannot fit in the {} MiB the guest is given",
+                    fields.config.resources.memory_mib
+                )))
+            }
+            _ => {}
+        }
         if fields.layers.is_empty() {
             return Err(InvalidValue::new_public(
                 "an instance names at least one layer, because a microVM boots from something",
@@ -232,6 +283,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             app_id: fields.app_id,
             deployment_id: fields.deployment_id,
             volume_id: fields.volume_id,
+            scratch: fields.scratch,
             desired_state: fields.desired_state,
             idle_timeout_ms: fields.idle_timeout_ms,
             activation: fields.activation,
@@ -248,7 +300,13 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
 // passes is one this host takes.
 #[cfg(feature = "schema")]
 fn desired_instance_rules(schema: &mut schemars::Schema) {
-    schema.insert("allOf".into(), serde_json::json!([{ "if": { "required": ["expiry"], "properties": {"expiry": {"type":"object"}} }, "then": { "properties": {"desiredState": {"const":"on-request"}} } }]));
+    schema.insert(
+        "allOf".into(),
+        serde_json::json!([
+            { "if": { "required": ["expiry"], "properties": {"expiry": {"type":"object"}} }, "then": { "properties": {"desiredState": {"const":"on-request"}} } },
+            { "oneOf": [{ "required": ["volumeId"] }, { "required": ["scratch"] }] }
+        ]),
+    );
     schema.insert(
         "not".into(),
         serde_json::json!({ "required": ["activation", "idleTimeoutMs"] }),

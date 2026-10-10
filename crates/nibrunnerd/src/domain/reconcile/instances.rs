@@ -20,7 +20,7 @@ use crate::domain::metrics::sleep_wake::SleepOutcome;
 use crate::domain::reconcile::plan::{InstancePlan, ReconcilePlan};
 use crate::domain::report::instance_record::{InstanceRecord, RecordFields};
 use crate::host::Host;
-use crate::ports::{BootRequest, SuspendRequest, VmError, WakeFailure, WakeOutcome, WakeRefusal};
+use crate::ports::{BootRequest, SuspendRequest, VmError, WakeFailure, WakeOutcome, WakeRefusal, Writable};
 
 /// The host ports a slot hands this app's extra ports, in the order the document named them.
 ///
@@ -290,6 +290,41 @@ async fn volume_refusal(host: &Host, volume_id: &VolumeId) -> Option<StateMessag
         })
 }
 
+/// The device the volume is attached at, or why it could not be.
+async fn attach_volume(
+    host: &Host,
+    desired: &DesiredInstance,
+    volume_id: &VolumeId,
+) -> Result<String, String> {
+    let attaching = std::time::Instant::now();
+    let attached = host.volumes.attach(volume_id, &desired.app_id).await;
+    host.metrics
+        .resources
+        .done(Operation::VolumeAttach, attached.is_ok(), attaching.elapsed());
+    attached
+        .map(|attached| attached.device_path)
+        .map_err(|error| error.message())
+}
+
+async fn writable_for(host: &Host, desired: &DesiredInstance) -> Result<Writable, String> {
+    match (&desired.volume_id, desired.scratch) {
+        (Some(volume_id), _) => {
+            let device_path = attach_volume(host, desired, volume_id).await?;
+            let attached_at = now_ms();
+            converge::stamp(&host.state, &desired.app_id, |deploy| {
+                deploy.volume_ready_at_ms = Some(attached_at);
+            })
+            .await;
+            Ok(Writable::Volume { device_path })
+        }
+        (None, Some(scratch)) => Ok(Writable::Scratch(scratch)),
+        (None, None) => Err(format!(
+            "{} names neither a volume nor a scratch, so its root has nowhere to be written",
+            desired.app_id
+        )),
+    }
+}
+
 pub async fn sleep_instance(host: &Host, desired: &DesiredInstance) {
     let Ok(slot) = host.slot_for(&desired.app_id).await else {
         tracing::error!(app_id = %desired.app_id, "this host has no slot left to answer for the app");
@@ -443,7 +478,11 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     // leaves it attached but bare) is nothing to boot onto: the guest would only die failing to
     // mount it. The fault is the volume's, so no start attempt is spent on it, and the app is
     // started the pass the volume is put right.
-    if let Some(refusal) = volume_refusal(host, &desired.volume_id).await {
+    let refused_volume = match &desired.volume_id {
+        Some(volume_id) => volume_refusal(host, volume_id).await,
+        None => None,
+    };
+    if let Some(refusal) = refused_volume {
         attempted.state = InstanceState::Failed;
         host.state.put_record(attempted).await;
         if say(host, &desired.app_id, refusal.clone()).await {
@@ -467,29 +506,17 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     let booted = match host.payloads.prepare(&desired.layers).await {
         Err(error) => Err((Failure::Layers, error.message())),
         Ok(payload) => {
-            let attaching = std::time::Instant::now();
-            let attached = host.volumes.attach(&desired.volume_id, &desired.app_id).await;
-            host.metrics
-                .resources
-                .done(Operation::VolumeAttach, attached.is_ok(), attaching.elapsed());
-            let data_device_path = match attached {
-                Ok(attached) => {
-                    let attached_at = now_ms();
-                    converge::stamp(&host.state, &desired.app_id, |deploy| {
-                        deploy.volume_ready_at_ms = Some(attached_at);
-                    })
-                    .await;
-                    attached.device_path
-                }
-                Err(error) => {
+            let writable = match writable_for(host, desired).await {
+                Ok(writable) => writable,
+                Err(reason) => {
                     host.state
                         .update_record(&desired.app_id, |record| {
                             record.state = InstanceState::Failed;
-                            record.message = Some(StateMessage::new(error.message()));
+                            record.message = Some(StateMessage::new(reason.clone()));
                         })
                         .await;
                     host.metrics.health.failed(&desired.app_id, Failure::Volume);
-                    tracing::error!(app_id = %desired.app_id, error = %error.message(), "instance start failed");
+                    tracing::error!(app_id = %desired.app_id, error = %reason, "instance start failed");
                     return;
                 }
             };
@@ -498,7 +525,7 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
                 .boot(BootRequest {
                     desired: desired.clone(),
                     slot,
-                    data_device_path,
+                    writable,
                     payload,
                 })
                 .await;
@@ -579,24 +606,21 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
 
     // The snapshot carries the guest's page cache, so a guest restored onto a device that no
     // longer answers serves reads from memory and only finds out when it writes. The device is
-    // made to answer first — re-attached if it does not — or the wake is refused.
-    let attaching = std::time::Instant::now();
-    let attached = host.volumes.attach(&desired.volume_id, &desired.app_id).await;
-    host.metrics
-        .resources
-        .done(Operation::VolumeAttach, attached.is_ok(), attaching.elapsed());
-    if let Err(error) = attached {
-        let reason = error.message();
-        host.state
-            .update_record(&desired.app_id, |record| {
-                record.message = Some(StateMessage::new(reason.clone()));
-            })
-            .await;
-        tracing::error!(app_id = %desired.app_id, reason, "wake refused: the volume is not usable");
-        return Err(WakeRefusal::Failed {
-            kind: WakeFailure::VolumeUnusable,
-            reason,
-        });
+    // made to answer first — re-attached if it does not — or the wake is refused. A scratch is
+    // the hypervisor's own and was never let go of.
+    if let Some(volume_id) = &desired.volume_id {
+        if let Err(reason) = attach_volume(host, desired, volume_id).await {
+            host.state
+                .update_record(&desired.app_id, |record| {
+                    record.message = Some(StateMessage::new(reason.clone()));
+                })
+                .await;
+            tracing::error!(app_id = %desired.app_id, reason, "wake refused: the volume is not usable");
+            return Err(WakeRefusal::Failed {
+                kind: WakeFailure::VolumeUnusable,
+                reason,
+            });
+        }
     }
 
     host.state.mark_active(&desired.app_id, now_ms()).await;
@@ -1421,6 +1445,59 @@ mod tests {
         let settled = host.state.record(&app_id()).await.unwrap();
         assert_eq!(settled.state, InstanceState::Failed);
         assert_eq!(settled.message.as_ref(), Some(&refusal));
+    }
+
+    fn scratch_instance() -> DesiredInstance {
+        desired_instance(|instance| {
+            instance.volume_id = None;
+            instance.scratch = Some(protocol::Scratch::Disk {
+                mib: std::num::NonZeroU32::new(64).unwrap(),
+            });
+        })
+    }
+
+    #[tokio::test]
+    async fn an_app_with_a_scratch_boots_without_a_volume_and_without_a_record_of_one() {
+        let host = test_host().await;
+
+        start_instance(&host, &scratch_instance()).await;
+
+        assert_eq!(host.vms.calls(), vec![crate::ports::VmCall::Boot]);
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Starting);
+        assert_eq!(record.volume_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_volume_report_does_not_hold_back_an_app_that_writes_to_a_scratch() {
+        let host = test_host().await;
+        host.state
+            .modify(|snapshot| {
+                snapshot.volume_reports = vec![reported_volume(|report| {
+                    report.state = protocol::VolumeState::Failed;
+                })]
+            })
+            .await;
+
+        start_instance(&host, &scratch_instance()).await;
+
+        assert_eq!(host.vms.calls(), vec![crate::ports::VmCall::Boot]);
+    }
+
+    #[tokio::test]
+    async fn an_app_that_names_neither_a_volume_nor_a_scratch_is_refused_rather_than_booted() {
+        let host = test_host().await;
+
+        start_instance(&host, &desired_instance(|instance| instance.volume_id = None)).await;
+
+        assert!(host.vms.calls().is_empty());
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Failed);
+        assert!(record
+            .message
+            .unwrap()
+            .as_str()
+            .contains("neither a volume nor a scratch"));
     }
 
     #[tokio::test]

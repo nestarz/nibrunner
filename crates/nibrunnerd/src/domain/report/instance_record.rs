@@ -22,7 +22,9 @@ pub struct RecordPort {
 pub struct InstanceRecord {
     pub app_id: AppId,
     pub deployment_id: DeploymentId,
-    pub volume_id: VolumeId,
+    /// Absent for an instance that writes to a scratch, which nothing outlives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<VolumeId>,
     pub hostnames: Vec<AppHostname>,
     pub host_port: HostPort,
     pub http_port: HttpPort,
@@ -78,7 +80,7 @@ fn default_restart_policy() -> RestartPolicy {
 pub struct RecordFields {
     pub app_id: AppId,
     pub deployment_id: DeploymentId,
-    pub volume_id: VolumeId,
+    pub volume_id: Option<VolumeId>,
     pub hostnames: Vec<AppHostname>,
     pub host_port: HostPort,
     pub http_port: HttpPort,
@@ -204,7 +206,7 @@ mod tests {
     fn redeployed() -> RecordFields {
         let mut fields = record_fields();
         fields.deployment_id = DeploymentId::parse("dep-2").unwrap();
-        fields.volume_id = VolumeId::parse("vol-2").unwrap();
+        fields.volume_id = Some(VolumeId::parse("vol-2").unwrap());
         fields.hostnames = vec![];
         fields.host_port = HostPort::new(23_456).unwrap();
         fields.http_port = HttpPort::new(9_001).unwrap();

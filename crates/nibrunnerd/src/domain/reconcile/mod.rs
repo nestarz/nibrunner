@@ -39,7 +39,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                 let record = snapshot.records.get(app_id);
                 ObservedInstance {
                     app_id: app_id.clone(),
-                    volume_id: record.map(|record| record.volume_id.clone()),
+                    volume_id: record.and_then(|record| record.volume_id.clone()),
                     deployment_id: record.map(|record| record.deployment_id.clone()),
                     present: status.loaded || record.is_some(),
                     expired: record.is_some_and(|record| record.expired_at_ms.is_some()),
@@ -1277,7 +1277,7 @@ mod tests {
                 }));
                 state.instances.push(desired_instance(|instance| {
                     instance.app_id = nth_app(n);
-                    instance.volume_id = volume_id;
+                    instance.volume_id = Some(volume_id);
                     instance.desired_state = DesiredInstanceState::OnRequest;
                 }));
             }

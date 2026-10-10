@@ -3,6 +3,8 @@ use protocol::{
     TenantEnvironment,
 };
 
+use crate::paths::WritableRoot;
+
 pub const INSTANCE_ENV_FILENAME: &str = "instance.env";
 pub const INSTANCE_CONFIG_IMAGE: &str = "config.squashfs";
 
@@ -14,8 +16,9 @@ const DNS_SERVERS: [&str; 2] = ["1.1.1.1", "1.0.0.1"];
 #[derive(Debug, Clone)]
 pub struct InstanceEnvContent<'a> {
     pub http_port: HttpPort,
-    /// How many layer drives follow the three every guest has.
+    /// How many layer drives follow the ones every guest has.
     pub layers: usize,
+    pub writable: WritableRoot,
     pub hostnames: &'a [AppHostname],
     pub program: &'a GuestPath,
     pub working_directory: &'a GuestPath,
@@ -56,6 +59,9 @@ pub fn render_instance_env(content: &InstanceEnvContent<'_>) -> Result<String, U
         format!("{RUNTIME_PREFIX}PROGRAM={}", content.program),
         format!("{RUNTIME_PREFIX}CWD={}", content.working_directory),
     ];
+    if let WritableRoot::Memory { mib } = content.writable {
+        lines.push(format!("{RUNTIME_PREFIX}SCRATCH_MIB={mib}"));
+    }
     if let Some(hostname) = platform_hostname(content.hostnames) {
         lines.push(format!("{RUNTIME_PREFIX}HOSTNAME={hostname}"));
     }
@@ -118,6 +124,7 @@ pub const CONFIG_MAX_BYTES: usize = 128 * 1024;
 pub struct InstanceConfig {
     pub http_port: u32,
     pub layers: usize,
+    pub writable: WritableRoot,
     pub program: String,
     pub working_directory: String,
     pub hostname: Option<String>,
@@ -253,6 +260,13 @@ pub fn parse_instance_env(text: &str) -> Result<InstanceConfig, InstanceEnvError
     Ok(InstanceConfig {
         http_port: number("NIBRUN_HTTP_PORT")?,
         layers: number("NIBRUN_LAYERS")? as usize,
+        // Absent from what a host that predates scratch writes, which always attached a volume.
+        writable: match named("NIBRUN_SCRATCH_MIB") {
+            None => WritableRoot::VolumeDrive,
+            Some(_) => WritableRoot::Memory {
+                mib: number("NIBRUN_SCRATCH_MIB")?,
+            },
+        },
         program: required("NIBRUN_PROGRAM")?.clone(),
         working_directory: required("NIBRUN_CWD")?.clone(),
         hostname: named("NIBRUN_HOSTNAME").cloned(),
@@ -314,6 +328,7 @@ mod tests {
 
     struct Overrides {
         http_port: HttpPort,
+        writable: WritableRoot,
         hostnames: Vec<AppHostname>,
         args: Vec<String>,
         environment: TenantEnvironment,
@@ -323,6 +338,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 http_port: DEFAULT_HTTP_PORT,
+                writable: WritableRoot::VolumeDrive,
                 hostnames: vec![hostname(PLATFORM_HOSTNAME, AppHostnameKind::Platform)],
                 args: vec![],
                 environment: TenantEnvironment::default(),
@@ -335,6 +351,7 @@ mod tests {
         render_instance_env(&InstanceEnvContent {
             http_port: overrides.http_port,
             layers: 1,
+            writable: overrides.writable,
             hostnames: &overrides.hostnames,
             program: &GuestPath::parse("/app/server").unwrap(),
             working_directory: &GuestPath::parse("/app").unwrap(),
@@ -366,6 +383,35 @@ mod tests {
             "NIBRUN_DNS=1.1.1.1,1.0.0.1",
         ];
         assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn a_scratch_in_memory_is_written_beside_the_layers_and_read_back_as_the_writable_root() {
+        let rendered = render(Overrides {
+            writable: WritableRoot::Memory { mib: 512 },
+            ..Default::default()
+        });
+        assert!(
+            rendered.contains("NIBRUN_CWD=/app\nNIBRUN_SCRATCH_MIB=512\n"),
+            "{rendered}"
+        );
+        let config = parse_instance_env(&rendered).unwrap();
+        assert_eq!(config.writable, WritableRoot::Memory { mib: 512 });
+        assert!(config
+            .tenant_environment()
+            .iter()
+            .all(|(name, _)| !name.contains("SCRATCH")));
+    }
+
+    #[test]
+    fn a_config_drive_that_names_no_scratch_is_read_as_one_with_a_volume_drive() {
+        let config = parse_instance_env(&render(Overrides::default())).unwrap();
+        assert_eq!(config.writable, WritableRoot::VolumeDrive);
+        let malformed = render(Overrides::default()) + "NIBRUN_SCRATCH_MIB=lots\n";
+        assert!(matches!(
+            parse_instance_env(&malformed),
+            Err(InstanceEnvError::Malformed { key, .. }) if key == "NIBRUN_SCRATCH_MIB"
+        ));
     }
 
     #[test]
@@ -498,6 +544,7 @@ mod both_ends {
         render_instance_env(&InstanceEnvContent {
             http_port: DEFAULT_HTTP_PORT,
             layers: 2,
+            writable: WritableRoot::VolumeDrive,
             hostnames: &hostnames,
             program: &GuestPath::parse("/app/server").unwrap(),
             working_directory: &GuestPath::parse("/app").unwrap(),
