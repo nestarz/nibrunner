@@ -373,6 +373,15 @@ validated_string!(
     { "minLength": 1, "maxLength": MAX_ZIP_ENTRY_LENGTH, "pattern": "^[^/]" }
 );
 
+validated_string!(
+    /// The path of one file inside a `.tar.xz`, as the archive names it.
+    TarEntry,
+    "tar entry",
+    "a relative path of between 1 and 512 characters",
+    |value| !value.is_empty() && value.len() <= MAX_ZIP_ENTRY_LENGTH && !value.starts_with('/'),
+    { "minLength": 1, "maxLength": MAX_ZIP_ENTRY_LENGTH, "pattern": "^[^/]" }
+);
+
 pub const MAX_STATE_MESSAGE_LENGTH: usize = 512;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
