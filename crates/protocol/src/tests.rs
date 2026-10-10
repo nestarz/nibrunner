@@ -81,6 +81,20 @@ fn a_desired_state_round_trips_with_its_wire_names() {
 }
 
 #[test]
+fn a_document_that_names_no_max_apps_leaves_the_host_to_its_configuration_and_writes_none_back() {
+    let parsed: HostDesiredState = serde_json::from_value(desired_json()).expect("parses");
+    assert_eq!(parsed.max_apps, None);
+    let written = serde_json::to_value(&parsed).expect("serialises");
+    assert!(written.get("maxApps").is_none());
+
+    let mut document = desired_json();
+    document["maxApps"] = serde_json::json!(128);
+    let parsed: HostDesiredState = serde_json::from_value(document).expect("parses");
+    assert_eq!(parsed.max_apps, Some(128));
+    assert_eq!(serde_json::to_value(&parsed).expect("serialises")["maxApps"], 128);
+}
+
+#[test]
 fn a_volume_that_starts_empty_says_nothing_about_it() {
     let mut document = desired_json();
     document["volumes"][0]

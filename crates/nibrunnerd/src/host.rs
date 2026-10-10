@@ -242,6 +242,22 @@ impl Host {
         self.allocator.lock().await.lookup(app_id)
     }
 
+    /// Widens the slot ring to the document's `maxApps`. It never narrows: a slot handed out stays
+    /// addressable until the daemon restarts on a ring that no longer reaches it.
+    pub async fn widen_slots(&self, desired: &protocol::HostDesiredState) {
+        let Some(asked) = desired.max_apps else {
+            return;
+        };
+        match self.config.widened_to(asked) {
+            Ok(max_apps) => self.allocator.lock().await.grow(max_apps),
+            Err(error) => tracing::warn!(
+                error = %error.message(),
+                max_apps = self.config.max_apps,
+                "the desired state's maxApps is not taken up; the host keeps the slots config.toml lays it out for"
+            ),
+        }
+    }
+
     pub async fn slots(&self) -> Vec<nft_render::AppSlot> {
         self.allocator.lock().await.slots()
     }
@@ -324,6 +340,11 @@ impl Host {
             .unwrap_or_default();
 
         let held = records.len();
+        // Before the restore, which drops every slot past the ring: a document that widened it
+        // handed out slots the configuration alone does not reach.
+        if let Some(document) = &accepted {
+            self.widen_slots(&document.desired).await;
+        }
         self.allocator.lock().await.restore(assignments, cursor);
         self.state
             .modify(|snapshot| {
@@ -582,6 +603,27 @@ mod tests {
         let snapshot = host.state.snapshot().await;
         assert_eq!(snapshot.last_active_at_ms.get(&app_id()), Some(&77));
         assert!(snapshot.deleted_volumes.contains_key(&volume_id()));
+    }
+
+    #[tokio::test]
+    async fn a_slot_past_max_apps_that_a_document_widened_the_ring_to_is_kept_across_a_restart() {
+        let host = test_host().await;
+        let past = host.config.max_apps;
+        let document = accepted_document(desired_state(|state| state.max_apps = Some(past + 1)));
+        host.remember_accepted_document(&document).await;
+        host.widen_slots(&document.desired).await;
+        let app = protocol::AppId::parse("past-the-file").unwrap();
+        host.allocator
+            .lock()
+            .await
+            .restore(BTreeMap::from([(app.clone(), past)]), 0);
+        host.persist().await;
+
+        *host.allocator.lock().await =
+            crate::adapters::net::allocator::SlotAllocator::addressing(host.config.max_apps);
+        host.load().await;
+
+        assert_eq!(host.slot_of(&app).await.map(|slot| slot.slot), Some(past));
     }
 
     #[tokio::test]

@@ -117,6 +117,7 @@ impl ConvergeController {
 
     /// What moved, when the document did; nothing when it stood still.
     async fn accept(&self, desired: &HostDesiredState) -> Option<Changes> {
+        self.host.widen_slots(desired).await;
         let mut cache = self.host.cache.lock().await;
         let changes = cache.changes_in(desired);
         self.host.runtime_policy.replace_instances(&desired.instances);
@@ -189,6 +190,26 @@ mod tests {
             host.runtime_policy.vm_budget(&app_id()).unwrap().memory_mib.get(),
             desired.instances[0].config.resources.memory_mib + 64
         );
+    }
+
+    #[tokio::test]
+    async fn a_document_asking_for_more_apps_than_max_apps_widens_the_ring_in_place_and_never_narrows_it() {
+        let host = test_host().await;
+        let controller = controller(&host, MockReconcileService::new());
+        let configured = host.config.max_apps;
+
+        controller
+            .accept(&desired_state(|state| state.max_apps = Some(configured + 64)))
+            .await;
+        assert_eq!(host.allocator.lock().await.limit(), configured + 64);
+
+        controller
+            .accept(&desired_state(|state| state.max_apps = Some(configured + 1)))
+            .await;
+        controller
+            .accept(&desired_state(|state| state.max_apps = None))
+            .await;
+        assert_eq!(host.allocator.lock().await.limit(), configured + 64);
     }
 
     #[tokio::test]
