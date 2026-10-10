@@ -6,6 +6,10 @@ name: kvm-gate
 # `gh workflow run kvm-gate.yml --ref <branch>`.
 on:
   workflow_dispatch:
+  # A dispatch finds only workflows the default branch carries, and this one is not there yet.
+  push:
+    branches:
+      - mf/v5-candidate
 
 permissions:
   contents: read
