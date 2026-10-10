@@ -124,6 +124,7 @@ impl ConvergeController {
         &self,
         desired: &HostDesiredState,
     ) -> Result<Option<Changes>, crate::domain::cron::registry::CronRegistryError> {
+        self.host.widen_slots(desired).await;
         let changes = {
             let mut cache = self.host.cache.lock().await;
             let deployments = desired
@@ -266,6 +267,29 @@ mod tests {
         reconciler.expect_reconcile().times(0);
         assert!(!controller(&host, reconciler).converge_once().await);
         assert_eq!(host.cache.lock().await.latest(), Some(&previous));
+    }
+
+    #[tokio::test]
+    async fn a_document_asking_for_more_apps_than_max_apps_widens_the_ring_in_place_and_never_narrows_it() {
+        let host = test_host().await;
+        let controller = controller(&host, MockReconcileService::new());
+        let configured = host.config.max_apps;
+
+        controller
+            .accept(&desired_state(|state| state.max_apps = Some(configured + 64)))
+            .await
+            .unwrap();
+        assert_eq!(host.allocator.lock().await.limit(), configured + 64);
+
+        controller
+            .accept(&desired_state(|state| state.max_apps = Some(configured + 1)))
+            .await
+            .unwrap();
+        controller
+            .accept(&desired_state(|state| state.max_apps = None))
+            .await
+            .unwrap();
+        assert_eq!(host.allocator.lock().await.limit(), configured + 64);
     }
 
     #[tokio::test]

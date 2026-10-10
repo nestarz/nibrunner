@@ -235,7 +235,7 @@ static EXPORT_SIZE_BYTES: Metric = Metric {
 
 static SLOTS: Metric = Metric {
     name: "nibrunner_slots",
-    help: "Slots on this host: each holds an app's ports, tap and guest address, and an app with none is refused. The total is max_apps in config.toml.",
+    help: "Slots on this host: each holds an app's ports, tap and guest address, and an app with none is refused. The total is max_apps in config.toml, or the desired state's maxApps when that is more.",
     kind: Kind::Gauge,
     labels: &["of"],
 };

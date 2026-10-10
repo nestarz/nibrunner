@@ -66,6 +66,7 @@ impl Jailer {
             Identities {
                 uid_base: 100_000,
                 gid_base: 100_000,
+                slots: 65_536,
             },
         );
         jailer.fake_preparation = true;
@@ -73,6 +74,12 @@ impl Jailer {
     }
 
     fn identities(&self, slot: u32) -> std::io::Result<(u32, u32)> {
+        if slot >= self.identities.slots {
+            return Err(io_error(format!(
+                "slot {slot} is past the {} jailer identities reserved in /etc/subuid and /etc/subgid",
+                self.identities.slots
+            )));
+        }
         let identity = |base: u32| {
             base.checked_add(slot)
                 .filter(|id| *id > 0 && *id < u32::MAX)
@@ -270,9 +277,25 @@ mod tests {
             Identities {
                 uid_base: u32::MAX,
                 gid_base: 100_000,
+                slots: 8,
             },
         );
         assert!(jailer.identities(1).is_err());
+    }
+
+    #[test]
+    fn a_slot_past_the_reservation_is_refused_rather_than_given_someone_elses_identity() {
+        let jailer = Jailer::new(
+            "/jailer".into(),
+            Identities {
+                uid_base: 100_000,
+                gid_base: 200_000,
+                slots: 8,
+            },
+        );
+        assert_eq!(jailer.identities(7).unwrap(), (100_007, 200_007));
+        let refused = jailer.identities(8).unwrap_err().to_string();
+        assert!(refused.contains("past the 8 jailer identities"), "{refused}");
     }
 
     #[test]
