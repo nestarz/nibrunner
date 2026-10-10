@@ -43,6 +43,7 @@ instance() {
 apply() {
     local revision=$1 digest
     shift
+    applied_at=$(now_ms)
     printf '%s\n' "$@" | jq -s --arg revision "$revision" --argjson maxApps "$wanted_slots" \
         '{ hostId: "gate", revision: $revision, maxApps: $maxApps, volumes: [], instances: ., checkpoints: [], exports: [] }' \
         > "$state/desired.json.next"
@@ -57,13 +58,12 @@ apply() {
 
 field() { jq -r --arg app "$1" ".instances[] | select(.appId == \$app) | .$2" "$state/reported.json"; }
 
-# wait_for APP STATE SECONDS, printing how many milliseconds it took.
+# wait_for APP STATES SECONDS, printing how many milliseconds after the last document it came.
+# STATES is a regex: an on-request app started again may sit idle until a request wakes it.
 wait_for() {
-    local started
-    started=$(now_ms)
     for _ in $(seq "$3"); do
-        if [ "$(field "$1" state)" = "$2" ]; then
-            echo $(($(now_ms) - started))
+        if field "$1" state | grep -Eqx "$2"; then
+            echo $(($(now_ms) - applied_at))
             return
         fi
         sleep 1
@@ -101,7 +101,7 @@ read -r written fill_ms < <(timed_get mem '/fill?mib=200')
 expect "$written" 209715200 "bytes written to the memory scratch"
 echo "200 MiB written in $fill_ms ms"
 sleep_ms=$(wait_for mem idle 240)
-echo "asleep after $sleep_ms ms"
+echo "asleep $sleep_ms ms after the document"
 read -r size wake_ms < <(timed_get mem /size)
 expect "$size" 209715200 "the file after sleep and wake"
 expect "$(get mem /)" ok "/ on mem after wake"
@@ -109,8 +109,8 @@ echo "woken, file intact, in $wake_ms ms"
 apply a-stopped "$(instance mem stopped 512 "$memory")"
 wait_for mem stopped 120 >/dev/null
 apply a-started "$(instance mem on-request 512 "$memory")"
-wait_for mem running 180 >/dev/null
-expect "$(get mem /size)" absent "the file after stop and start"
+wait_for mem 'idle|running' 180 >/dev/null
+expect "$(get mem /size)" absent "the file after stop and start, once a request has woken it"
 echo "PASS (a): boot ${boot_ms} ms, wake ${wake_ms} ms, scratch empty after stop and start"
 
 say "(b) a disk scratch of 8 GiB: its cold boot, a 1 GiB write, sleep and wake, and nothing left after stop"
