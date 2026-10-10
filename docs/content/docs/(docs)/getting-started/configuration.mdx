@@ -22,7 +22,8 @@ the key and the reason.
   is an error that names the key.
 - **Unknown keys are errors.** A typo is reported as an unknown key, not as a missing one.
 - **Only whole sections are optional.** `[proxy.http.tls]`, `[proxy.raw]`, `[metrics]` and
-  `[logs]` and `[network.host_tcp]` can be omitted. If present, they must be complete.
+  `[logs]` and `[network.host_tcp]` can be omitted. So can `[exports]` on the `local-file`
+  backend, which writes no exports; `zerofs` requires it. If present, a section must be complete.
 
 Example errors:
 

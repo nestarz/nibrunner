@@ -150,7 +150,10 @@ fn render(config: &HostConfig) -> String {
 fn reaches_an_object_store(config: &HostConfig) -> bool {
     let remote = |url: &str| url.starts_with("s3://");
     remote(&config.artifact_store_url)
-        || remote(&config.export_store_url)
+        || config
+            .exports
+            .as_ref()
+            .is_some_and(|exports| remote(&exports.store_url))
         || config
             .volumes
             .zerofs()
@@ -270,7 +273,10 @@ mod tests {
         assert!(!reaches_an_object_store(&local()));
 
         let mut exports = local();
-        exports.export_store_url = "s3://nibrunner-exports/exports".to_string();
+        exports.exports = Some(crate::config::ExportsConfig {
+            store_url: "s3://nibrunner-exports/exports".to_string(),
+            staging_dir: std::path::PathBuf::from("/var/lib/nibrunner/exports"),
+        });
         assert!(reaches_an_object_store(&exports));
 
         assert!(reaches_an_object_store(&zerofs_in_a_bucket()));

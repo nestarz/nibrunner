@@ -10,7 +10,7 @@
       "$ref": "#/$defs/artifacts"
     },
     "exports": {
-      "description": "Where a checkpoint goes when the document asks for it as a bundle.",
+      "description": "Where a checkpoint goes when the document asks for it as a bundle. Required by the\n`zerofs` backend; absent on `local-file`, which cuts no checkpoint to export.",
       "$ref": "#/$defs/exports"
     },
     "filesystem": {
@@ -69,14 +69,29 @@
     }
   },
   "additionalProperties": false,
+  "if": {
+    "properties": {
+      "volumes": {
+        "properties": {
+          "backend": {
+            "const": "zerofs"
+          }
+        }
+      }
+    }
+  },
   "required": [
     "max_apps",
     "paths",
     "artifacts",
     "volumes",
-    "exports",
     "network"
   ],
+  "then": {
+    "required": [
+      "exports"
+    ]
+  },
   "$defs": {
     "HttpAdmission": {
       "description": "Optional limits on requests through the hostname router. Omission preserves unrestricted ingress.",

@@ -512,7 +512,7 @@ async fn test_host_over(
         artifacts: artifacts.clone(),
         payloads: crate::adapters::vm::layers::LayerImages::new(artifacts, config.artifact_cache_dir()),
         repositories,
-        exports,
+        exports: Some(exports),
         checkpoint_servers: None,
         nbd: crate::adapters::volumes::nbd::NbdDevices::new(commands.clone()),
         commands: commands.clone(),
