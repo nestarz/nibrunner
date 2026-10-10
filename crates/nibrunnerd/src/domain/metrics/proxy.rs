@@ -118,10 +118,32 @@ fn class_of(status: StatusCode) -> usize {
     (usize::from(status.as_u16() / 100)).clamp(1, 5) - 1
 }
 
-/// What one app's ingress has carried, kept while the document names it. What its requests
-/// cost is a sum and a count, deliberately without buckets: a tenant's own distribution would be
-/// fifteen series each on a page rendered whole every scrape, and `rate(sum) / rate(count)` is
-/// enough to say which tenant is slow. The shape of the distribution is the host-wide histogram's.
+// A 1xx that ends a request here is a websocket's upgrade: waiting for it is a handshake rather
+// than an answer, and a class almost always empty would cost every app a histogram of nothing.
+const TIMED_CLASSES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
+
+fn timed_class_of(status: StatusCode) -> Option<usize> {
+    class_of(status).checked_sub(1)
+}
+
+// Prometheus's own defaults, which every dashboard already reads. Coarser than the host-wide
+// histogram's, because these are rendered once per class for every app on the page, and a
+// tenant's latency matters in the milliseconds a visitor notices, up to a wake.
+const APP_BUCKET_BOUNDS_SECONDS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+#[derive(Debug)]
+struct AppDurations([Histogram; TIMED_CLASSES.len()]);
+
+impl Default for AppDurations {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| {
+            Histogram::over(&APP_BUCKET_BOUNDS_SECONDS)
+        }))
+    }
+}
+
+/// What one app's ingress has carried, kept while the document names it. What its requests cost
+/// is a sum and a count here; the shape of that cost, by class, is [`ProxyMetrics`]'s to keep.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AppProxy {
     pub requests: [u64; CLASSES.len()],
@@ -165,6 +187,7 @@ pub struct ProxyMetrics {
     in_flight: AtomicU64,
     handshakes: [AtomicU64; HANDSHAKES.len()],
     apps: Apps,
+    durations: Mutex<BTreeMap<AppId, AppDurations>>,
 }
 
 impl Default for ProxyMetrics {
@@ -175,6 +198,7 @@ impl Default for ProxyMetrics {
             in_flight: AtomicU64::new(0),
             handshakes: Default::default(),
             apps: Arc::new(Mutex::new(BTreeMap::new())),
+            durations: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -208,7 +232,9 @@ impl ProxyMetrics {
             .collect()
     }
 
-    pub fn answered(&self, outcome: Outcome, took: Duration, app_id: Option<&AppId>) {
+    /// A request this proxy finished, with the status it answered and the app it was routed to,
+    /// when it got that far.
+    pub fn answered(&self, outcome: Outcome, status: StatusCode, took: Duration, app_id: Option<&AppId>) {
         let index = OUTCOMES.iter().position(|each| *each == outcome).unwrap_or(0);
         self.served[index].fetch_add(1, Ordering::Relaxed);
         self.answered.observe(took);
@@ -217,6 +243,15 @@ impl ProxyMetrics {
                 app.request_count += 1;
                 app.request_micros += took.as_micros() as u64;
             });
+            if let Some(class) = timed_class_of(status) {
+                self.durations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(app_id.clone())
+                    .or_default()
+                    .0[class]
+                    .observe(took);
+            }
         }
     }
 
@@ -258,6 +293,10 @@ impl ProxyMetrics {
 
     pub fn forget(&self, app_id: &AppId) {
         self.apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(app_id);
+        self.durations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(app_id);
@@ -308,6 +347,13 @@ static APP_REQUEST_DURATION_SECONDS: Metric = Metric {
     labels: &["app"],
 };
 
+static APP_REQUEST_SECONDS: Metric = Metric {
+    name: "nibrunner_app_request_seconds",
+    help: "How long requests to one app took this proxy to answer, by the class of the status it answered with — a 502 or 503 of the proxy's own included, a websocket's 101 not. Measured as the host-wide request duration is.",
+    kind: Kind::Histogram,
+    labels: &["app", "class"],
+};
+
 static APP_REQUESTS_TOTAL: Metric = Metric {
     name: "nibrunner_app_requests_total",
     help: "Requests routed to an app, by the class of the status that came back. A 502 for an app that could not be reached is the proxy's and counted apart below.",
@@ -349,6 +395,7 @@ pub(super) static DECLARED: &[&Metric] = &[
     &PROXY_REQUESTS_IN_FLIGHT,
     &PROXY_TLS_HANDSHAKES_TOTAL,
     &APP_REQUEST_DURATION_SECONDS,
+    &APP_REQUEST_SECONDS,
     &APP_REQUESTS_TOTAL,
     &APP_REQUESTS_UNREACHABLE_TOTAL,
     &APP_REQUESTS_OPEN,
@@ -399,6 +446,24 @@ pub(super) fn render(page: &mut Page, metrics: &ProxyMetrics, snapshot: &HostSna
             app.request_count,
         );
     }
+
+    page.declare(&APP_REQUEST_SECONDS);
+    let unobserved = AppDurations::default();
+    let durations = metrics
+        .durations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for app_id in &apps {
+        let app = durations.get(*app_id).unwrap_or(&unobserved);
+        for (histogram, class) in app.0.iter().zip(TIMED_CLASSES) {
+            page.histogram(
+                &APP_REQUEST_SECONDS,
+                &[("app", app_id.as_str()), ("class", class)],
+                histogram,
+            );
+        }
+    }
+    drop(durations);
 
     page.declare(&APP_REQUESTS_TOTAL);
     for app_id in &apps {
@@ -513,9 +578,19 @@ mod tests {
             }))
             .await;
         let metrics = &host.metrics.proxy;
-        metrics.answered(Outcome::Served, Duration::from_millis(2), Some(&app_id()));
+        metrics.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(2),
+            Some(&app_id()),
+        );
         metrics.app_answered(&app_id(), StatusCode::OK, true);
-        metrics.answered(Outcome::Unreachable, Duration::from_millis(4), Some(&app_id()));
+        metrics.answered(
+            Outcome::Unreachable,
+            StatusCode::BAD_GATEWAY,
+            Duration::from_millis(4),
+            Some(&app_id()),
+        );
         metrics.app_answered(&app_id(), StatusCode::BAD_GATEWAY, false);
         metrics.raw_session(&other, Protocol::Tcp, RawOutcome::Served);
         metrics.raw_bytes(&other, Protocol::Tcp, 100, 2_000);
@@ -579,6 +654,94 @@ mod tests {
         ));
         assert!(bytes
             .contains(&"nibrunner_raw_port_bytes_total{app=\"app-2\",protocol=\"udp\",direction=\"in\"} 0"));
+    }
+
+    fn holding_the_app() -> HostSnapshot {
+        HostSnapshot {
+            records: BTreeMap::from([(app_id(), instance_record(|_| {}))]),
+            ..HostSnapshot::default()
+        }
+    }
+
+    fn rendered_with_the_app(metrics: &ProxyMetrics) -> String {
+        let mut page = Page::new();
+        render(&mut page, metrics, &holding_the_app());
+        page.0
+    }
+
+    #[test]
+    fn what_each_app_s_requests_took_is_a_distribution_by_the_class_it_was_answered_with() {
+        let metrics = ProxyMetrics::default();
+        let app = Some(&app_id());
+        metrics.answered(Outcome::Served, StatusCode::OK, Duration::from_millis(2), app);
+        metrics.answered(Outcome::Served, StatusCode::OK, Duration::from_millis(30), app);
+        metrics.answered(
+            Outcome::Served,
+            StatusCode::NOT_FOUND,
+            Duration::from_millis(3),
+            app,
+        );
+        metrics.answered(
+            Outcome::Unreachable,
+            StatusCode::BAD_GATEWAY,
+            Duration::from_secs(20),
+            app,
+        );
+        metrics.answered(
+            Outcome::Served,
+            StatusCode::SWITCHING_PROTOCOLS,
+            Duration::from_millis(1),
+            app,
+        );
+        metrics.answered(
+            Outcome::NoSuchHost,
+            StatusCode::NOT_FOUND,
+            Duration::from_millis(1),
+            None,
+        );
+
+        let page = rendered_with_the_app(&metrics);
+        let series = lines_for(&page, "nibrunner_app_request_seconds_bucket");
+        assert_eq!(
+            series.len(),
+            TIMED_CLASSES.len() * (APP_BUCKET_BOUNDS_SECONDS.len() + 1),
+            "every class of every app, answered or not, and no 1xx: {series:?}"
+        );
+        for expected in [
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="2xx",le="0.005"} 1"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="2xx",le="0.025"} 1"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="2xx",le="0.05"} 2"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="2xx",le="+Inf"} 2"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="3xx",le="+Inf"} 0"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="4xx",le="0.005"} 1"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="5xx",le="10"} 0"#,
+            r#"nibrunner_app_request_seconds_bucket{app="app-1",class="5xx",le="+Inf"} 1"#,
+        ] {
+            assert!(series.contains(&expected), "{expected} in {series:?}");
+        }
+        assert!(page.contains("nibrunner_app_request_seconds_sum{app=\"app-1\",class=\"2xx\"} 0.032\n"));
+        assert!(page.contains("nibrunner_app_request_seconds_count{app=\"app-1\",class=\"4xx\"} 1\n"));
+        assert!(page.contains("nibrunner_app_request_seconds_count{app=\"app-1\",class=\"5xx\"} 1\n"));
+    }
+
+    #[test]
+    fn an_app_the_document_dropped_takes_its_distribution_with_it() {
+        let metrics = ProxyMetrics::default();
+        metrics.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(2),
+            Some(&app_id()),
+        );
+        assert!(rendered_with_the_app(&metrics)
+            .contains("nibrunner_app_request_seconds_count{app=\"app-1\",class=\"2xx\"} 1\n"));
+        metrics.forget(&app_id());
+
+        let page = rendered_with_the_app(&metrics);
+        assert!(
+            page.contains("nibrunner_app_request_seconds_count{app=\"app-1\",class=\"2xx\"} 0\n"),
+            "an app named again starts from nothing: {page}"
+        );
     }
 
     #[test]

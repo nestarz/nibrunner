@@ -514,6 +514,7 @@ pub fn render(metrics: &HostMetrics, scrape: &Scrape<'_>) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use hyper::StatusCode;
     use protocol::{
         ComputeUsage, HostCapacity, HostId, HostReportedState, HostState, HostVersions, Timestamp,
     };
@@ -579,9 +580,12 @@ pub(crate) mod tests {
     fn page_of_a_busy_host() -> String {
         use crate::test_support::*;
         let metrics = HostMetrics::new();
-        metrics
-            .proxy
-            .answered(Outcome::Served, Duration::from_millis(2), Some(&app_id()));
+        metrics.proxy.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(2),
+            Some(&app_id()),
+        );
         metrics.proxy.raw_bytes(&app_id(), proxy::Protocol::Tcp, 1, 2);
         metrics
             .proxy
@@ -727,10 +731,10 @@ pub(crate) mod tests {
         let metrics = HostMetrics::new();
         metrics
             .proxy
-            .answered(Outcome::Served, Duration::from_millis(2), None);
+            .answered(Outcome::Served, StatusCode::OK, Duration::from_millis(2), None);
         metrics
             .proxy
-            .answered(Outcome::Served, Duration::from_millis(150), None);
+            .answered(Outcome::Served, StatusCode::OK, Duration::from_millis(150), None);
         metrics.sleep_wake.woke(Duration::from_millis(148), false);
         let page = rendered(&report(), &metrics);
 
@@ -770,26 +774,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn what_one_app_cost_is_a_sum_and_a_count_rather_than_a_distribution_of_its_own() {
+    fn what_one_app_cost_is_a_sum_and_a_count_and_its_distribution_is_a_series_apart() {
         let metrics = HostMetrics::new();
         let app = protocol::AppId::parse("app-1").unwrap();
-        metrics
-            .proxy
-            .answered(Outcome::Served, Duration::from_millis(10), Some(&app));
-        metrics
-            .proxy
-            .answered(Outcome::Served, Duration::from_millis(30), Some(&app));
+        metrics.proxy.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(10),
+            Some(&app),
+        );
+        metrics.proxy.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(30),
+            Some(&app),
+        );
         let page = page(&report(), &metrics, &holding(&["app-1"]), 0);
 
         assert!(page.contains(r#"nibrunner_app_request_duration_seconds_count{app="app-1"} 2"#));
         assert!(page.contains(r#"nibrunner_app_request_duration_seconds_sum{app="app-1"} 0.04"#));
-        // Fifteen series an app is what this is instead of, so no bucket may carry one.
         assert!(
-            !lines_for(&page, "nibrunner_app_request_duration_seconds_bucket")
-                .iter()
-                .any(|line| line.contains("app=")),
-            "a per-app histogram is the cardinality this metric exists to avoid"
+            lines_for(&page, "nibrunner_app_request_duration_seconds_bucket").is_empty(),
+            "the summary keeps its shape; the buckets are nibrunner_app_request_seconds'"
         );
+        assert!(page.contains(r#"nibrunner_app_request_seconds_count{app="app-1",class="2xx"} 2"#));
     }
 
     #[test]
@@ -797,12 +805,18 @@ pub(crate) mod tests {
         let metrics = HostMetrics::new();
         let gone = protocol::AppId::parse("app-1").unwrap();
         let kept = protocol::AppId::parse("app-2").unwrap();
-        metrics
-            .proxy
-            .answered(Outcome::Served, Duration::from_millis(10), Some(&gone));
-        metrics
-            .proxy
-            .answered(Outcome::Served, Duration::from_millis(10), Some(&kept));
+        metrics.proxy.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(10),
+            Some(&gone),
+        );
+        metrics.proxy.answered(
+            Outcome::Served,
+            StatusCode::OK,
+            Duration::from_millis(10),
+            Some(&kept),
+        );
 
         metrics.forget(&gone);
         let page = page(&report(), &metrics, &holding(&["app-2"]), 0);
@@ -883,9 +897,12 @@ pub(crate) mod tests {
     fn a_histogram_counts_every_request_once_and_its_buckets_only_grow() {
         let proxy = HostMetrics::new();
         for micros in [500, 3_000, 40_000, 90_000_000] {
-            proxy
-                .proxy
-                .answered(Outcome::Served, Duration::from_micros(micros), None);
+            proxy.proxy.answered(
+                Outcome::Served,
+                StatusCode::OK,
+                Duration::from_micros(micros),
+                None,
+            );
         }
         let page = rendered(&report(), &proxy);
 

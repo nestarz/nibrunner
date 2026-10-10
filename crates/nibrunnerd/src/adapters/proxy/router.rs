@@ -189,9 +189,12 @@ impl Router {
         metrics.proxy.began();
         let (mut response, outcome, route) = self.route(request, arrival).await;
         let elapsed = started.elapsed();
-        metrics
-            .proxy
-            .answered(outcome, elapsed, route.as_ref().map(|route| &route.app_id));
+        metrics.proxy.answered(
+            outcome,
+            response.status(),
+            elapsed,
+            route.as_ref().map(|route| &route.app_id),
+        );
         metrics.proxy.ended();
         if let (Some((sink, method, uri)), Some(route)) = (access, route) {
             sink.record(
@@ -1030,6 +1033,38 @@ mod tests {
             "{counted:?}"
         );
         assert_eq!(metrics.proxy.of(&crate::test_support::app_id()).unreachable, 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_carried_to_an_app_is_timed_under_the_class_of_the_status_it_came_back_with() {
+        let metrics = Arc::new(HostMetrics::new());
+        let router = Router::new(metrics.clone(), None);
+        let port = serving(router.clone()).await;
+        let request = "GET / HTTP/1.0\r\nHost: app-1.apps.example.com\r\n\r\n";
+
+        routed_at(&router, answering_with(StatusCode::NOT_FOUND).await).await;
+        asked(port, request).await;
+        asked(port, request).await;
+        routed_at(&router, nobody_listening().await).await;
+        asked(port, request).await;
+
+        let page = crate::domain::metrics::tests::page(
+            &crate::domain::metrics::tests::report(),
+            &metrics,
+            &crate::state::HostSnapshot {
+                records: std::collections::BTreeMap::from([(
+                    crate::test_support::app_id(),
+                    instance_record(|_| {}),
+                )]),
+                ..Default::default()
+            },
+            0,
+        );
+        for (class, count) in [("2xx", 0), ("4xx", 2), ("5xx", 1)] {
+            let line =
+                format!("nibrunner_app_request_seconds_count{{app=\"app-1\",class=\"{class}\"}} {count}\n");
+            assert!(page.contains(&line), "{line} in {page}");
+        }
     }
 
     /// A tenant that streams its one answer as the test feeds it: a chunk per message, and the
