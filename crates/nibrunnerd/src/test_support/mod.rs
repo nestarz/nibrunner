@@ -276,6 +276,7 @@ pub fn desired_state(edit: impl FnOnce(&mut HostDesiredState)) -> HostDesiredSta
     let mut value = HostDesiredState {
         host_id: host_id(),
         revision: revision(),
+        max_apps: None,
         volumes: vec![],
         instances: vec![],
         checkpoints: vec![],

@@ -264,6 +264,43 @@ still takes the restart path.
     with a new loopback port and a new guest address.
 </Callout>
 
+### From the desired state
+
+A control plane that places apps can raise the count without touching `config.toml`: it sets
+`maxApps` in the [desired state](/docs/reference/desired).
+
+```json
+{
+  "hostId": "host-1",
+  "revision": "deploy-42",
+  "maxApps": 128,
+  "volumes": [],
+  "instances": [],
+  "checkpoints": [],
+  "exports": []
+}
+```
+
+The running daemon widens its slots to `maxApps` when it reads the document, and again when it
+restarts on it. No `nibrunnerd start` is needed, and `nibrunner_slots{of="total"}` shows
+the new count.
+
+| `maxApps` | What the host holds |
+| --- | --- |
+| absent, or at most `max_apps` | `max_apps` |
+| above `max_apps` | `maxApps` |
+| refused | `max_apps`, with a warning in the daemon's log naming why |
+
+<Callout title="Note">
+  - **It only raises.** A document never takes a host below `max_apps`, and a running daemon
+    never narrows: a lower `maxApps` takes effect on the next restart, with the same move for an
+    app past it as lowering `max_apps`.
+  - **It is held to the rules `max_apps` is held to:** at most 5567, and no listener of yours in
+    the wider range of loopback ports. A `zerofs` host refuses it, for the reason above.
+  - **The conntrack table stays sized for `max_apps`**, never below 262144 entries. Past 256 apps,
+    raise `max_apps` itself and run `nibrunnerd start` to resize it.
+</Callout>
+
 ## HTTP concurrency
 
 By default the HTTP router imposes no concurrency limit. To bound requests across

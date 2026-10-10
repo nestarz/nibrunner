@@ -399,6 +399,11 @@ pub struct HostDesiredState {
     /// a control plane can always ask which of its own versions a host is on — and so a host
     /// answering with one nobody wrote is impossible.
     pub revision: Revision,
+    /// How many apps this host is to hold a slot for, when that is more than `max_apps` in its
+    /// config.toml: the running daemon widens to it in place, with no restart. It never narrows
+    /// the host below its configuration, and absent, the configuration alone says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_apps: Option<u32>,
     pub volumes: Vec<DesiredVolume>,
     pub instances: Vec<DesiredInstance>,
     pub checkpoints: Vec<DesiredCheckpoint>,

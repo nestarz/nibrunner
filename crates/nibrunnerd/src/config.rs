@@ -275,8 +275,8 @@ pub struct HostConfig {
     pub vm_budgets: Option<VmBudgets>,
     /// How many apps this host is laid out for. Everything that counts slots follows from it —
     /// the ring the allocator walks, the loopback ports reserved, the nbd minors the module is
-    /// loaded with, the conntrack table's size, what the metrics page calls the total — and
-    /// nothing holds a copy of it.
+    /// loaded with, the conntrack table's size, what the metrics page calls the total. A desired document's
+    /// `maxApps` widens the ring and the total past it; the conntrack table stays sized for this.
     pub max_apps: u32,
     pub state_dir: PathBuf,
     pub runtime_dir: PathBuf,
@@ -714,6 +714,28 @@ impl HostConfig {
             reason: error.message().trim().replace('\n', "; "),
         })?;
         Self::from_document(&document)
+    }
+
+    /// The ring a desired document's `maxApps` widens this host to, held to the rules `max_apps`
+    /// is held to in the file: no wider than the ports fit, and no listener inside the ports the
+    /// wider ring reserves. A ZeroFS host keeps its ring, because its export reader holds the nbd
+    /// device just past the last slot. Never narrower than this configuration.
+    pub fn widened_to(&self, max_apps: u32) -> Result<u32, ConfigError> {
+        if max_apps <= self.max_apps {
+            return Ok(self.max_apps);
+        }
+        if self.volumes.zerofs().is_some() {
+            return Err(ConfigError::invalid(
+                "maxApps",
+                format!(
+                    "more than max_apps = {} on a ZeroFS host, whose export reader holds the nbd device past the last slot: raise max_apps in config.toml and run nibrunnerd start",
+                    self.max_apps
+                ),
+            ));
+        }
+        let mut wider = self.clone();
+        wider.max_apps = max_apps;
+        Self::from_document(&wider.to_document()).map(|wider| wider.max_apps)
     }
 
     fn from_document(document: &file::ConfigFile) -> Result<Self, ConfigError> {
@@ -1905,6 +1927,37 @@ denied_egress_addresses_v6 = []
 
         assert_eq!(parsed(&document(&[("max_apps", "5567")], "")).max_apps, 5567);
         assert_eq!(parsed(&whole()).max_apps, 1000);
+    }
+
+    #[test]
+    fn a_document_widens_the_ring_only_as_far_as_the_file_itself_could_have() {
+        let mut config = parsed(&whole());
+        assert_eq!(config.widened_to(10).unwrap(), 1000);
+        assert_eq!(config.widened_to(1200).unwrap(), 1200);
+
+        let message = config.widened_to(5568).unwrap_err().message();
+        assert!(message.contains("at most 5567"), "{message}");
+
+        config.proxy.http = Some(HttpListener {
+            listen_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 30_000,
+            tls: None,
+            redirect_from_port: None,
+        });
+        assert_eq!(config.widened_to(1100).unwrap(), 1100);
+        let message = config.widened_to(1200).unwrap_err().message();
+        assert!(message.contains("proxy.http.port"), "{message}");
+        assert!(message.contains("free"), "{message}");
+    }
+
+    #[test]
+    fn a_zerofs_host_keeps_its_ring_whatever_a_document_asks_for() {
+        let mut config = HostConfig::under(Path::new("/srv/nibrunner"));
+        config.volumes = VolumeBackend::Zerofs(Box::new(crate::test_support::zerofs_settings(|_| {})));
+        assert_eq!(config.widened_to(config.max_apps).unwrap(), config.max_apps);
+        let message = config.widened_to(config.max_apps + 1).unwrap_err().message();
+        assert!(message.contains("maxApps"), "{message}");
+        assert!(message.contains("export reader"), "{message}");
     }
 
     #[test]
