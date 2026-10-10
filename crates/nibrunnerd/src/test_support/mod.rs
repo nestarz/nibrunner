@@ -513,7 +513,7 @@ async fn test_host_over(
             commands.clone(),
         ),
         repositories,
-        exports,
+        exports: Some(exports),
         checkpoint_servers: None,
         nbd: crate::adapters::volumes::nbd::NbdDevices::new(commands.clone()),
         commands: commands.clone(),
