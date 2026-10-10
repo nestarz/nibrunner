@@ -57,5 +57,10 @@ time, and is capped at `maxBackoffMs`. If the program stays up for `resetAfterMs
 count resets. After `maxRestarts` failures, the instance is reported `failed` and is not restarted
 until it is deployed again with a new `deploymentId`.
 
+With `maxRestarts: 0` the program is run once. When it ends, by any exit code or signal, the
+instance is reported `exited` with `lastExitCode` set to the program's status (the code, or 128
+plus the signal), and it is not started again until a new `deploymentId`. It is reported `failed`
+only when the guest went down without saying how the program ended.
+
 The [reference](/docs/reference/desired) lists every field of a health check and a restart
 policy.

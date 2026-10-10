@@ -303,6 +303,7 @@ pub fn observed_instance(edit: impl FnOnce(&mut ObservedInstance)) -> ObservedIn
         running: true,
         exited: false,
         refused: false,
+        ran_once: false,
     };
     edit(&mut value);
     value

@@ -19,6 +19,9 @@ pub struct ObservedInstance {
     /// not one asleep, nor one that spent its budget: it is started the pass the refusal lifts,
     /// on request or not.
     pub refused: bool,
+    /// Whether its program was run once and has ended: it is done, and only a new deployment
+    /// runs it again.
+    pub ran_once: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +222,11 @@ fn plan_instance(
                 desired: wanted.clone(),
             };
         }
+        if current.ran_once {
+            return InstancePlan::None {
+                app_id: wanted.app_id.clone(),
+            };
+        }
         // An idle on-request app has no live guest to recover: its device reading as gone is only
         // the outage, and it is left asleep to be woken (and re-attached) when it is next asked for.
         // One refused before it was ever brought up is not asleep: a request would only find it
@@ -249,6 +257,11 @@ fn plan_instance(
     if current.deployment_id.as_ref() != Some(&wanted.deployment_id) {
         return InstancePlan::Replace {
             desired: wanted.clone(),
+        };
+    }
+    if current.ran_once {
+        return InstancePlan::None {
+            app_id: wanted.app_id.clone(),
         };
     }
     if current.running {
@@ -801,6 +814,50 @@ mod tests {
                 vec![InstancePlan::Replace {
                     desired: on_request()
                 }]
+            );
+        }
+    }
+
+    mod a_program_run_once {
+        use super::*;
+
+        fn ended() -> ObservedInstance {
+            observed_instance(|instance| {
+                instance.running = false;
+                instance.exited = true;
+                instance.ran_once = true;
+            })
+        }
+
+        #[test]
+        fn that_has_ended_is_not_started_again() {
+            for wanted in [DesiredInstanceState::Running, DesiredInstanceState::OnRequest] {
+                let result = plan(
+                    desired_state(|state| {
+                        state.instances = vec![desired_instance(|instance| instance.desired_state = wanted)]
+                    }),
+                    observed_state(|state| state.instances = vec![ended()]),
+                );
+                assert_eq!(
+                    result.instances,
+                    vec![InstancePlan::None { app_id: app_id() }],
+                    "{wanted:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn that_has_ended_is_run_again_by_a_new_deployment() {
+            let redeployed = desired_instance(|instance| {
+                instance.deployment_id = DeploymentId::parse("dep-2").unwrap();
+            });
+            let result = plan(
+                desired_state(|state| state.instances = vec![redeployed.clone()]),
+                observed_state(|state| state.instances = vec![ended()]),
+            );
+            assert_eq!(
+                result.instances,
+                vec![InstancePlan::Replace { desired: redeployed }]
             );
         }
     }

@@ -48,6 +48,9 @@ pub(crate) fn run() -> ExitCode {
             "the tenant used its {} restarts without staying up; shutting the guest down",
             config.max_restarts
         )),
+        // The host reads this line, the last init says before the reboot, off the console as
+        // the instance's exit.
+        supervisor::Ended::RanOnce(exit) => log(&guest_contract::control::ran_once(exit)),
         supervisor::Ended::SpawnFailed => {
             log("the tenant could not be started at all; shutting the guest down")
         }
