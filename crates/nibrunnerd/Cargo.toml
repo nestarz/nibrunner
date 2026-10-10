@@ -43,6 +43,7 @@ toml.workspace = true
 tar.workspace = true
 flate2.workspace = true
 zip.workspace = true
+lzma-rust2.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tokio.workspace = true
@@ -81,6 +82,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 mockall.workspace = true
+lzma-rust2 = { workspace = true, features = ["encoder"] }
 jsonschema.workspace = true
 nft-render.workspace = true
 nibrunnerd = { path = ".", features = ["testing"] }
