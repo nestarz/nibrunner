@@ -19,6 +19,7 @@ async fn a_lifetime_expiry_drains_an_open_request_only_until_its_allowance_is_sp
     let app = host.tenant(1).edited(|instance| {
         instance.desired_state = protocol::DesiredInstanceState::OnRequest;
         instance.activation = Some(ActivationPolicy {
+            snapshot_ttl_ms: None,
             sleep_when: SleepPolicy::MaxLifetime {
                 ttl_ms: MaxLifetimeMs::try_from(IDLE_TIMEOUT_MS).expect("a lifetime"),
             },

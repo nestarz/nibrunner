@@ -51,6 +51,17 @@
       "properties": {
         "sleepWhen": {
           "$ref": "#/$defs/SleepPolicy"
+        },
+        "snapshotTtlMs": {
+          "description": "How long the memory snapshot of an instance asleep is kept without a wake. Past that it is\ndeleted, and the next request boots the instance afresh. Absent, it is kept until the next\nwake. Only an instance that sleeps has a snapshot for this to apply to.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SnapshotTtlMs"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -800,6 +811,11 @@
           ]
         }
       ]
+    },
+    "SnapshotTtlMs": {
+      "type": "integer",
+      "maximum": 2592000000,
+      "minimum": 60000
     },
     "StoredObject": {
       "description": "An object in the store the host's `artifacts.store_url` names, checked against `digest`\nbefore anything is made from it. The digest is the whole of what is checked: a `sizeBytes`\nbeside it, which a document used to carry, is read past.",

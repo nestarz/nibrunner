@@ -192,6 +192,11 @@ pub trait Vmm: Send + Sync {
     /// down, or the kernel's panic. A guest killed from outside said nothing.
     async fn guest_verdict(&self, app_id: &AppId) -> Option<String>;
     fn working_dir(&self, app_id: &AppId) -> PathBuf;
+    /// Deletes the memory snapshot of a microVM asleep once it has gone unwoken for `kept_for`,
+    /// and says whether it did. The next wake then finds nothing to restore and boots afresh.
+    async fn expire_snapshot(&self, _app_id: &AppId, _kept_for: std::time::Duration) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -356,6 +361,7 @@ pub enum VmCall {
     Stop,
     Discard,
     DeleteTap,
+    ExpireSnapshot,
 }
 
 #[cfg(test)]

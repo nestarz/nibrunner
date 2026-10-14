@@ -1156,3 +1156,36 @@ mod schema {
         }
     }
 }
+
+#[test]
+fn a_snapshot_ttl_round_trips_in_activation_and_is_absent_unless_named() {
+    let named = read(instance_with(|document| {
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+            "snapshotTtlMs": 86400000
+        });
+    }))
+    .expect("parses");
+    assert_eq!(
+        named.activation().snapshot_ttl_ms.map(SnapshotTtlMs::get),
+        Some(86_400_000)
+    );
+    assert_eq!(
+        serde_json::to_value(&named).unwrap()["activation"]["snapshotTtlMs"],
+        86_400_000
+    );
+    assert_eq!(read(instance_json()).unwrap().activation().snapshot_ttl_ms, None);
+}
+
+#[test]
+fn a_snapshot_ttl_outside_its_range_refuses_the_instance() {
+    for ttl in [0, MIN_SNAPSHOT_TTL_MS - 1, MAX_SNAPSHOT_TTL_MS + 1] {
+        let refused = read(instance_with(|document| {
+            document["activation"] = serde_json::json!({
+                "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+                "snapshotTtlMs": ttl
+            });
+        }));
+        assert!(refused.is_err(), "{ttl}");
+    }
+}
