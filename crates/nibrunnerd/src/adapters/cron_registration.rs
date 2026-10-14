@@ -27,6 +27,7 @@ pub fn cron_registration_socket_path(working_dir: &Path) -> PathBuf {
 }
 
 struct Attachment {
+    source: AppId,
     deployment_id: DeploymentId,
     socket_path: PathBuf,
     task: JoinHandle<()>,
@@ -58,9 +59,24 @@ impl CronRegistrationReceiver {
         deployment_id: DeploymentId,
         socket_path: PathBuf,
     ) -> std::io::Result<()> {
+        self.attach_as(app_id.clone(), app_id, deployment_id, socket_path)
+            .await
+    }
+
+    /// Answers the guest of the microVM run under `app_id` as `source`, whose crontab it
+    /// registers: the same app, unless the microVM is a new deployment booted beside `source`.
+    pub async fn attach_as(
+        &self,
+        app_id: AppId,
+        source: AppId,
+        deployment_id: DeploymentId,
+        socket_path: PathBuf,
+    ) -> std::io::Result<()> {
         let mut attachments = self.attachments.lock().await;
         if attachments.get(&app_id).is_some_and(|existing| {
-            existing.socket_path == socket_path && existing.deployment_id == deployment_id
+            existing.socket_path == socket_path
+                && existing.deployment_id == deployment_id
+                && existing.source == source
         }) {
             return Ok(());
         }
@@ -77,12 +93,13 @@ impl CronRegistrationReceiver {
         let task = tokio::spawn(serve(
             listener,
             self.registry.clone(),
-            app_id.clone(),
+            source.clone(),
             deployment_id.clone(),
         ));
         attachments.insert(
             app_id,
             Attachment {
+                source,
                 deployment_id,
                 socket_path,
                 task,

@@ -67,6 +67,32 @@ pub struct InstanceRecord {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+    /// The app whose new deployment this record boots beside the one still serving. Such a record
+    /// is never routed and never reported: it is that app's, to take over its hostnames once it is
+    /// healthy or to be stopped if it never is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_for: Option<AppId>,
+    /// The deployment this app is being cut over to, while the one it runs keeps serving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover: Option<Cutover>,
+    /// How the last deployment of this app went when it could not be cut over to cleanly. Kept
+    /// apart from `message`, which the status loop rewrites, so it is still said once the instance
+    /// it describes is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover_note: Option<StateMessage>,
+    /// The same, as the report's `cutover` says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover_outcome: Option<protocol::CutoverOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cutover {
+    pub deployment_id: DeploymentId,
+    pub deadline_ms: i64,
+    /// The deployment never became healthy in time and was stopped: it is not tried again until
+    /// the document names another.
+    pub abandoned: bool,
 }
 
 fn default_restart_policy() -> RestartPolicy {
@@ -118,6 +144,10 @@ impl InstanceRecord {
             converged_at: None,
             last_exit_code: None,
             message: None,
+            staging_for: None,
+            cutover: None,
+            cutover_note: None,
+            cutover_outcome: None,
         }
     }
 

@@ -221,6 +221,7 @@ pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedIn
         converged_at: None,
         last_exit_code: None,
         message: None,
+        cutover: None,
     };
     edit(&mut value);
     value
@@ -304,6 +305,8 @@ pub fn observed_instance(edit: impl FnOnce(&mut ObservedInstance)) -> ObservedIn
         running: true,
         exited: false,
         refused: false,
+        staging_for: None,
+        cutover: None,
     };
     edit(&mut value);
     value

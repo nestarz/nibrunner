@@ -45,7 +45,7 @@ fn record_ports(
         .collect()
 }
 
-fn record_fields(desired: &DesiredInstance, slot: &nft_render::AppSlot) -> RecordFields {
+pub(super) fn record_fields(desired: &DesiredInstance, slot: &nft_render::AppSlot) -> RecordFields {
     RecordFields {
         app_id: desired.app_id.clone(),
         deployment_id: desired.deployment_id.clone(),
@@ -512,6 +512,7 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
                     slot,
                     writable,
                     payload,
+                    staged_for: attempted.staging_for.clone(),
                 })
                 .await;
             if matches!(boot, Err(VmError::StartBusy)) {
@@ -832,6 +833,8 @@ fn starting(plan: &ReconcilePlan) -> impl Iterator<Item = &DesiredInstance> {
     plan.instances.iter().filter_map(|action| match action {
         InstancePlan::Start { desired }
         | InstancePlan::Replace { desired }
+        | InstancePlan::FallBack { desired, .. }
+        | InstancePlan::Stage { desired, .. }
         | InstancePlan::Recover { desired } => Some(desired),
         _ => None,
     })

@@ -1,4 +1,5 @@
 pub mod checkpoints;
+pub(crate) mod cutover;
 pub mod exports;
 pub mod idle;
 pub mod ingress;
@@ -52,12 +53,29 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                             && record.started_at.is_none()
                             && record.start_attempts == NO_START_ATTEMPTS
                     }),
+                    staging_for: record.and_then(|record| record.staging_for.clone()),
+                    cutover: record.and_then(|record| {
+                        let cutover = record.cutover.as_ref()?;
+                        let staged = cutover::staging_id(app_id)
+                            .and_then(|staging| snapshot.records.get(&staging))
+                            .filter(|staged| {
+                                staged.staging_for.as_ref() == Some(app_id)
+                                    && staged.deployment_id == cutover.deployment_id
+                            });
+                        Some(ObservedCutover {
+                            deployment_id: cutover.deployment_id.clone(),
+                            deadline_ms: cutover.deadline_ms,
+                            abandoned: cutover.abandoned,
+                            staging: staged.map(cutover::progress),
+                        })
+                    }),
                 }
             })
             .collect(),
         volumes: volumes::observe_volumes(host, &volumes::volume_owners(desired, &snapshot.records)).await,
         checkpoints: checkpoints::observe_checkpoints(host, desired).await,
         exports: exports::observe_exports(host).await,
+        now_ms: crate::clock::now_ms(),
     }
 }
 
@@ -72,6 +90,12 @@ async fn sync_desired(host: &Host, desired: &HostDesiredState) {
                 record.desired_running = wanted.desired_state != DesiredInstanceState::Stopped;
                 record.on_request = wanted.desired_state == DesiredInstanceState::OnRequest;
                 record.http_port = wanted.config.http_port;
+                // A cut-over the document no longer asks for, because it names the deployment
+                // this app already runs, has nothing left to say.
+                if record.deployment_id == wanted.deployment_id && record.cutover.take().is_some() {
+                    record.cutover_note = None;
+                    record.cutover_outcome = None;
+                }
             })
             .await;
     }
@@ -83,7 +107,8 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             InstancePlan::Stop { app_id, reason } => {
                 instances::stop_instance(host, app_id, reason.as_str()).await;
             }
-            InstancePlan::Replace { desired } => {
+            InstancePlan::Replace { desired } | InstancePlan::FallBack { desired, .. } => {
+                let _transition = host.state.transition(&desired.app_id).await;
                 instances::stop_instance(host, &desired.app_id, InstanceStopReason::Superseded.as_str())
                     .await;
                 let _ = host.vms.discard(&desired.app_id).await;
@@ -104,6 +129,15 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             // files taken below.
             InstancePlan::Forget { app_id } => {
                 let _ = host.vms.discard(app_id).await;
+                // Nothing else will ever ask for the slot of what was booted for a cut-over.
+                if host
+                    .state
+                    .record(app_id)
+                    .await
+                    .is_some_and(|record| record.staging_for.is_some())
+                {
+                    volumes::give_back_slot(host, app_id).await;
+                }
                 host.state.drop_record(app_id).await;
                 host.logs.discard(app_id);
                 host.router.discard_http_log(app_id).await;
@@ -136,6 +170,7 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
         .filter_map(|action| match action {
             InstancePlan::Start { desired }
             | InstancePlan::Replace { desired }
+            | InstancePlan::FallBack { desired, .. }
             | InstancePlan::Recover { desired } => Some(desired),
             _ => None,
         })
@@ -224,6 +259,8 @@ pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Tr
     network::apply_activators(host).await;
     network::apply_network(host).await;
     apply_starts(host, &plan).await;
+    cutover::note_fallbacks(host, &plan).await;
+    cutover::apply_cutovers(host, &plan).await;
     volumes::apply_teardowns(host, &plan).await;
     checkpoints::apply_checkpoints(host, &plan).await;
     exports::apply_exports(host, &plan, trigger).await;

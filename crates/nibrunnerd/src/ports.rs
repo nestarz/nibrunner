@@ -129,6 +129,9 @@ pub struct BootRequest {
     pub slot: nft_render::AppSlot,
     pub writable: Writable,
     pub payload: PreparedPayload,
+    /// The app this is booted beside, to take over once it is healthy. Its output is that app's
+    /// from the first line, since it is that app's new deployment.
+    pub staged_for: Option<AppId>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +204,9 @@ pub trait Vmm: Send + Sync {
     /// down, or the kernel's panic. A guest killed from outside said nothing.
     async fn guest_verdict(&self, app_id: &AppId) -> Option<String>;
     fn working_dir(&self, app_id: &AppId) -> PathBuf;
+    /// Hands each of two running microVMs the other's app id, so that the app one answered to
+    /// is answered by the other from now on.
+    async fn exchange(&self, first: &AppId, second: &AppId) -> Result<(), VmError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -365,6 +371,7 @@ pub enum VmCall {
     Stop,
     Discard,
     DeleteTap,
+    Exchange,
 }
 
 #[cfg(test)]

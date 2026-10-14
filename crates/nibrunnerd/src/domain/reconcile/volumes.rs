@@ -164,7 +164,7 @@ pub async fn apply_volumes(
 /// The tap goes with the slot rather than with the microVM, because a stopped app keeps both and
 /// only an app that is leaving gives them up. Taking it here is also what stops the slot the
 /// cursor hands out next from inheriting a live device.
-async fn give_back_slot(host: &Host, app_id: &AppId) {
+pub(super) async fn give_back_slot(host: &Host, app_id: &AppId) {
     let tap_name = {
         let mut allocator = host.allocator.lock().await;
         let held = allocator.lookup(app_id).map(|slot| slot.tap_name);

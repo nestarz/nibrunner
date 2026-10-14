@@ -116,6 +116,64 @@
         "failed"
       ]
     },
+    "CutoverFallback": {
+      "description": "Why a deployment that asked to be cut over to was started only once the old one was stopped.",
+      "oneOf": [
+        {
+          "description": "Two guests cannot write one disk, so the old one has to let go of it first.",
+          "type": "string",
+          "const": "volume"
+        },
+        {
+          "description": "The host had no room to boot it beside the old one within `cutoverTimeoutMs`.",
+          "type": "string",
+          "const": "no-room"
+        },
+        {
+          "description": "The id it would be booted under beside the old one (the app id with `--next` after it) is\nnamed by another app in the document, or longer than an app id may be.",
+          "type": "string",
+          "const": "no-staging-name"
+        }
+      ]
+    },
+    "CutoverOutcome": {
+      "oneOf": [
+        {
+          "description": "The old deployment was stopped before the one reported started.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "fallback"
+            },
+            "reason": {
+              "$ref": "#/$defs/CutoverFallback"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        },
+        {
+          "description": "`deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the\ndeployment reported keeps serving, and the named one is not tried again.",
+          "type": "object",
+          "properties": {
+            "deploymentId": {
+              "$ref": "#/$defs/DeploymentId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "abandoned"
+            }
+          },
+          "required": [
+            "kind",
+            "deploymentId"
+          ]
+        }
+      ]
+    },
     "DeploymentId": {
       "description": "an identifier",
       "type": "string",
@@ -340,6 +398,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cutover": {
+          "description": "How this app's last new deployment went when it asked for a cut-over and did not get a\nclean one. Absent after a clean cut-over, and for an instance that never asked for one.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CutoverOutcome"
             },
             {
               "type": "null"

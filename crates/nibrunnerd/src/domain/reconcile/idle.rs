@@ -776,6 +776,7 @@ mod sleep_tests {
 
     fn default_idle_policy() -> ActivationPolicy {
         ActivationPolicy {
+            cutover_timeout_ms: None,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },
@@ -1013,6 +1014,7 @@ mod sleep_tests {
             sleep_when: protocol::SleepPolicy::MaxLifetime {
                 ttl_ms: protocol::MaxLifetimeMs::try_from(ttl_ms).unwrap(),
             },
+            cutover_timeout_ms: None,
         }
     }
 
@@ -1074,6 +1076,7 @@ mod sleep_tests {
     async fn an_app_told_never_to_sleep_is_kept_up_where_a_timeout_would_have_let_it_go() {
         let never = protocol::ActivationPolicy {
             sleep_when: protocol::SleepPolicy::Never,
+            cutover_timeout_ms: None,
         };
         let host = host_under(never).await;
         last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 * 10).await;

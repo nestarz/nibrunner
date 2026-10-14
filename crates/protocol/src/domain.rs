@@ -454,11 +454,69 @@ pub enum SleepPolicy {
     MaxLifetime { ttl_ms: MaxLifetimeMs },
 }
 
+/// The shortest and longest a new deployment may be given to become healthy beside the one
+/// still serving.
+pub const MIN_CUTOVER_TIMEOUT_MS: u64 = 1_000;
+pub const MAX_CUTOVER_TIMEOUT_MS: u64 = 3_600_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct CutoverTimeoutMs(u64);
+
+impl CutoverTimeoutMs {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for CutoverTimeoutMs {
+    type Error = InvalidValue;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if (MIN_CUTOVER_TIMEOUT_MS..=MAX_CUTOVER_TIMEOUT_MS).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidValue::new_public("cutoverTimeoutMs is out of range"))
+        }
+    }
+}
+
+impl From<CutoverTimeoutMs> for u64 {
+    fn from(value: CutoverTimeoutMs) -> u64 {
+        value.0
+    }
+}
+
+#[cfg(feature = "schema")]
+impl JsonSchema for CutoverTimeoutMs {
+    fn schema_name() -> Cow<'static, str> {
+        "CutoverTimeoutMs".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::CutoverTimeoutMs").into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "minimum": MIN_CUTOVER_TIMEOUT_MS,
+            "maximum": MAX_CUTOVER_TIMEOUT_MS
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ActivationPolicy {
     pub sleep_when: SleepPolicy,
+    /// How long a new `deploymentId` is given to become healthy beside the deployment still
+    /// serving, before its hostnames are moved over to it and the old one is stopped. A new
+    /// deployment that is not healthy by then is stopped and the old one keeps serving. Absent,
+    /// the old deployment is stopped before the new one starts. An instance with a volume is
+    /// always replaced that way, since two guests cannot write one disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover_timeout_ms: Option<CutoverTimeoutMs>,
 }
 
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;

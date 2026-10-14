@@ -195,6 +195,11 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
         push(&calls, VmCall::Discard);
         Ok(())
     });
+    let calls = spy.calls.clone();
+    vms.expect_exchange().returning(move |_, _| {
+        push(&calls, VmCall::Exchange);
+        Ok(())
+    });
     let (calls, removed_taps) = (spy.calls.clone(), spy.removed_taps.clone());
     vms.expect_delete_tap().returning(move |name: &str| {
         push(&calls, VmCall::DeleteTap);
@@ -374,6 +379,10 @@ impl Vmm for HeldSleeps {
 
     fn working_dir(&self, app_id: &AppId) -> PathBuf {
         self.vms.working_dir(app_id)
+    }
+
+    async fn exchange(&self, first: &AppId, second: &AppId) -> Result<(), VmError> {
+        self.vms.exchange(first, second).await
     }
 }
 

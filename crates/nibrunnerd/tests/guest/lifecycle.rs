@@ -360,6 +360,7 @@ async fn a_document_this_host_refused_changes_nothing_about_the_app_it_is_alread
     let refused = host.document(std::slice::from_ref(&app.clone().edited(|instance| {
         instance.desired_state = DesiredInstanceState::Running;
         instance.activation = Some(protocol::ActivationPolicy {
+            cutover_timeout_ms: None,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },

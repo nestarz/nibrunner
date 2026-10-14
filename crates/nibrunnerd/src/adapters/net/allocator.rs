@@ -120,6 +120,18 @@ impl SlotAllocator {
         self.assignments.remove(app_id);
     }
 
+    /// Hands each of two apps the other's slot, the way the microVMs on them were handed over.
+    pub fn exchange(&mut self, first: &AppId, second: &AppId) {
+        let one = self.assignments.remove(first);
+        let two = self.assignments.remove(second);
+        if let Some(slot) = one {
+            self.assignments.insert(second.clone(), slot);
+        }
+        if let Some(slot) = two {
+            self.assignments.insert(first.clone(), slot);
+        }
+    }
+
     pub fn slots(&self) -> Vec<AppSlot> {
         self.assignments
             .iter()
@@ -148,6 +160,19 @@ mod tests {
             assert_eq!(allocator.allocate(&app(index)).unwrap().slot, index);
         }
         allocator
+    }
+
+    #[test]
+    fn two_apps_exchanging_slots_each_answer_on_the_other_s_port_and_take_no_third() {
+        let mut allocator = allocator();
+        let (live, staged) = (
+            allocator.allocate(&app(1)).unwrap(),
+            allocator.allocate(&app(2)).unwrap(),
+        );
+        allocator.exchange(&app(1), &app(2));
+        assert_eq!(allocator.lookup(&app(1)).unwrap().host_port, staged.host_port);
+        assert_eq!(allocator.lookup(&app(2)).unwrap().host_port, live.host_port);
+        assert_eq!(allocator.assignments().len(), 2);
     }
 
     #[test]

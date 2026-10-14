@@ -470,6 +470,7 @@ fn a_report_omits_what_it_does_not_know() {
         converged_at: None,
         last_exit_code: Some(0),
         message: None,
+        cutover: None,
     };
     let written = serde_json::to_value(&instance).unwrap();
     assert_eq!(written["lastExitCode"], 0);
@@ -859,6 +860,7 @@ mod schema {
                 converged_at: Some(now.clone()),
                 last_exit_code: Some(0),
                 message: Some(StateMessage::new("healthy")),
+                cutover: None,
             }],
             checkpoints: vec![ReportedCheckpoint {
                 checkpoint_id: CheckpointId::parse("ckpt-1").unwrap(),
@@ -1279,4 +1281,70 @@ fn a_memory_scratch_larger_than_the_guest_is_refused_and_a_disk_one_is_not() {
         serde_json::json!({ "kind": "disk", "mib": 257 }),
     ))
     .unwrap();
+}
+
+#[test]
+fn a_running_instance_may_name_how_long_a_new_deployment_has_to_become_healthy_beside_it() {
+    let running = read(instance_with(|document| {
+        document["desiredState"] = serde_json::json!("running");
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "never" },
+            "cutoverTimeoutMs": 600000
+        });
+    }))
+    .expect("parses");
+    assert_eq!(
+        running.activation().cutover_timeout_ms.map(CutoverTimeoutMs::get),
+        Some(600_000)
+    );
+    let written = serde_json::to_value(&running).unwrap();
+    assert_eq!(written["activation"]["cutoverTimeoutMs"], 600_000);
+}
+
+#[test]
+fn an_instance_that_names_no_cutover_timeout_is_stopped_before_its_replacement_starts() {
+    let unnamed = read(instance_with(|document| {
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 }
+        });
+    }))
+    .expect("parses");
+    assert_eq!(unnamed.activation().cutover_timeout_ms, None);
+    let written = serde_json::to_value(&unnamed).unwrap();
+    assert!(written["activation"].get("cutoverTimeoutMs").is_none());
+    assert_eq!(
+        read(instance_json()).unwrap().activation().cutover_timeout_ms,
+        None
+    );
+}
+
+#[test]
+fn a_cutover_timeout_outside_its_range_refuses_the_instance() {
+    for timeout in [0, MIN_CUTOVER_TIMEOUT_MS - 1, MAX_CUTOVER_TIMEOUT_MS + 1] {
+        let refused = read(instance_with(|document| {
+            document["activation"] = serde_json::json!({
+                "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+                "cutoverTimeoutMs": timeout
+            });
+        }));
+        assert!(refused.is_err(), "{timeout}");
+    }
+}
+
+#[test]
+fn a_cutover_outcome_is_reported_by_kind() {
+    assert_eq!(
+        serde_json::to_value(CutoverOutcome::Fallback {
+            reason: CutoverFallback::NoRoom
+        })
+        .unwrap(),
+        serde_json::json!({ "kind": "fallback", "reason": "no-room" })
+    );
+    assert_eq!(
+        serde_json::to_value(CutoverOutcome::Abandoned {
+            deployment_id: DeploymentId::parse("dep-2").unwrap()
+        })
+        .unwrap(),
+        serde_json::json!({ "kind": "abandoned", "deploymentId": "dep-2" })
+    );
 }

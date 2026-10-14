@@ -741,6 +741,7 @@ mod tests {
             state.instances = vec![desired_instance(|instance| {
                 instance.activation = Some(ActivationPolicy {
                     sleep_when: SleepPolicy::Never,
+                    cutover_timeout_ms: None,
                 });
                 instance.config.health_check = HealthCheck::BootCompleted;
             })];
