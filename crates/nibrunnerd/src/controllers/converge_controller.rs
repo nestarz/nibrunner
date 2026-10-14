@@ -396,6 +396,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_document_giving_one_hostname_to_two_apps_is_refused_and_the_last_one_kept() {
+        let host = test_host().await;
+        let named = |app: &str| {
+            desired_instance(|instance| {
+                instance.app_id = protocol::AppId::parse(app).unwrap();
+                instance.hostnames = vec![app_hostname()];
+            })
+        };
+        let kept = desired_state(|state| state.instances = vec![named("app-1")]);
+        write_desired_state(&host.config.desired_state_file, &kept);
+        let mut reconciler = MockReconcileService::new();
+        reconciler.expect_reconcile().times(1).returning(|_, _| ());
+        assert!(controller(&host, reconciler).converge_once().await);
+
+        write_desired_state(
+            &host.config.desired_state_file,
+            &desired_state(|state| state.instances = vec![named("app-1"), named("app-2")]),
+        );
+        let mut reconciler = MockReconcileService::new();
+        reconciler.expect_reconcile().never();
+        assert!(!controller(&host, reconciler).converge_once().await);
+
+        let refusal = host
+            .state
+            .snapshot()
+            .await
+            .desired_refusal
+            .expect("the refusal is reported");
+        assert!(
+            refusal.as_str().contains("routes to one app"),
+            "{}",
+            refusal.as_str()
+        );
+        assert_eq!(host.cache.lock().await.latest(), Some(&kept));
+    }
+
+    #[tokio::test]
     async fn the_last_document_this_host_was_given_is_what_a_restart_converges_on_first() {
         let host = test_host().await;
         host.repositories
