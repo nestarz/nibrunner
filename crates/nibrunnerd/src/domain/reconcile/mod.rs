@@ -177,6 +177,30 @@ async fn apply_sleeps(host: &Host, plan: &ReconcilePlan) {
     }
 }
 
+/// A snapshot kept unwoken past the app's snapshotTtlMs is the disk an app nobody asks for holds
+/// on to. Deleting it leaves the app asleep: the next request boots it rather than restoring it.
+async fn expire_snapshots(host: &Host, desired: &HostDesiredState) {
+    for wanted in &desired.instances {
+        let Some(ttl) = wanted.activation().snapshot_ttl_ms else {
+            continue;
+        };
+        let Some(_transition) = host.state.try_transition(&wanted.app_id) else {
+            continue;
+        };
+        if !host
+            .state
+            .record(&wanted.app_id)
+            .await
+            .is_some_and(|record| record.is_idle())
+        {
+            continue;
+        }
+        host.vms
+            .expire_snapshot(&wanted.app_id, std::time::Duration::from_millis(ttl.get()))
+            .await;
+    }
+}
+
 async fn apply_holds(host: &Host, plan: &ReconcilePlan) {
     for action in &plan.instances {
         if let InstancePlan::Hold { desired } = action {
@@ -291,6 +315,7 @@ pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Tr
 
     volumes::apply_volumes(host, &plan, &observed, desired, trigger).await;
     apply_sleeps(host, &plan).await;
+    expire_snapshots(host, desired).await;
     apply_holds(host, &plan).await;
     network::apply_activators(host).await;
     network::apply_network(host).await;
@@ -684,6 +709,51 @@ mod tests {
         let record = host.state.record(&app_id()).await.unwrap();
         assert_eq!(record.state, InstanceState::Failed);
         assert!(record.message.unwrap().as_str().contains("used its 5 restarts"));
+    }
+
+    fn kept_for_a_day(state: DesiredInstanceState) -> protocol::HostDesiredState {
+        desired_state(|document| {
+            document.instances = vec![desired_instance(|instance| {
+                instance.desired_state = state;
+                instance.activation = Some(protocol::ActivationPolicy {
+                    sleep_when: protocol::SleepPolicy::Never,
+                    snapshot_ttl_ms: Some(protocol::SnapshotTtlMs::try_from(86_400_000).unwrap()),
+                });
+            })];
+        })
+    }
+
+    #[tokio::test]
+    async fn only_the_snapshot_of_an_app_asleep_that_names_a_ttl_is_asked_to_expire() {
+        let host = test_host().await;
+        host.state
+            .put_record(instance_record(|record| record.state = InstanceState::Idle))
+            .await;
+
+        expire_snapshots(&host, &kept_for_a_day(DesiredInstanceState::Running)).await;
+        assert_eq!(host.vms.calls(), vec![VmCall::ExpireSnapshot]);
+
+        expire_snapshots(&host, &running_app()).await;
+        assert_eq!(host.vms.calls(), vec![VmCall::ExpireSnapshot]);
+
+        host.state
+            .update_record(&app_id(), |record| record.state = InstanceState::Running)
+            .await;
+        expire_snapshots(&host, &kept_for_a_day(DesiredInstanceState::Running)).await;
+        assert_eq!(host.vms.calls(), vec![VmCall::ExpireSnapshot]);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_mid_transition_is_left_for_the_next_pass() {
+        let host = test_host().await;
+        host.state
+            .put_record(instance_record(|record| record.state = InstanceState::Idle))
+            .await;
+        let _waking = host.state.transition(&app_id()).await;
+
+        expire_snapshots(&host, &kept_for_a_day(DesiredInstanceState::Running)).await;
+
+        assert!(host.vms.calls().is_empty());
     }
 
     #[tokio::test]

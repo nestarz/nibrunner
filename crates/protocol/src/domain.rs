@@ -580,11 +580,66 @@ pub enum SleepPolicy {
     MaxLifetime { ttl_ms: MaxLifetimeMs },
 }
 
+/// The shortest and longest a sleeping instance's memory snapshot may be kept unwoken.
+pub const MIN_SNAPSHOT_TTL_MS: u64 = 60_000;
+pub const MAX_SNAPSHOT_TTL_MS: u64 = 2_592_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct SnapshotTtlMs(u64);
+
+impl SnapshotTtlMs {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for SnapshotTtlMs {
+    type Error = InvalidValue;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if (MIN_SNAPSHOT_TTL_MS..=MAX_SNAPSHOT_TTL_MS).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidValue::new_public("snapshotTtlMs is out of range"))
+        }
+    }
+}
+
+impl From<SnapshotTtlMs> for u64 {
+    fn from(value: SnapshotTtlMs) -> u64 {
+        value.0
+    }
+}
+
+#[cfg(feature = "schema")]
+impl JsonSchema for SnapshotTtlMs {
+    fn schema_name() -> Cow<'static, str> {
+        "SnapshotTtlMs".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::SnapshotTtlMs").into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "minimum": MIN_SNAPSHOT_TTL_MS,
+            "maximum": MAX_SNAPSHOT_TTL_MS
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ActivationPolicy {
     pub sleep_when: SleepPolicy,
+    /// How long the memory snapshot of an instance asleep is kept without a wake. Past that it is
+    /// deleted, and the next request boots the instance afresh. Absent, it is kept until the next
+    /// wake. Only an instance that sleeps has a snapshot for this to apply to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_ttl_ms: Option<SnapshotTtlMs>,
 }
 
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;

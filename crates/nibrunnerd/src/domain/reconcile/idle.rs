@@ -901,6 +901,7 @@ mod sleep_tests {
                 sleep_when: protocol::SleepPolicy::TrafficIdle {
                     timeout_ms: IdleTimeoutMs::try_from(120_000).unwrap(),
                 },
+                snapshot_ttl_ms: None,
             },
         )]);
         last_reached(&host, 61_000).await;
@@ -922,6 +923,7 @@ mod sleep_tests {
         assert!(!reclaim_due(&policies[&app_id()], record, &snapshot, 1, now));
         let never = ActivationPolicy {
             sleep_when: protocol::SleepPolicy::Never,
+            snapshot_ttl_ms: None,
         };
         assert!(!reclaim_due(&never, record, &snapshot, 0, now));
         let mut stale = snapshot;
@@ -1109,6 +1111,7 @@ mod sleep_tests {
             sleep_when: protocol::SleepPolicy::MaxLifetime {
                 ttl_ms: protocol::MaxLifetimeMs::try_from(ttl_ms).unwrap(),
             },
+            snapshot_ttl_ms: None,
         }
     }
 
@@ -1170,6 +1173,7 @@ mod sleep_tests {
     async fn an_app_told_never_to_sleep_is_kept_up_where_a_timeout_would_have_let_it_go() {
         let never = protocol::ActivationPolicy {
             sleep_when: protocol::SleepPolicy::Never,
+            snapshot_ttl_ms: None,
         };
         let host = host_under(never).await;
         last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 * 10).await;

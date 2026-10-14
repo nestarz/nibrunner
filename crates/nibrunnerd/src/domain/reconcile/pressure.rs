@@ -320,6 +320,7 @@ mod tests {
             sleep_when: SleepPolicy::TrafficIdle {
                 timeout_ms: 300_000.try_into().unwrap(),
             },
+            snapshot_ttl_ms: None,
         }
     }
 
@@ -490,7 +491,8 @@ mod tests {
         assert!(!eligible(
             &running(),
             &ActivationPolicy {
-                sleep_when: SleepPolicy::Never
+                sleep_when: SleepPolicy::Never,
+                snapshot_ttl_ms: None,
             },
             &quiet(),
             None,

@@ -295,6 +295,7 @@ impl DesiredInstance {
                 },
                 DesiredInstanceState::Running | DesiredInstanceState::Stopped => SleepPolicy::Never,
             },
+            snapshot_ttl_ms: None,
         })
     }
 }
