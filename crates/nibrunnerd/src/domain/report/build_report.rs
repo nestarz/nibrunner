@@ -22,7 +22,8 @@ pub fn to_reported_instance(record: &InstanceRecord, last_active_at_ms: Option<i
         last_active_at: last_active_at_ms.map(Timestamp::from_epoch_ms),
         expired_at: record.expired_at_ms.map(Timestamp::from_epoch_ms),
         last_exit_code: record.last_exit_code,
-        message: record.message.clone(),
+        message: record.message.clone().or_else(|| record.cutover_note.clone()),
+        cutover: record.cutover_outcome.clone(),
     }
 }
 
@@ -55,6 +56,7 @@ pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
         instances: inputs
             .records
             .iter()
+            .filter(|record| record.staging_for.is_none())
             .map(|record| to_reported_instance(record, inputs.last_active_at_ms.get(&record.app_id).copied()))
             .collect(),
         checkpoints: inputs.checkpoints,

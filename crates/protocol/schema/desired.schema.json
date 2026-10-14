@@ -58,6 +58,17 @@
     "ActivationPolicy": {
       "type": "object",
       "properties": {
+        "cutoverTimeoutMs": {
+          "description": "How long a new `deploymentId` is given to become healthy beside the deployment still\nserving, before its hostnames are moved over to it and the old one is stopped. A new\ndeployment that is not healthy by then is stopped and the old one keeps serving. Absent,\nthe old deployment is stopped before the new one starts. An instance with a volume is\nalways replaced that way, since two guests cannot write one disk.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CutoverTimeoutMs"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sleepWhen": {
           "$ref": "#/$defs/SleepPolicy"
         }
@@ -156,6 +167,11 @@
         "workingDirectory",
         "environment"
       ]
+    },
+    "CutoverTimeoutMs": {
+      "type": "integer",
+      "maximum": 3600000,
+      "minimum": 1000
     },
     "DeploymentId": {
       "description": "an identifier",

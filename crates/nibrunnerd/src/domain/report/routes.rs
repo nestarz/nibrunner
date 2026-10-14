@@ -13,7 +13,7 @@ pub struct RouteTarget {
 pub fn renderable_routes(records: &[InstanceRecord]) -> Vec<RouteTarget> {
     records
         .iter()
-        .filter(|record| !record.hostnames.is_empty())
+        .filter(|record| !record.hostnames.is_empty() && record.staging_for.is_none())
         .map(|record| RouteTarget {
             app_id: record.app_id.clone(),
             deployment_id: record.deployment_id.clone(),

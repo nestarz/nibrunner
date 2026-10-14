@@ -101,6 +101,7 @@ mod tests {
             sleep_when: SleepPolicy::TrafficIdle {
                 timeout_ms: IdleTimeoutMs::try_from(TIMEOUT_MS).unwrap(),
             },
+            cutover_timeout_ms: None,
         }
     }
 
@@ -109,12 +110,14 @@ mod tests {
             sleep_when: SleepPolicy::MaxLifetime {
                 ttl_ms: MaxLifetimeMs::try_from(TTL_MS).unwrap(),
             },
+            cutover_timeout_ms: None,
         }
     }
 
     fn never() -> ActivationPolicy {
         ActivationPolicy {
             sleep_when: SleepPolicy::Never,
+            cutover_timeout_ms: None,
         }
     }
 

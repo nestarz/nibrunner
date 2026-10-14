@@ -43,13 +43,31 @@ impl RuntimePolicy {
             .settings
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A new deployment booted beside the one serving is held to the limits of the app it
+        // will become; an app the document itself names by that id keeps its own.
+        let staged = |instance: &DesiredInstance| {
+            instance
+                .activation()
+                .cutover_timeout_ms
+                .and_then(|_| crate::domain::reconcile::cutover::staging_id(&instance.app_id))
+        };
         settings.instances = instances
             .iter()
-            .filter_map(|instance| instance.limits.map(|limits| (instance.app_id.clone(), limits)))
+            .filter_map(|instance| Some((staged(instance)?, instance.limits?)))
+            .chain(
+                instances
+                    .iter()
+                    .filter_map(|instance| instance.limits.map(|limits| (instance.app_id.clone(), limits))),
+            )
             .collect();
         settings.resources = instances
             .iter()
-            .map(|instance| (instance.app_id.clone(), instance.config.resources))
+            .filter_map(|instance| Some((staged(instance)?, instance.config.resources)))
+            .chain(
+                instances
+                    .iter()
+                    .map(|instance| (instance.app_id.clone(), instance.config.resources)),
+            )
             .collect();
     }
 
@@ -178,5 +196,23 @@ mod tests {
         policy.replace_instances(&[]);
         assert_eq!(policy.http_limits(&app_id()), None);
         assert_eq!(policy.vm_budget(&app_id()), None);
+    }
+
+    #[test]
+    fn a_deployment_booted_beside_the_serving_one_is_held_to_its_app_s_budget() {
+        let policy = RuntimePolicy::default();
+        let instance = crate::test_support::desired_instance(|instance| {
+            instance.activation = Some(protocol::ActivationPolicy {
+                sleep_when: protocol::SleepPolicy::Never,
+                cutover_timeout_ms: Some(protocol::CutoverTimeoutMs::try_from(600_000).unwrap()),
+            });
+        });
+        policy.replace_instances(std::slice::from_ref(&instance));
+        let staged = crate::domain::reconcile::cutover::staging_id(&app_id()).unwrap();
+        assert_eq!(policy.vm_budget(&staged), policy.vm_budget(&app_id()));
+        assert!(policy.vm_budget(&staged).is_some());
+
+        policy.replace_instances(&[crate::test_support::desired_instance(|_| {})]);
+        assert!(policy.vm_budget(&staged).is_none());
     }
 }

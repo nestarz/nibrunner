@@ -278,6 +278,7 @@ mod tests {
                 instance.desired_state = protocol::DesiredInstanceState::OnRequest;
                 instance.activation = Some(ActivationPolicy {
                     sleep_when: SleepPolicy::Never,
+                    cutover_timeout_ms: None,
                 });
             })]
         }));
@@ -354,6 +355,7 @@ mod tests {
                 instance.desired_state = protocol::DesiredInstanceState::OnRequest;
                 instance.activation = Some(ActivationPolicy {
                     sleep_when: SleepPolicy::Never,
+                    cutover_timeout_ms: None,
                 });
             })];
         });
