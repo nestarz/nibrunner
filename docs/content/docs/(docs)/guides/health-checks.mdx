@@ -62,5 +62,37 @@ instance is reported `exited` with `lastExitCode` set to the program's status (t
 plus the signal), and it is not started again until a new `deploymentId`. It is reported `failed`
 only when the guest went down without saying how the program ended.
 
+## New deployments
+
+By default a new `deploymentId` stops the running instance before the new one boots, so the app
+is down while the new deployment starts. Name `activation.cutoverTimeoutMs` to start the new
+deployment first:
+
+```json
+"activation": {
+  "sleepWhen": { "kind": "never" },
+  "cutoverTimeoutMs": 600000
+}
+```
+
+| What happens | Reported `message` |
+| --- | --- |
+| The new deployment passes its health check: its hostnames move to it, then the old one is stopped | none |
+| It is not healthy within `cutoverTimeoutMs`: it is stopped and the old deployment keeps serving | `cutover_abandoned: ...` |
+| The instance writes to a volume: the old one is stopped first | `cutover_fallback: ...` |
+| The host has no room for both within `cutoverTimeoutMs`: the old one is stopped first | `cutover_fallback: ...` |
+
+The instance's `cutover` says the same as a value: `{ "kind": "fallback", "reason": "volume" }`
+(or `no-room`, `no-staging-name`), or `{ "kind": "abandoned", "deploymentId": "..." }`.
+
+An abandoned deployment is not tried again until the document names another `deploymentId`. While
+both run, the host needs the memory of both. The app's `hostPort` changes at the cut-over, since
+the new deployment runs on a slot of its own.
+
+<Callout title="Why not with a volume">
+  Two guests cannot mount one disk, so an instance with a volume is always stopped before its new
+  deployment starts.
+</Callout>
+
 The [reference](/docs/reference/desired) lists every field of a health check and a restart
 policy.

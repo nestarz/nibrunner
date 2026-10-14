@@ -43,9 +43,12 @@ impl TenantLogReceiver {
         Arc::new(Self::default())
     }
 
+    /// Listens for the guest of the microVM answering to `app_id`, and says what it writes is
+    /// `source`'s: the same app, unless the microVM is a new deployment booted beside it.
     pub async fn attach(
         self: &Arc<Self>,
         app_id: AppId,
+        source: AppId,
         deployment_id: DeploymentId,
         socket_path: PathBuf,
         sink: Arc<dyn LogSink>,
@@ -53,7 +56,7 @@ impl TenantLogReceiver {
         let mut attachments = self.attachments.lock().await;
         if let Some(existing) = attachments.get(&app_id) {
             if existing.socket_path == socket_path {
-                *existing.source.lock().await = (app_id, deployment_id);
+                *existing.source.lock().await = (source, deployment_id);
                 return Ok(());
             }
         }
@@ -71,7 +74,7 @@ impl TenantLogReceiver {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(PRIVATE_SOCKET_MODE))?;
         }
-        let source = Arc::new(Mutex::new((app_id.clone(), deployment_id)));
+        let source = Arc::new(Mutex::new((source, deployment_id)));
         let (detached, detaching) = watch::channel(());
         let task = tokio::spawn(serve(listener, source.clone(), sink, detaching));
         attachments.insert(
@@ -91,6 +94,19 @@ impl TenantLogReceiver {
         if let Some(attachment) = attachments.remove(app_id) {
             attachment.task.abort();
             let _ = std::fs::remove_file(&attachment.socket_path);
+        }
+    }
+
+    /// Follows two microVMs that were handed each other's app id. What each guest writes is
+    /// still said to be the app it was written for, and the guests keep their connections.
+    pub async fn exchange(&self, first: &AppId, second: &AppId) {
+        let mut attachments = self.attachments.lock().await;
+        let one = attachments.remove(first);
+        let two = attachments.remove(second);
+        for (now_for, attachment) in [(second, one), (first, two)] {
+            if let Some(attachment) = attachment {
+                attachments.insert(now_for.clone(), attachment);
+            }
         }
     }
 
@@ -371,7 +387,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -407,7 +429,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -457,7 +485,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -490,7 +524,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -526,7 +566,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -561,7 +607,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -602,7 +654,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -641,7 +699,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -687,7 +751,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -730,7 +800,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -764,7 +840,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -800,7 +882,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -833,7 +921,13 @@ mod tests {
         ));
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -878,13 +972,25 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
         let guest = UnixStream::connect(&socket_path).await.unwrap();
         let newer = DeploymentId::parse("dep-2").unwrap();
         receiver
-            .attach(app_id(), newer.clone(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                newer.clone(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
         drop(guest);
@@ -918,11 +1024,11 @@ mod tests {
         let first = tenant_log_socket_path(&directory.path().join("one"));
         let second = tenant_log_socket_path(&directory.path().join("two"));
         receiver
-            .attach(app_id(), deployment_id(), first.clone(), sink.clone())
+            .attach(app_id(), app_id(), deployment_id(), first.clone(), sink.clone())
             .await
             .unwrap();
         receiver
-            .attach(app_id(), deployment_id(), second.clone(), sink)
+            .attach(app_id(), app_id(), deployment_id(), second.clone(), sink)
             .await
             .unwrap();
         assert_eq!(receiver.attached().await, vec![app_id()]);
@@ -938,7 +1044,13 @@ mod tests {
         let (sink, _) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         assert!(receiver
-            .attach(app_id(), deployment_id(), tenant_log_socket_path(&occupied), sink)
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                tenant_log_socket_path(&occupied),
+                sink
+            )
             .await
             .is_err());
         assert!(receiver.attached().await.is_empty());
@@ -951,7 +1063,13 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink.clone())
+            .attach(
+                app_id(),
+                app_id(),
+                deployment_id(),
+                socket_path.clone(),
+                sink.clone(),
+            )
             .await
             .unwrap();
 
@@ -980,7 +1098,7 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink)
+            .attach(app_id(), app_id(), deployment_id(), socket_path.clone(), sink)
             .await
             .unwrap();
 
@@ -1012,7 +1130,7 @@ mod tests {
         let (sink, spy) = mocks::log_sink();
         let receiver = TenantLogReceiver::new();
         receiver
-            .attach(app_id(), deployment_id(), socket_path.clone(), sink)
+            .attach(app_id(), app_id(), deployment_id(), socket_path.clone(), sink)
             .await
             .unwrap();
 

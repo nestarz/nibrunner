@@ -63,6 +63,19 @@ pub struct VmRecord {
     pub signal: Option<i32>,
     #[serde(default)]
     pub stop_requested: bool,
+    /// Where this microVM's files are when they are not named after the app it answers to: one
+    /// booted beside the deployment still serving keeps the files it was booted with once it
+    /// takes the app over, since Firecracker holds them open under the names it was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<VmFiles>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmFiles {
+    pub working_dir: PathBuf,
+    pub api_socket: PathBuf,
+    pub console: PathBuf,
 }
 
 impl VmRecord {
@@ -169,8 +182,23 @@ impl VmProcesses {
         &self.boot_id
     }
 
+    fn recorded_files(&self, app_id: &AppId) -> Option<VmFiles> {
+        self.read_record(app_id).and_then(|record| record.files)
+    }
+
+    fn api_socket_named(&self, stem: &str) -> PathBuf {
+        self.runtime_dir.join(format!("vm-{stem}.sock"))
+    }
+
+    fn console_named(&self, stem: &str) -> PathBuf {
+        self.runtime_dir.join(format!("vm-{stem}.console"))
+    }
+
     pub fn api_socket(&self, app_id: &AppId) -> PathBuf {
-        self.runtime_dir.join(format!("vm-{app_id}.sock"))
+        self.recorded_files(app_id).map_or_else(
+            || self.api_socket_named(app_id.as_str()),
+            |files| files.api_socket,
+        )
     }
 
     pub fn record_path(&self, app_id: &AppId) -> PathBuf {
@@ -178,7 +206,49 @@ impl VmProcesses {
     }
 
     pub fn console_path(&self, app_id: &AppId) -> PathBuf {
-        self.runtime_dir.join(format!("vm-{app_id}.console"))
+        self.recorded_files(app_id)
+            .map_or_else(|| self.console_named(app_id.as_str()), |files| files.console)
+    }
+
+    /// The files of a microVM run from `working_dir`, named after that directory, so that one
+    /// booted under a directory of its own owns sockets no other microVM's name can reach.
+    fn files_from(&self, working_dir: &Path) -> VmFiles {
+        let stem = working_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        VmFiles {
+            working_dir: working_dir.to_path_buf(),
+            api_socket: self.api_socket_named(&stem),
+            console: self.console_named(&stem),
+        }
+    }
+
+    fn record_holding(&self, pid: i32) -> Option<VmRecord> {
+        std::fs::read_dir(&self.runtime_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| read_json::<VmRecord>(&entry.path()).ok().flatten())
+            .find(|record| record.pid == pid)
+    }
+
+    /// Hands each of two microVMs the other's app, files and all, so that whichever app id is
+    /// asked for afterwards reaches the other microVM. Nothing a running Firecracker holds is
+    /// renamed: each record keeps naming the files its microVM was started with.
+    pub fn exchange(
+        &self,
+        (first, first_dir): (&AppId, &Path),
+        (second, second_dir): (&AppId, &Path),
+    ) -> std::io::Result<()> {
+        let missing = || std::io::Error::other("a microVM to be exchanged has no process record");
+        let mut one = self.read_record(first).ok_or_else(missing)?;
+        let mut two = self.read_record(second).ok_or_else(missing)?;
+        one.files = Some(one.files.take().unwrap_or_else(|| self.files_from(first_dir)));
+        two.files = Some(two.files.take().unwrap_or_else(|| self.files_from(second_dir)));
+        one.app_id = second.clone();
+        two.app_id = first.clone();
+        self.write_record(&one)?;
+        self.write_record(&two)
     }
 
     pub fn read_record(&self, app_id: &AppId) -> Option<VmRecord> {
@@ -192,9 +262,10 @@ impl VmProcesses {
     }
 
     pub fn forget(&self, app_id: &AppId) {
+        let (api_socket, console) = (self.api_socket(app_id), self.console_path(app_id));
         let _ = std::fs::remove_file(self.record_path(app_id));
-        let _ = std::fs::remove_file(self.api_socket(app_id));
-        let _ = std::fs::remove_file(self.console_path(app_id));
+        let _ = std::fs::remove_file(api_socket);
+        let _ = std::fs::remove_file(console);
     }
 
     pub fn adopted_app_ids(&self) -> Vec<AppId> {
@@ -295,11 +366,12 @@ impl VmProcesses {
         config_file: Option<&Path>,
     ) -> std::io::Result<VmRecord> {
         make_directory(&self.runtime_dir, RUNTIME_DIR_MODE)?;
-        let api_socket = self.api_socket(app_id);
+        let files = self.files_from(working_dir);
+        let api_socket = files.api_socket.clone();
         let _ = std::fs::remove_file(&api_socket);
         let _ = std::fs::remove_file(working_dir.join(guest_contract::vsock::GUEST_VSOCK_FILENAME));
 
-        let console = std::fs::File::create(self.console_path(app_id))?;
+        let console = std::fs::File::create(&files.console)?;
         let mut command = self.command(app_id, binary)?;
 
         command
@@ -368,6 +440,7 @@ impl VmProcesses {
             exit_code: None,
             signal: None,
             stop_requested: false,
+            files: (files.api_socket != self.api_socket_named(app_id.as_str())).then_some(files),
         };
         self.write_record(&record)?;
 
@@ -380,11 +453,15 @@ impl VmProcesses {
         let app_id = app_id.clone();
         tokio::spawn(async move {
             let exit = exit_of(child.wait().await);
-            if let Some(mut record) = processes.read_record(&app_id) {
-                if record.pid == pid {
-                    record.ended(exit);
-                    let _ = processes.write_record(&record);
-                }
+            // The app it was started for may have been handed to another microVM since, and
+            // this one given another app's record.
+            let held = processes
+                .read_record(&app_id)
+                .filter(|record| record.pid == pid)
+                .or_else(|| processes.record_holding(pid));
+            if let Some(mut record) = held {
+                record.ended(exit);
+                let _ = processes.write_record(&record);
             }
         });
         Ok(record)
@@ -497,6 +574,7 @@ mod tests {
                     exit_code: None,
                     signal: None,
                     stop_requested: false,
+                    files: None,
                 })
                 .unwrap();
             assert!(processes.freeze(&app_id()).await.is_err());
@@ -653,6 +731,7 @@ mod tests {
                 exit_code: None,
                 signal: None,
                 stop_requested: false,
+                files: None,
             })
             .unwrap();
         let status = processes.status(&app_id());
@@ -678,6 +757,7 @@ mod tests {
                 exit_code: None,
                 signal: None,
                 stop_requested: false,
+                files: None,
             })
             .unwrap();
         let status = processes.status(&app_id());
@@ -701,6 +781,7 @@ mod tests {
             exit_code: Some(1),
             signal: None,
             stop_requested: false,
+            files: None,
         };
         processes.write_record(&record).unwrap();
         let crashed = processes.status(&app_id());
@@ -788,6 +869,7 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 stop_requested: true,
+                files: None,
             })
             .unwrap();
         std::fs::write(processes.console_path(&app_id()), b"[nibrun] gone\n").unwrap();
@@ -816,6 +898,90 @@ mod tests {
         );
         assert_ne!(processes.api_socket(&app_id()), processes.api_socket(&neighbour));
         assert_eq!(processes.boot_id(), "boot-1");
+    }
+
+    fn record_of(app: &AppId, pid: i32) -> VmRecord {
+        VmRecord {
+            app_id: app.clone(),
+            pid,
+            start_ticks: None,
+            frozen: false,
+            firecracker_version: None,
+            host_boot_id: "boot-1".into(),
+            started_at_ms: 0,
+            exit_code: None,
+            signal: None,
+            stop_requested: false,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn two_exchanged_microvms_each_answer_to_the_other_s_app_through_the_files_they_were_started_with() {
+        let directory = tempfile::tempdir().unwrap();
+        let processes = processes(directory.path());
+        let staged = AppId::parse("app-1--next").unwrap();
+        let (live_dir, staged_dir) = (
+            directory.path().join("app-1"),
+            directory.path().join("app-1--next.dep-2"),
+        );
+        processes.write_record(&record_of(&app_id(), 10)).unwrap();
+        processes
+            .write_record(&VmRecord {
+                files: Some(processes.files_from(&staged_dir)),
+                ..record_of(&staged, 20)
+            })
+            .unwrap();
+
+        processes
+            .exchange((&app_id(), &live_dir), (&staged, &staged_dir))
+            .unwrap();
+
+        assert_eq!(processes.read_record(&app_id()).unwrap().pid, 20);
+        assert_eq!(processes.read_record(&staged).unwrap().pid, 10);
+        assert_eq!(
+            processes.api_socket(&app_id()),
+            directory.path().join("vm-app-1--next.dep-2.sock")
+        );
+        assert_eq!(
+            processes.api_socket(&staged),
+            directory.path().join("vm-app-1.sock")
+        );
+        assert_eq!(
+            processes.read_record(&staged).unwrap().files.unwrap().working_dir,
+            live_dir
+        );
+        assert_eq!(processes.record_holding(10).unwrap().app_id, staged);
+    }
+
+    #[test]
+    fn forgetting_an_exchanged_microvm_takes_the_files_it_was_started_with_and_leaves_the_other_s() {
+        let directory = tempfile::tempdir().unwrap();
+        let processes = processes(directory.path());
+        let staged = AppId::parse("app-1--next").unwrap();
+        let staged_dir = directory.path().join("app-1--next.dep-2");
+        processes.write_record(&record_of(&app_id(), 10)).unwrap();
+        processes
+            .write_record(&VmRecord {
+                files: Some(processes.files_from(&staged_dir)),
+                ..record_of(&staged, 20)
+            })
+            .unwrap();
+        processes
+            .exchange(
+                (&app_id(), &directory.path().join("app-1")),
+                (&staged, &staged_dir),
+            )
+            .unwrap();
+        let (old_console, new_console) = (processes.console_path(&staged), processes.console_path(&app_id()));
+        std::fs::write(&old_console, b"old").unwrap();
+        std::fs::write(&new_console, b"new").unwrap();
+
+        processes.forget(&staged);
+
+        assert!(!old_console.exists());
+        assert!(new_console.exists());
+        assert_eq!(processes.read_record(&app_id()).unwrap().pid, 20);
     }
 
     #[test]
@@ -970,6 +1136,7 @@ mod tests {
                 exit_code: None,
                 signal: None,
                 stop_requested: false,
+                files: None,
             })
             .unwrap();
         processes.stop(&app_id()).await;

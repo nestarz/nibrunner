@@ -279,6 +279,7 @@ mod tests {
                 instance.activation = Some(ActivationPolicy {
                     first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
+                    cutover_timeout_ms: None,
                 });
             })]
         }));
@@ -356,6 +357,7 @@ mod tests {
                 instance.activation = Some(ActivationPolicy {
                     first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
+                    cutover_timeout_ms: None,
                 });
             })];
         });

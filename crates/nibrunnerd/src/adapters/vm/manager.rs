@@ -62,7 +62,22 @@ impl VmManager {
     }
 
     pub fn working_dir_for(&self, app_id: &AppId) -> PathBuf {
-        self.vm_dir.join(app_id.as_str())
+        self.processes
+            .read_record(app_id)
+            .and_then(|record| record.files)
+            .map_or_else(|| self.vm_dir.join(app_id.as_str()), |files| files.working_dir)
+    }
+
+    /// Where a microVM booted now runs from. One booted beside the deployment still serving gets
+    /// a directory no app id can name, so that it can take the app over without anything it was
+    /// started with being moved, and a later one booted beside it does not land on its files.
+    fn boot_dir(&self, request: &BootRequest) -> PathBuf {
+        let app_id = &request.desired.app_id;
+        if request.staged_for.is_none() || self.processes.read_record(app_id).is_some() {
+            return self.working_dir_for(app_id);
+        }
+        self.vm_dir
+            .join(format!("{app_id}.{}", request.desired.deployment_id))
     }
 
     fn api(&self, app_id: &AppId) -> FirecrackerApi {
@@ -114,7 +129,7 @@ impl VmManager {
         Ok(path.display().to_string())
     }
 
-    async fn stage(&self, request: &BootRequest) -> Result<PathBuf, VmError> {
+    async fn stage(&self, request: &BootRequest) -> Result<(PathBuf, PathBuf), VmError> {
         let slot = &request.slot;
         let host = |error: crate::adapters::net::attachment::NetworkError| VmError::Host(error.message());
         self.network
@@ -134,7 +149,7 @@ impl VmManager {
             .await
             .map_err(host)?;
 
-        let working_dir = self.working_dir_for(&request.desired.app_id);
+        let working_dir = self.boot_dir(request);
         make_directory(&working_dir, VM_DIR_MODE).map_err(|error| VmError::Host(error.to_string()))?;
 
         let (data_device_path, writable) = match &request.writable {
@@ -202,13 +217,17 @@ impl VmManager {
         self.logs
             .attach(
                 request.desired.app_id.clone(),
+                request
+                    .staged_for
+                    .clone()
+                    .unwrap_or_else(|| request.desired.app_id.clone()),
                 request.desired.deployment_id.clone(),
                 tenant_log_socket_path(&working_dir),
                 self.sink.clone(),
             )
             .await
             .map_err(|error| VmError::Host(error.to_string()))?;
-        Ok(config_file)
+        Ok((working_dir, config_file))
     }
 
     /// Whether this microVM may be snapshotted now, and its share of the disk while it is.
@@ -305,11 +324,10 @@ impl Vmm for VmManager {
         let app_id = request.desired.app_id.clone();
         self.discard_snapshot(&app_id);
         let staged = std::time::Instant::now();
-        let config_file = self.stage(&request).await?;
+        let (working_dir, config_file) = self.stage(&request).await?;
         let staged_ms = staged.elapsed().as_millis();
 
         let starting = std::time::Instant::now();
-        let working_dir = self.working_dir_for(&app_id);
         let started = self
             .processes
             .spawn(&app_id, &self.firecracker, &working_dir, Some(&config_file))
@@ -565,6 +583,7 @@ impl Vmm for VmManager {
         self.logs
             .attach(
                 app_id.clone(),
+                record.staging_for.unwrap_or_else(|| app_id.clone()),
                 record.deployment_id,
                 tenant_log_socket_path(&working_dir),
                 self.sink.clone(),
@@ -580,6 +599,15 @@ impl Vmm for VmManager {
 
     fn working_dir(&self, app_id: &AppId) -> PathBuf {
         self.working_dir_for(app_id)
+    }
+
+    async fn exchange(&self, first: &AppId, second: &AppId) -> Result<(), VmError> {
+        let (first_dir, second_dir) = (self.working_dir_for(first), self.working_dir_for(second));
+        self.processes
+            .exchange((first, &first_dir), (second, &second_dir))
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        self.logs.exchange(first, second).await;
+        Ok(())
     }
 }
 
@@ -1093,6 +1121,7 @@ mod tests {
                 layer_image_paths: vec![PathBuf::from("/cache/abc/executable-0123456789abcdef.squashfs")],
                 fetched_bytes: 0,
             },
+            staged_for: None,
         }
     }
 
@@ -1102,7 +1131,7 @@ mod tests {
         let request = boot_request(desired_instance(|instance| {
             instance.hostnames = vec![app_hostname()]
         }));
-        let config_file = fixture.manager.stage(&request).await.unwrap();
+        let (_, config_file) = fixture.manager.stage(&request).await.unwrap();
 
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config_file).unwrap()).unwrap();
@@ -1177,7 +1206,7 @@ mod tests {
     async fn a_memory_scratch_boots_with_no_data_drive_and_tells_the_guest_how_large_its_tmpfs_is() {
         let fixture = fixture();
         let request = scratch_request(protocol::Scratch::Memory { mib: mib(512) });
-        let config_file = fixture.manager.stage(&request).await.unwrap();
+        let (_, config_file) = fixture.manager.stage(&request).await.unwrap();
 
         let drives = drive_paths(&config_file);
         assert_eq!(drives.len(), 3, "{drives:?}");
@@ -1196,7 +1225,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"what the last boot wrote").unwrap();
 
-        let config_file = fixture.manager.stage(&request).await.unwrap();
+        let (_, config_file) = fixture.manager.stage(&request).await.unwrap();
 
         let drives = drive_paths(&config_file);
         assert_eq!(drives[2], path.display().to_string());
@@ -1309,6 +1338,29 @@ mod tests {
             !paths.directory.exists(),
             "an unloadable snapshot is discarded, not left"
         );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_booted_beside_the_serving_one_runs_from_a_directory_no_app_id_names() {
+        let fixture = fixture();
+        let staged = protocol::AppId::parse("app-1--next").unwrap();
+        let (working_dir, _) = fixture
+            .manager
+            .stage(&BootRequest {
+                staged_for: Some(app_id()),
+                ..boot_request(desired_instance(|instance| instance.app_id = staged.clone()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            working_dir,
+            fixture
+                .manager
+                .vm_dir
+                .join(format!("app-1--next.{}", deployment_id()))
+        );
+        assert_ne!(working_dir, fixture.manager.working_dir_for(&staged));
+        assert_eq!(fixture.manager.logs.attached().await, vec![staged]);
     }
 
     #[tokio::test]

@@ -321,6 +321,7 @@ mod tests {
             sleep_when: SleepPolicy::TrafficIdle {
                 timeout_ms: 300_000.try_into().unwrap(),
             },
+            cutover_timeout_ms: None,
         }
     }
 
@@ -492,7 +493,8 @@ mod tests {
             &running(),
             &ActivationPolicy {
                 first_boot: protocol::FirstBoot::Eager,
-                sleep_when: SleepPolicy::Never
+                sleep_when: SleepPolicy::Never,
+                cutover_timeout_ms: None,
             },
             &quiet(),
             None,
