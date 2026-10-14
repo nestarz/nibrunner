@@ -744,6 +744,7 @@ mod tests {
             state.volumes = vec![desired_volume(|_| {})];
             state.instances = vec![desired_instance(|instance| {
                 instance.activation = Some(ActivationPolicy {
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                 });
                 instance.config.health_check = HealthCheck::BootCompleted;

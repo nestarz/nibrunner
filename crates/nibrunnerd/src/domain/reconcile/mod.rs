@@ -171,8 +171,10 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
 
 async fn apply_sleeps(host: &Host, plan: &ReconcilePlan) {
     for action in &plan.instances {
-        if let InstancePlan::Sleep { desired } = action {
-            instances::sleep_instance(host, desired).await;
+        match action {
+            InstancePlan::Sleep { desired } => instances::sleep_instance(host, desired).await,
+            InstancePlan::Declare { desired } => instances::declare_instance(host, desired).await,
+            _ => {}
         }
     }
 }
@@ -708,6 +710,109 @@ mod tests {
         );
         assert_eq!(host.repositories.instances.all().await.unwrap().len(), 1);
         assert_eq!(host.repositories.slots.all().await.unwrap().len(), 1);
+    }
+
+    fn lazy_app(deployment: &str) -> protocol::HostDesiredState {
+        desired_state(|state| {
+            state.volumes = vec![desired_volume(|_| {})];
+            state.instances = vec![desired_instance(|instance| {
+                instance.deployment_id = protocol::DeploymentId::parse(deployment).unwrap();
+                instance.desired_state = DesiredInstanceState::OnRequest;
+                instance.activation = Some(protocol::ActivationPolicy {
+                    sleep_when: protocol::SleepPolicy::TrafficIdle {
+                        timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
+                    },
+                    first_boot: protocol::FirstBoot::Lazy,
+                });
+                instance.hostnames = vec![app_hostname()];
+            })];
+        })
+    }
+
+    #[tokio::test]
+    async fn a_lazy_app_is_declared_routable_and_fetched_without_being_booted() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Change).await;
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Tick).await;
+
+        assert!(host.vms.calls().is_empty());
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Idle);
+        assert_eq!(record.started_at, None);
+        assert_eq!(
+            host.router
+                .routes()
+                .await
+                .port_for(app_hostname().hostname.as_str()),
+            Some(record.host_port)
+        );
+        assert_eq!(host.activator.listening_for().await, vec![app_id()]);
+        assert!(crate::adapters::vm::layers::layer_image_path(
+            &host.config.artifact_cache_dir(),
+            &layer(|_| {})
+        )
+        .exists());
+    }
+
+    #[tokio::test]
+    async fn the_first_request_to_a_lazy_app_boots_it_as_a_wake_with_nothing_to_restore_does() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Change).await;
+        host.vms.refuse_wake(VmError::SnapshotUnusable {
+            reason: "this host kept none".into(),
+        });
+
+        let outcome = instances::resume_instance(&host, &lazy_app("dep-1").instances[0])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::ports::WakeOutcome::ColdBoot);
+        assert_eq!(host.vms.calls(), vec![VmCall::Wake, VmCall::Boot]);
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_deployment_of_a_lazy_app_never_booted_only_replaces_its_declaration() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Change).await;
+
+        reconcile(host.arc(), &lazy_app("dep-2"), Trigger::Change).await;
+
+        assert_eq!(host.vms.calls(), vec![VmCall::Discard]);
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Idle);
+        assert_eq!(record.deployment_id.as_str(), "dep-2");
+    }
+
+    #[tokio::test]
+    async fn a_lazy_app_never_booted_still_expires_at_its_deadline() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let mut desired = lazy_app("dep-1");
+        desired.instances[0].expiry = Some(protocol::ExpiryPolicy {
+            idle_ms: protocol::ExpiryIdleMs::try_from(protocol::MIN_EXPIRY_IDLE_MS).unwrap(),
+            deadline: Some(protocol::Timestamp::from_epoch_ms(1)),
+        });
+        reconcile(host.arc(), &desired, Trigger::Change).await;
+
+        expiry::apply(host.arc(), crate::clock::now_ms()).await;
+
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Expired);
+        assert!(host
+            .state
+            .admit(&app_id(), crate::clock::now_ms(), || ())
+            .await
+            .is_none());
+        reconcile(host.arc(), &desired, Trigger::Tick).await;
+        assert!(!host.vms.calls().contains(&VmCall::Boot));
     }
 
     #[tokio::test]

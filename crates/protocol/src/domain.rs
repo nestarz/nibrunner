@@ -585,6 +585,27 @@ pub enum SleepPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct ActivationPolicy {
     pub sleep_when: SleepPolicy,
+    /// Whether the host boots the instance once it is declared, or leaves it to its first request.
+    #[serde(default, skip_serializing_if = "FirstBoot::is_eager")]
+    pub first_boot: FirstBoot,
+}
+
+/// When an `on-request` instance is first booted. `lazy` leaves it as one asleep with nothing to
+/// wake from: its layers are fetched and its hostnames answer, but no memory is held for it until a
+/// request boots it. Refused on anything but an `on-request` instance, which nothing would wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum FirstBoot {
+    #[default]
+    Eager,
+    Lazy,
+}
+
+impl FirstBoot {
+    pub fn is_eager(&self) -> bool {
+        *self == FirstBoot::Eager
+    }
 }
 
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;

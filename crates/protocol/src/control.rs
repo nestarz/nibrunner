@@ -15,7 +15,8 @@ use crate::wire::*;
 pub enum DesiredInstanceState {
     /// Keeps the microVM up.
     Running,
-    /// Brings the microVM up for the first deploy and for every request that finds it asleep, and
+    /// Brings the microVM up for the first deploy (unless `activation.firstBoot` is `lazy`, when the
+    /// first request does) and for every request that finds it asleep, and
     /// lets it sleep again once it has been quiet for `idleTimeoutMs`.
     OnRequest,
     /// Takes the microVM down and leaves the app reachable enough to say so.
@@ -295,7 +296,12 @@ impl DesiredInstance {
                 },
                 DesiredInstanceState::Running | DesiredInstanceState::Stopped => SleepPolicy::Never,
             },
+            first_boot: FirstBoot::Eager,
         })
+    }
+
+    pub fn boots_lazily(&self) -> bool {
+        self.activation().first_boot == FirstBoot::Lazy
     }
 }
 
@@ -344,6 +350,12 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             {
                 return Err(InvalidValue::new_public(
                     "only an on-request instance may name a sleepWhen other than never, because nothing would wake it again",
+                ));
+            }
+            if fields.desired_state != DesiredInstanceState::OnRequest && policy.first_boot == FirstBoot::Lazy
+            {
+                return Err(InvalidValue::new_public(
+                    "only an on-request instance may name a lazy firstBoot, because no request would ever boot it",
                 ));
             }
         }
@@ -419,7 +431,10 @@ fn desired_instance_rules(schema: &mut schemars::Schema) {
         "then".into(),
         serde_json::json!({
             "properties": {
-                "activation": { "properties": { "sleepWhen": { "properties": { "kind": { "const": "never" } } } } }
+                "activation": { "properties": {
+                    "sleepWhen": { "properties": { "kind": { "const": "never" } } },
+                    "firstBoot": { "const": "eager" }
+                } }
             }
         }),
     );

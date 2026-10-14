@@ -898,6 +898,7 @@ mod sleep_tests {
         let policies = BTreeMap::from([(
             app_id(),
             ActivationPolicy {
+                first_boot: protocol::FirstBoot::Eager,
                 sleep_when: protocol::SleepPolicy::TrafficIdle {
                     timeout_ms: IdleTimeoutMs::try_from(120_000).unwrap(),
                 },
@@ -921,6 +922,7 @@ mod sleep_tests {
         let now = crate::clock::now_ms();
         assert!(!reclaim_due(&policies[&app_id()], record, &snapshot, 1, now));
         let never = ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::Never,
         };
         assert!(!reclaim_due(&never, record, &snapshot, 0, now));
@@ -1106,6 +1108,7 @@ mod sleep_tests {
 
     fn max_lifetime(ttl_ms: u64) -> protocol::ActivationPolicy {
         protocol::ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::MaxLifetime {
                 ttl_ms: protocol::MaxLifetimeMs::try_from(ttl_ms).unwrap(),
             },
@@ -1169,6 +1172,7 @@ mod sleep_tests {
     #[tokio::test]
     async fn an_app_told_never_to_sleep_is_kept_up_where_a_timeout_would_have_let_it_go() {
         let never = protocol::ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::Never,
         };
         let host = host_under(never).await;
