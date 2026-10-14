@@ -97,6 +97,12 @@ pub enum InstancePlan {
     Sleep {
         desired: DesiredInstance,
     },
+    /// An on-request instance that waits for its first request to boot: its layers are fetched
+    /// and a record left asleep with nothing to wake from, so the request that finds it cold-boots
+    /// it. A declaration of an earlier deployment that is not up is replaced rather than booted.
+    Declare {
+        desired: DesiredInstance,
+    },
     /// A stopped record on a slot of its own for an app the document wants down that this host
     /// has never held, with nothing booted under it: what a stop leaves behind, so that its
     /// hostnames say it is stopped rather than that it is not here.
@@ -206,13 +212,25 @@ fn plan_instance(
     }
     if wanted.desired_state == DesiredInstanceState::OnRequest {
         let Some(current) = current.filter(|instance| instance.present) else {
-            return InstancePlan::Start {
-                desired: wanted.clone(),
+            return if wanted.boots_lazily() {
+                InstancePlan::Declare {
+                    desired: wanted.clone(),
+                }
+            } else {
+                InstancePlan::Start {
+                    desired: wanted.clone(),
+                }
             };
         };
         if current.deployment_id.as_ref() != Some(&wanted.deployment_id) {
-            return InstancePlan::Replace {
-                desired: wanted.clone(),
+            return if wanted.boots_lazily() && !current.running {
+                InstancePlan::Declare {
+                    desired: wanted.clone(),
+                }
+            } else {
+                InstancePlan::Replace {
+                    desired: wanted.clone(),
+                }
             };
         }
         if current.ran_once {
@@ -224,6 +242,10 @@ fn plan_instance(
             return if wanted.expiry.is_some() {
                 InstancePlan::None {
                     app_id: wanted.app_id.clone(),
+                }
+            } else if wanted.boots_lazily() {
+                InstancePlan::Declare {
+                    desired: wanted.clone(),
                 }
             } else {
                 InstancePlan::Replace {
@@ -242,6 +264,10 @@ fn plan_instance(
                 InstancePlan::None {
                     app_id: wanted.app_id.clone(),
                 }
+            }
+        } else if current.refused && wanted.boots_lazily() {
+            InstancePlan::Declare {
+                desired: wanted.clone(),
             }
         } else if current.refused {
             InstancePlan::Start {
@@ -712,6 +738,114 @@ mod tests {
                 ObservedState::default(),
             );
             assert_eq!(result.instances, vec![InstancePlan::Hold { desired: stopped() }]);
+        }
+    }
+
+    mod an_app_that_waits_for_its_first_request {
+        use super::*;
+
+        fn lazy() -> DesiredInstance {
+            desired_instance(|instance| {
+                instance.desired_state = DesiredInstanceState::OnRequest;
+                instance.activation = Some(protocol::ActivationPolicy {
+                    sleep_when: protocol::SleepPolicy::TrafficIdle {
+                        timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
+                    },
+                    first_boot: protocol::FirstBoot::Lazy,
+                });
+            })
+        }
+
+        fn declared() -> Vec<InstancePlan> {
+            vec![InstancePlan::Declare { desired: lazy() }]
+        }
+
+        #[test]
+        fn one_this_host_has_never_served_is_declared_rather_than_started() {
+            let result = plan(
+                desired_state(|state| state.instances = vec![lazy()]),
+                ObservedState::default(),
+            );
+            assert_eq!(result.instances, declared());
+        }
+
+        #[test]
+        fn once_declared_it_is_left_asleep_for_the_request_that_boots_it() {
+            let result = plan(
+                desired_state(|state| state.instances = vec![lazy()]),
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| instance.running = false)]
+                }),
+            );
+            assert_eq!(result.instances, vec![InstancePlan::Sleep { desired: lazy() }]);
+        }
+
+        #[test]
+        fn a_new_deployment_of_one_that_is_not_up_replaces_the_declaration_without_booting() {
+            let result = plan(
+                desired_state(|state| state.instances = vec![lazy()]),
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| {
+                        instance.running = false;
+                        instance.deployment_id = Some(DeploymentId::parse("dep-0").unwrap());
+                    })]
+                }),
+            );
+            assert_eq!(result.instances, declared());
+        }
+
+        #[test]
+        fn a_new_deployment_of_one_a_request_brought_up_is_replaced_as_any_other() {
+            let result = plan(
+                desired_state(|state| state.instances = vec![lazy()]),
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| {
+                        instance.deployment_id = Some(DeploymentId::parse("dep-0").unwrap());
+                    })]
+                }),
+            );
+            assert_eq!(result.instances, vec![InstancePlan::Replace { desired: lazy() }]);
+        }
+
+        #[test]
+        fn one_refused_before_it_came_up_is_declared_again_for_the_next_request() {
+            let result = plan(
+                desired_state(|state| state.instances = vec![lazy()]),
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| {
+                        instance.running = false;
+                        instance.refused = true;
+                    })]
+                }),
+            );
+            assert_eq!(result.instances, declared());
+        }
+
+        #[test]
+        fn one_that_expired_stays_expired_and_is_declared_again_once_its_expiry_is_lifted() {
+            let expired = || {
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| {
+                        instance.running = false;
+                        instance.expired = true;
+                    })]
+                })
+            };
+            let retained = plan(
+                desired_state(|state| {
+                    state.instances = vec![desired_instance(|instance| {
+                        *instance = lazy();
+                        instance.expiry = Some(protocol::ExpiryPolicy {
+                            idle_ms: protocol::ExpiryIdleMs::try_from(protocol::MIN_EXPIRY_IDLE_MS).unwrap(),
+                            deadline: None,
+                        });
+                    })]
+                }),
+                expired(),
+            );
+            assert_eq!(retained.instances, vec![InstancePlan::None { app_id: app_id() }]);
+            let lifted = plan(desired_state(|state| state.instances = vec![lazy()]), expired());
+            assert_eq!(lifted.instances, declared());
         }
     }
 
