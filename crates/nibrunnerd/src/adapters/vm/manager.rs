@@ -609,6 +609,26 @@ impl Vmm for VmManager {
         self.logs.exchange(first, second).await;
         Ok(())
     }
+
+    async fn expire_snapshot(&self, app_id: &AppId, kept_for: std::time::Duration) -> bool {
+        let paths = snapshot_paths(&self.snapshot_dir, app_id);
+        // The stamp is the last thing a sleep writes and a wake removes, so its age is how long
+        // the snapshot has been waiting to be woken from.
+        let Ok(written) = std::fs::metadata(&paths.stamp_path).and_then(|info| info.modified()) else {
+            return false;
+        };
+        if written.elapsed().unwrap_or_default() < kept_for {
+            return false;
+        }
+        let bytes = super::snapshot::read_snapshot_bytes(&paths.directory);
+        self.discard_snapshot(app_id);
+        tracing::info!(
+            %app_id,
+            bytes,
+            "a snapshot kept past its snapshotTtlMs was deleted; the next request boots the app afresh"
+        );
+        true
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1337,6 +1357,33 @@ mod tests {
         assert!(
             !paths.directory.exists(),
             "an unloadable snapshot is discarded, not left"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_is_deleted_once_it_has_gone_unwoken_for_its_ttl_and_kept_until_then() {
+        let fixture = fixture();
+        let paths = snapshot_paths(&fixture.manager.snapshot_dir, &app_id());
+        std::fs::create_dir_all(&paths.directory).unwrap();
+        std::fs::write(&paths.memory_path, b"memory").unwrap();
+        std::fs::write(&paths.stamp_path, b"{}").unwrap();
+
+        let an_hour = std::time::Duration::from_secs(3600);
+        assert!(!fixture.manager.expire_snapshot(&app_id(), an_hour).await);
+        assert!(paths.memory_path.exists());
+
+        assert!(
+            fixture
+                .manager
+                .expire_snapshot(&app_id(), std::time::Duration::ZERO)
+                .await
+        );
+        assert!(!paths.directory.exists());
+        assert!(
+            !fixture
+                .manager
+                .expire_snapshot(&app_id(), std::time::Duration::ZERO)
+                .await
         );
     }
 

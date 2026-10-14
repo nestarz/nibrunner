@@ -280,6 +280,7 @@ mod tests {
                     first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                     cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
                 });
             })]
         }));
@@ -358,6 +359,7 @@ mod tests {
                     first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                     cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
                 });
             })];
         });

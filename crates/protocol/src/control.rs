@@ -298,6 +298,7 @@ impl DesiredInstance {
             },
             first_boot: FirstBoot::Eager,
             cutover_timeout_ms: None,
+            snapshot_ttl_ms: None,
         })
     }
 

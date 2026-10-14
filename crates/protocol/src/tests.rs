@@ -1424,3 +1424,67 @@ fn a_cutover_outcome_is_reported_by_kind() {
         serde_json::json!({ "kind": "abandoned", "deploymentId": "dep-2" })
     );
 }
+
+#[test]
+fn a_snapshot_ttl_round_trips_in_activation_and_is_absent_unless_named() {
+    let named = read(instance_with(|document| {
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+            "snapshotTtlMs": 86400000
+        });
+    }))
+    .expect("parses");
+    assert_eq!(
+        named.activation().snapshot_ttl_ms.map(SnapshotTtlMs::get),
+        Some(86_400_000)
+    );
+    assert_eq!(
+        serde_json::to_value(&named).unwrap()["activation"]["snapshotTtlMs"],
+        86_400_000
+    );
+    assert_eq!(read(instance_json()).unwrap().activation().snapshot_ttl_ms, None);
+}
+
+#[test]
+fn a_snapshot_ttl_outside_its_range_refuses_the_instance() {
+    for ttl in [0, MIN_SNAPSHOT_TTL_MS - 1, MAX_SNAPSHOT_TTL_MS + 1] {
+        let refused = read(instance_with(|document| {
+            document["activation"] = serde_json::json!({
+                "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+                "snapshotTtlMs": ttl
+            });
+        }));
+        assert!(refused.is_err(), "{ttl}");
+    }
+}
+
+#[test]
+fn an_instance_may_name_its_first_boot_cutover_and_snapshot_lifetime_together() {
+    let instance = read(instance_with(|document| {
+        document.as_object_mut().unwrap().remove("volumeId");
+        document["scratch"] = serde_json::json!({ "kind": "memory", "mib": 64 });
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+            "firstBoot": "lazy",
+            "cutoverTimeoutMs": 600000,
+            "snapshotTtlMs": 86400000
+        });
+    }))
+    .expect("parses");
+    let policy = instance.activation();
+    assert!(instance.boots_lazily());
+    assert_eq!(
+        policy.cutover_timeout_ms.map(CutoverTimeoutMs::get),
+        Some(600_000)
+    );
+    assert_eq!(policy.snapshot_ttl_ms.map(SnapshotTtlMs::get), Some(86_400_000));
+    assert_eq!(
+        serde_json::to_value(&instance).unwrap()["activation"],
+        serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+            "firstBoot": "lazy",
+            "cutoverTimeoutMs": 600000,
+            "snapshotTtlMs": 86400000
+        })
+    );
+}

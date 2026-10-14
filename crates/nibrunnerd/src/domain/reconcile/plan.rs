@@ -897,6 +897,7 @@ mod tests {
                     },
                     first_boot: protocol::FirstBoot::Lazy,
                     cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
                 });
             })
         }
@@ -1147,6 +1148,7 @@ mod tests {
                     sleep_when: protocol::SleepPolicy::Never,
                     cutover_timeout_ms: Some(protocol::CutoverTimeoutMs::try_from(600_000).unwrap()),
                     first_boot: protocol::FirstBoot::Eager,
+                    snapshot_ttl_ms: None,
                 });
             })
         }

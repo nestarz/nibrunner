@@ -103,6 +103,7 @@ mod tests {
                 timeout_ms: IdleTimeoutMs::try_from(TIMEOUT_MS).unwrap(),
             },
             cutover_timeout_ms: None,
+            snapshot_ttl_ms: None,
         }
     }
 
@@ -113,6 +114,7 @@ mod tests {
                 ttl_ms: MaxLifetimeMs::try_from(TTL_MS).unwrap(),
             },
             cutover_timeout_ms: None,
+            snapshot_ttl_ms: None,
         }
     }
 
@@ -121,6 +123,7 @@ mod tests {
             first_boot: protocol::FirstBoot::Eager,
             sleep_when: SleepPolicy::Never,
             cutover_timeout_ms: None,
+            snapshot_ttl_ms: None,
         }
     }
 

@@ -227,6 +227,11 @@ pub fn vmm() -> (Arc<MockVmm>, VmmSpy) {
         push(&calls, VmCall::Exchange);
         Ok(())
     });
+    let calls = spy.calls.clone();
+    vms.expect_expire_snapshot().returning(move |_, _| {
+        push(&calls, VmCall::ExpireSnapshot);
+        true
+    });
     let (calls, removed_attachments) = (spy.calls.clone(), spy.removed_attachments.clone());
     vms.expect_delete_attachment().returning(move |name: &str| {
         push(&calls, VmCall::DeleteAttachment);
@@ -429,6 +434,10 @@ impl Vmm for HeldSleeps {
 
     async fn exchange(&self, first: &AppId, second: &AppId) -> Result<(), VmError> {
         self.vms.exchange(first, second).await
+    }
+
+    async fn expire_snapshot(&self, app_id: &AppId, kept_for: std::time::Duration) -> bool {
+        self.vms.expire_snapshot(app_id, kept_for).await
     }
 }
 
