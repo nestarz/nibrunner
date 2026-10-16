@@ -11,7 +11,7 @@ use crate::adapters::vm::firecracker_api::FirecrackerApi;
 use crate::adapters::vm::process::VmProcesses;
 use crate::adapters::vm::snapshot::{
     ensure_loadable, measure_snapshot_disk, refusal_to_sleep, snapshot_bytes_for, snapshot_paths, Reserved,
-    SleepSubject, SnapshotStamp, SnapshotsInFlight, StagedSnapshot,
+    SleepSubject, SnapshotHost, SnapshotStamp, SnapshotsInFlight, StagedSnapshot,
 };
 use crate::adapters::vm::status::VmStatus;
 use crate::adapters::vm::time_sync;
@@ -84,6 +84,8 @@ impl VmManager {
             guest_image_version: self.guest_image_version.clone(),
             host_boot_id: self.processes.boot_id().to_string(),
             slot: request.slot.slot,
+            firecracker_version: Some(super::process::FIRECRACKER_VERSION.to_string()),
+            host: SnapshotHost::this_one().clone(),
         }
     }
 
@@ -1345,10 +1347,12 @@ mod tests {
         write_json(
             &paths.stamp_path,
             &SnapshotStamp {
+                firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.to_string()),
                 deployment_id: deployment_id(),
                 guest_image_version: "an-older-image".into(),
                 host_boot_id: fixture.manager.processes.boot_id().to_string(),
                 slot: 0,
+                host: SnapshotHost::this_one().clone(),
             },
         )
         .unwrap();
@@ -1746,10 +1750,12 @@ mod tests {
         write_json(
             &paths.stamp_path,
             &SnapshotStamp {
+                firecracker_version: Some(crate::adapters::vm::process::FIRECRACKER_VERSION.to_string()),
                 deployment_id: deployment_id(),
                 guest_image_version: fixture.manager.guest_image_version.clone(),
                 host_boot_id: fixture.manager.processes.boot_id().to_string(),
                 slot: 0,
+                host: SnapshotHost::this_one().clone(),
             },
         )
         .unwrap();

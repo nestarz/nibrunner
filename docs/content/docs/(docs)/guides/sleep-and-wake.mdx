@@ -74,6 +74,10 @@ to disk. It verifies both files' sizes and SHA-256 hashes before restoring. A mi
 older snapshot without integrity records is discarded; the request starts the app from cold
 instead. Files on its volume survive, but in-memory state does not.
 
+A snapshot also records its Firecracker version, the host kernel and the CPU the guest was given.
+It survives a host reboot onto the same kernel and CPU with the same Firecracker, and the next
+request restores it; one the reboot changed any of the three for is removed when the daemon starts.
+
 <Callout title="Snapshot cost">
   Hashing reads the state and memory once during sleep and once during wake. The guest stays
   paused until the snapshot is committed, so a failed commit can resume it without losing memory.
