@@ -16,8 +16,8 @@ const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_REPLY: usize = 4096;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(PartialEq, Eq)]
-struct FileStamp {
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub(crate) struct FileStamp {
     device: u64,
     inode: u64,
     length: u64,
@@ -33,8 +33,8 @@ impl Inputs {
         for name in ["manifest.json", "vmlinux", "rootfs.ext4"] {
             paths.push(config.guest_image_dir.join(name));
         }
+        // The certificate and key are not inputs: the proxy re-reads them when they change.
         if let Some(tls) = config.proxy.http.as_ref().and_then(|http| http.tls.as_ref()) {
-            paths.extend([tls.certificate.clone(), tls.key.clone()]);
             paths.extend(tls.client_ca.iter().cloned());
         }
         paths
@@ -44,7 +44,7 @@ impl Inputs {
             .map(Self)
     }
 
-    fn stamp(path: &Path) -> io::Result<Option<FileStamp>> {
+    pub(crate) fn stamp(path: &Path) -> io::Result<Option<FileStamp>> {
         match std::fs::metadata(path) {
             Ok(metadata) => Ok(Some(FileStamp {
                 device: metadata.dev(),

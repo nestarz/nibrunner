@@ -466,6 +466,7 @@ async fn test_host_over(
             listen_address: std::net::Ipv4Addr::LOCALHOST.into(),
             port: 8080,
             tls: None,
+            redirect_from_port: None,
         }),
         raw: Some(crate::config::RawPorts {
             listen_address: std::net::Ipv4Addr::LOCALHOST.into(),

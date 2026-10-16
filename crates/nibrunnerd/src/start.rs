@@ -589,6 +589,7 @@ mod tests {
                 key: directory.join("origin.key"),
                 client_ca,
             }),
+            redirect_from_port: None,
         });
         config
     }

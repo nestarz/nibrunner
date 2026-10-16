@@ -1,4 +1,5 @@
 pub mod activator;
+pub mod certificate;
 pub(crate) mod concurrency;
 pub mod datagram_activator;
 pub mod forward;
