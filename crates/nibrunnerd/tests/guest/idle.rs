@@ -21,6 +21,7 @@ async fn a_lifetime_expiry_drains_an_open_request_only_until_its_allowance_is_sp
         instance.activation = Some(ActivationPolicy {
             first_boot: protocol::FirstBoot::Eager,
             snapshot_ttl_ms: None,
+            cutover_timeout_ms: None,
             sleep_when: SleepPolicy::MaxLifetime {
                 ttl_ms: MaxLifetimeMs::try_from(IDLE_TIMEOUT_MS).expect("a lifetime"),
             },
