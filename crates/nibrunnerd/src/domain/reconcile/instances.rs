@@ -165,6 +165,30 @@ pub async fn suspend_instance(host: &Host, app_id: &AppId, why: SleepReason) -> 
         return None;
     };
 
+    // A full snapshot faults the whole guest back in before it is written out, so it holds that
+    // much until it is done. Never reclaimed for: the caller may be reclaiming for someone else.
+    let _memory = match host
+        .reserve_memory_once(
+            app_id,
+            record.resources,
+            crate::domain::memory_admission::MemoryOperation::Snapshot,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(shortfall_mib) => {
+            tracing::info!(%app_id, shortfall_mib, "snapshot waits for memory");
+            host.metrics.sleep_wake.slept(
+                app_id,
+                why,
+                SleepOutcome::Refused,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            );
+            return Some(SleepOutcome::Refused);
+        }
+    };
+
     host.state.mark_snapshotting(app_id, true).await;
     // The port goes to the activator before the guest is paused, not once the batch is done: a
     // host port still pointing at a paused guest connects to nothing for as long as the snapshot

@@ -17,6 +17,7 @@ max_concurrent_vm_starts = 2
 
 [memory_admission]
 mode = "observe"
+reclaim = false
 headroom_mib = 1024
 
 [cron]

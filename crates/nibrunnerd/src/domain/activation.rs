@@ -22,6 +22,9 @@ pub const MAX_ACTIVITY_AGE_MS: i64 = 15_000;
 pub enum SleepReason {
     Quiet,
     LivedLongEnough,
+    /// Put to sleep to make room: the host or its pool is short of memory, or a start or a wake
+    /// needs what this quiet app holds.
+    MemoryPressure,
 }
 
 impl SleepReason {
@@ -29,6 +32,7 @@ impl SleepReason {
         match self {
             SleepReason::Quiet => "idle",
             SleepReason::LivedLongEnough => "max-lifetime",
+            SleepReason::MemoryPressure => "memory-pressure",
         }
     }
 }

@@ -104,6 +104,8 @@ pub enum MemoryAdmissionMode {
     /// Measure and log what a measured decision would have been; refuse exactly what the ceilings
     /// refuse.
     Observe,
+    /// Admit against measured working sets instead of ceilings.
+    Adaptive,
 }
 
 /// Optional. Absent, admission sums ceilings and takes no samples.
@@ -112,8 +114,48 @@ pub enum MemoryAdmissionMode {
 #[schemars(rename = "memory_admission")]
 pub struct MemoryAdmission {
     pub mode: MemoryAdmissionMode,
+    /// A root-level systemd slice the orchestrator has already bounded. Every VMM's cgroup is
+    /// placed under it, and admission respects what is left of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<WorkloadPool>,
+    /// Put quiet on-request apps to sleep before refusing a start or a wake, and while the host or
+    /// the pool is short of memory.
+    #[serde(default)]
+    pub reclaim: bool,
     /// Physical memory held back for the host and bursts; swap never increases this capacity.
     pub headroom_mib: std::num::NonZeroU32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "memory_admission.pool")]
+pub struct WorkloadPool {
+    #[schemars(pattern(r"^[A-Za-z0-9_]+\.slice$"))]
+    pub slice: String,
+    /// The largest `memory.max` the slice may have, every descendant included.
+    pub memory_mib: std::num::NonZeroU32,
+}
+
+impl WorkloadPool {
+    pub(crate) fn membership(&self) -> String {
+        format!("/{}", self.slice)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let valid = self.slice.strip_suffix(".slice").is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+        if !valid {
+            return Err(ConfigError::invalid(
+                "memory_admission.pool.slice",
+                "a root-level slice named with letters, digits or underscores",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Where the world reaches an app on this host.
@@ -758,7 +800,15 @@ impl HostConfig {
                 "max_concurrent_vm_starts",
                 document.max_concurrent_vm_starts,
             )?,
-            memory_admission: document.memory_admission.clone(),
+            memory_admission: match &document.memory_admission {
+                Some(policy) => {
+                    if let Some(pool) = &policy.pool {
+                        pool.validate()?;
+                    }
+                    Some(policy.clone())
+                }
+                None => None,
+            },
             max_apps,
             cron,
             snapshot_dir: path_key("paths.snapshot_dir", &paths.snapshot_dir)?,
@@ -950,6 +1000,8 @@ impl HostConfig {
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2).expect("a positive start limit"),
             memory_admission: Some(MemoryAdmission {
                 mode: MemoryAdmissionMode::Observe,
+                pool: None,
+                reclaim: false,
                 headroom_mib: std::num::NonZeroU32::new(1024).expect("positive headroom"),
             }),
             logs: LogsConfig::default(),
@@ -1483,6 +1535,34 @@ staging_dir = "/var/lib/nibrunner/exports"
 denied_egress_addresses_v4 = []
 denied_egress_addresses_v6 = []
 "#;
+
+    #[test]
+    fn workload_pool_names_are_root_level_slices_and_its_limit_is_nonzero() {
+        let section = |slice: &str, memory_mib: u32| {
+            format!(
+                "{WHOLE}\n[memory_admission]\nmode = \"adaptive\"\nheadroom_mib = 1024\nreclaim = true\n\n[memory_admission.pool]\nslice = {slice:?}\nmemory_mib = {memory_mib}\n"
+            )
+        };
+        let config = parsed(&section("workloads.slice", 4096));
+        let policy = config.memory_admission.as_ref().unwrap();
+        assert_eq!(policy.mode, MemoryAdmissionMode::Adaptive);
+        assert!(policy.reclaim);
+        assert_eq!(policy.pool.as_ref().unwrap().membership(), "/workloads.slice");
+        assert_eq!(parsed(&config.to_toml()), config);
+        for slice in [
+            "workloads",
+            ".slice",
+            "a/b.slice",
+            "../x.slice",
+            "work-loads.slice",
+        ] {
+            assert!(
+                refused(&section(slice, 4096)).contains("memory_admission.pool.slice"),
+                "{slice}"
+            );
+        }
+        assert!(!refused(&section("workloads.slice", 0)).is_empty());
+    }
 
     #[test]
     fn host_tcp_endpoints_are_exact_validated_and_optional() {

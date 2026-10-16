@@ -185,9 +185,26 @@ impl Drop for MemoryHighLift {
     }
 }
 
+static POOLED_PARENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Called once at startup, before any VMM is spawned: a workload pool puts every jail's cgroup
+/// under its slice, so that the slice's limits bound them all together.
+pub(crate) fn place_under_pool(pool: Option<&crate::config::WorkloadPool>) {
+    if let Some(pool) = pool {
+        let _ = POOLED_PARENT.set(format!("{}/{CGROUP_PARENT}", pool.slice));
+    }
+}
+
+/// Where the jailer makes each VMM's cgroup, relative to the unified hierarchy's root.
+pub(crate) fn cgroup_parent() -> &'static str {
+    POOLED_PARENT.get().map_or(CGROUP_PARENT, String::as_str)
+}
+
+/// The cgroup a VMM spawned now is given. One spawned under an earlier configuration is found
+/// through its process instead.
 pub(crate) fn cgroup_path(app_id: &protocol::AppId) -> std::path::PathBuf {
     std::path::Path::new("/sys/fs/cgroup")
-        .join(CGROUP_PARENT)
+        .join(cgroup_parent())
         .join(super::jailer::jail_id(app_id))
 }
 

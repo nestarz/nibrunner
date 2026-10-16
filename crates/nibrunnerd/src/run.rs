@@ -55,6 +55,15 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         extract_jailer(&config.firecracker_dir).map_err(|error| StartupError::Unusable(error.to_string()))?,
         identities,
     );
+    let pool = config
+        .memory_admission
+        .as_ref()
+        .and_then(|policy| policy.pool.as_ref());
+    if let Some(pool) = pool {
+        crate::adapters::cgroup::read_pool(pool)
+            .map_err(|error| StartupError::Unusable(format!("workload pool {}: {error}", pool.slice)))?;
+    }
+    crate::adapters::vm::limits::place_under_pool(pool);
     let commands: Arc<dyn crate::ports::CommandRunner> = Arc::new(HostCommands);
     let state = HostState::shared();
     let repositories = crate::repositories::Repositories::sqlite(
@@ -201,7 +210,8 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     let host = Arc::new(Host {
         cron,
         cron_runs: Arc::new(crate::domain::cron::runs::CronRuns::default()),
-        guest_memory_mib: guest_memory_mib(read_host_memory_mib(), volumes.reserved_cache().memory_mib()),
+        guest_memory_mib: guest_memory_mib(read_host_memory_mib(), volumes.reserved_cache().memory_mib())
+            .min(pool.map_or(u64::MAX, |pool| u64::from(pool.memory_mib.get()))),
         guest_image_version,
         state,
         allocator: allocator.clone(),

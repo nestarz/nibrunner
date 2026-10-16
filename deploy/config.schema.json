@@ -83,6 +83,11 @@
           "description": "Measure and log what a measured decision would have been; refuse exactly what the ceilings\nrefuse.",
           "type": "string",
           "const": "observe"
+        },
+        {
+          "description": "Admit against measured working sets instead of ceilings.",
+          "type": "string",
+          "const": "adaptive"
         }
       ]
     },
@@ -186,12 +191,42 @@
         },
         "mode": {
           "$ref": "#/$defs/MemoryAdmissionMode"
+        },
+        "pool": {
+          "description": "A root-level systemd slice the orchestrator has already bounded. Every VMM's cgroup is\nplaced under it, and admission respects what is left of it.",
+          "$ref": "#/$defs/memory_admission.pool"
+        },
+        "reclaim": {
+          "description": "Put quiet on-request apps to sleep before refusing a start or a wake, and while the host or\nthe pool is short of memory.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
       "required": [
         "mode",
+        "reclaim",
         "headroom_mib"
+      ]
+    },
+    "memory_admission.pool": {
+      "type": "object",
+      "properties": {
+        "memory_mib": {
+          "description": "The largest `memory.max` the slice may have, every descendant included.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "slice": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_]+\\.slice$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "slice",
+        "memory_mib"
       ]
     },
     "metrics": {

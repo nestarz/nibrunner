@@ -58,46 +58,143 @@ pub struct Host {
     pub datagram_activator: Option<Arc<DatagramActivator>>,
 }
 
+/// Quiet apps put to sleep for one start or wake before it is refused anyway.
+const MAX_RECLAIMED_FOR_ONE_START: usize = 4;
+
 impl Host {
-    /// Under `[memory_admission] mode = "observe"`, what a measured decision would have said about
-    /// a start or a wake the ceilings decided, logged beside it. It never changes the decision.
-    pub(crate) async fn observe_memory_admission(
+    /// A start's or a wake's memory, held until its record accounts for it. With `reclaim`, quiet
+    /// on-request apps are put to sleep, lowest priority first, until it fits or none is left.
+    pub(crate) async fn reserve_memory(
+        self: &Arc<Self>,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+        purpose: crate::domain::reconcile::pressure::ReclaimPurpose,
+    ) -> Result<crate::state::MemoryReservation, u64> {
+        use crate::domain::memory_admission::MemoryOperation;
+        let first = self
+            .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+            .await;
+        if first.is_ok()
+            || !self
+                .config
+                .memory_admission
+                .as_ref()
+                .is_some_and(|policy| policy.reclaim)
+        {
+            return first;
+        }
+        let Ok(_reclaiming) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.state.reclaim.lock()).await
+        else {
+            return first;
+        };
+        let mut result = self
+            .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+            .await;
+        for _ in 0..MAX_RECLAIMED_FOR_ONE_START {
+            if result.is_ok()
+                || !crate::domain::reconcile::pressure::reclaim_one(self, purpose, Some(app_id)).await
+            {
+                return result;
+            }
+            result = self
+                .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+                .await;
+        }
+        result
+    }
+
+    pub(crate) async fn reserve_memory_once(
         &self,
         app_id: &AppId,
-        wanted: &protocol::InstanceResources,
-        records: &[crate::domain::report::InstanceRecord],
-        strict_shortfall_mib: u64,
-    ) {
+        wanted: protocol::InstanceResources,
+        operation: crate::domain::memory_admission::MemoryOperation,
+    ) -> Result<crate::state::MemoryReservation, u64> {
         let Some(policy) = &self.config.memory_admission else {
-            return;
+            return self
+                .state
+                .reserve_memory(self.guest_memory_mib, app_id, wanted, operation, None)
+                .await;
         };
-        let Some(available_bytes) = crate::domain::report::capacity::read_memory_available_bytes() else {
-            return;
+        let measured = self.memory_readings(Some(app_id)).await;
+        if measured.is_none()
+            && (policy.mode == crate::config::MemoryAdmissionMode::Adaptive || policy.pool.is_some())
+        {
+            tracing::warn!(%app_id, "memory admission waits for a host memory reading");
+            return Err(u64::from(wanted.memory_mib));
+        }
+        self.state
+            .reserve_memory(self.guest_memory_mib, app_id, wanted, operation, measured)
+            .await
+    }
+
+    /// What the host and every VM it runs were measured at just now, and, for `starting`, what its
+    /// deployment was measured at before. Each running VM's peak is folded into its record on the
+    /// way, so that the next cold start of the deployment knows it.
+    pub(crate) async fn memory_readings(
+        &self,
+        starting: Option<&AppId>,
+    ) -> Option<(
+        crate::config::MemoryAdmissionMode,
+        crate::domain::memory_admission::MemoryReadings,
+    )> {
+        let policy = self.config.memory_admission.as_ref()?;
+        let reservation_generation = self.state.memory_generation();
+        let records = self.state.records().await;
+        let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
+        let apps = self.vms.memory(&ids).await;
+        let pool = match &policy.pool {
+            None => None,
+            Some(configuration) => {
+                let mut pool = crate::adapters::cgroup::read_pool(configuration).ok()?;
+                pool.all_workloads_contained = records
+                    .iter()
+                    .filter(|record| crate::domain::report::capacity::holds_something(record))
+                    .all(|record| {
+                        apps.get(&record.app_id)
+                            .and_then(|memory| memory.cgroup.as_deref())
+                            .is_some_and(|group| pool.contains(group))
+                    });
+                Some(pool)
+            }
         };
-        let others: Vec<_> = records
-            .iter()
-            .filter(|record| &record.app_id != app_id)
-            .cloned()
-            .collect();
-        let ids: Vec<_> = others.iter().map(|record| record.app_id.clone()).collect();
+        let startup = match starting {
+            Some(app) => {
+                let desired = self
+                    .cache
+                    .lock()
+                    .await
+                    .latest()
+                    .and_then(|desired| desired.instances.iter().find(|instance| &instance.app_id == app))
+                    .cloned();
+                match desired {
+                    Some(desired) => Some(self.state.startup_memory(&desired).await),
+                    None => None,
+                }
+            }
+            None => None,
+        };
         let readings = crate::domain::memory_admission::MemoryReadings {
-            available_bytes,
+            startup,
+            pool,
+            reservation_generation,
+            available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
             headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
             measured_at_ms: crate::clock::now_ms(),
-            apps: self.vms.memory(&ids).await,
+            apps,
         };
-        let measured_shortfall_mib = readings.shortfall_mib(
-            self.guest_memory_mib,
-            &others,
-            crate::domain::memory_admission::MemoryReadings::ceiling(*wanted),
-        );
-        tracing::info!(
-            %app_id,
-            mode = ?policy.mode,
-            strict_shortfall_mib,
-            measured_shortfall_mib,
-            "memory admission evaluated"
-        );
+        for record in &records {
+            if let Some(peak) = readings.observed_peak_bytes(record) {
+                self.state
+                    .update_record(&record.app_id, |held| {
+                        if held.deployment_id == record.deployment_id && held.resources == record.resources {
+                            held.memory_peak_bytes = Some(held.memory_peak_bytes.unwrap_or(0).max(peak));
+                        }
+                    })
+                    .await;
+            }
+        }
+        Some((policy.mode, readings))
     }
 
     /// Takes up every instance's `limits` without a new deployment: the proxy's per-instance
@@ -169,7 +266,11 @@ impl Host {
     }
 
     async fn write_down(&self) -> Result<(), crate::domain::store::StoreError> {
-        let snapshot = self.state.snapshot().await;
+        let mut snapshot = self.state.snapshot().await;
+        crate::domain::memory_admission::prune_profiles(
+            &mut snapshot.memory_profiles,
+            crate::clock::now_ms(),
+        );
         let records: Vec<_> = snapshot.records.values().cloned().collect();
         let (assignments, cursor) = {
             let allocator = self.allocator.lock().await;
@@ -177,6 +278,10 @@ impl Host {
         };
 
         self.repositories.slots.replace_all(&assignments, cursor).await?;
+        self.repositories
+            .memory_profiles
+            .replace_all(&snapshot.memory_profiles)
+            .await?;
         self.repositories.instances.replace_all(&records).await?;
         self.repositories
             .activity
@@ -191,6 +296,14 @@ impl Host {
 
     pub async fn load(&self) {
         let records = self.repositories.instances.all().await.unwrap_or_default();
+        let mut memory_profiles = self.repositories.memory_profiles.all().await.unwrap_or_default();
+        for record in &records {
+            crate::domain::memory_admission::remember_profile(
+                &mut memory_profiles,
+                record,
+                crate::clock::now_ms(),
+            );
+        }
         let last_active = self.repositories.activity.all().await.unwrap_or_default();
         let meters = self.repositories.meters.all().await.unwrap_or_default();
         let deleted = self.repositories.deleted_volumes.all().await.unwrap_or_default();
@@ -214,6 +327,7 @@ impl Host {
                     .into_iter()
                     .map(|record| (record.app_id.clone(), record))
                     .collect();
+                snapshot.memory_profiles = memory_profiles;
                 snapshot.last_active_at_ms = last_active;
                 snapshot.meters = meters;
                 snapshot.deleted_volumes = deleted;
@@ -356,6 +470,15 @@ mod tests {
         accepted
     }
 
+    fn quiet_memory_profiles() -> crate::repositories::memory_profiles_repository::MockMemoryProfileRepository
+    {
+        let mut profiles =
+            crate::repositories::memory_profiles_repository::MockMemoryProfileRepository::new();
+        profiles.expect_all().returning(|| Ok(Default::default()));
+        profiles.expect_replace_all().returning(|_| Ok(()));
+        profiles
+    }
+
     fn bundle(
         instances: MockInstanceRepository,
         slots: MockSlotRepository,
@@ -372,6 +495,7 @@ mod tests {
             slots: Arc::new(slots),
             activity: Arc::new(activity),
             meters: Arc::new(quiet_meters()),
+            memory_profiles: Arc::new(quiet_memory_profiles()),
             deleted_volumes: Arc::new(deleted_volumes),
             identity: Arc::new(identity),
             accepted_document: Arc::new(quiet_accepted_document()),

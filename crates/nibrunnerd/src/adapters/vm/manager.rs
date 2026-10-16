@@ -366,7 +366,14 @@ impl VmManager {
                 .map_err(|error| VmError::Host(error.message()))?
                 .ok_or_else(|| VmError::Host("the paused VM has no staged machine configuration".into()))?;
         super::limits::VmLimits::for_machine(&config.machine_config)
-            .and_then(|limits| limits.reserve_snapshot_memory(&super::limits::cgroup_path(app_id)))
+            .and_then(|limits| {
+                limits.reserve_snapshot_memory(
+                    &self
+                        .processes
+                        .cgroup(app_id)
+                        .unwrap_or_else(|| super::limits::cgroup_path(app_id)),
+                )
+            })
             .map_err(|error| VmError::Host(format!("snapshot memory could not be reserved: {error}")))
     }
 
@@ -378,7 +385,11 @@ impl VmManager {
         {
             return Ok(None);
         }
-        super::limits::lift_memory_high(&super::limits::cgroup_path(app_id)).map_err(|error| {
+        let cgroup = self
+            .processes
+            .cgroup(app_id)
+            .unwrap_or_else(|| super::limits::cgroup_path(app_id));
+        super::limits::lift_memory_high(&cgroup).map_err(|error| {
             VmError::Host(format!(
                 "memory.high could not be lifted for the snapshot: {error}"
             ))
@@ -730,10 +741,9 @@ impl Vmm for VmManager {
         else {
             return Ok(());
         };
-        let cgroup = super::limits::cgroup_path(app_id);
-        if !cgroup.exists() {
+        let Some(cgroup) = self.processes.cgroup(app_id) else {
             return Ok(());
-        }
+        };
         super::limits::RuntimeControls::for_instance(resources, limits.as_ref())
             .write(&cgroup, record.pid)
             .map_err(|error| VmError::Host(format!("the instance's limits could not be applied: {error}")))
