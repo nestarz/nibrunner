@@ -256,7 +256,8 @@ impl RunningHost {
             instance: DesiredInstance {
                 app_id: app_id.clone(),
                 deployment_id: DeploymentId::parse(format!("dep-{number}-1")).expect("a deployment id"),
-                volume_id: volume_id.clone(),
+                volume_id: Some(volume_id.clone()),
+                scratch: None,
                 desired_state: DesiredInstanceState::Running,
                 idle_timeout_ms: None,
                 activation: None,

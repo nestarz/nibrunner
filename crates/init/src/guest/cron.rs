@@ -619,6 +619,7 @@ mod tests {
         let config = InstanceConfig {
             http_port: 8080,
             layers: 0,
+            writable: paths::WritableRoot::VolumeDrive,
             program: "/app/server".into(),
             working_directory: "/app".into(),
             hostname: None,
