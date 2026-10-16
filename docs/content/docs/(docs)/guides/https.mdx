@@ -46,10 +46,20 @@ key = "/etc/nibrunner/tls/origin.key"
   every hostname of every app. In practice that means a wildcard, which matches one label:
   `app.example.com` but not `a.b.example.com`.
 - **The daemon does not obtain certificates.** Use certbot or the edge for ACME and renewal. The
-  files are read once, at startup. After renewing, run `systemctl restart nibrunnerd`. This does
-  not stop any app.
-- **One listener only.** You cannot run plain HTTP and TLS side by side. Nothing redirects
-  between them, so two listeners would serve every app both ways.
+  files are re-read whenever either changes, so a renewal needs no restart and stops no app. A pair
+  that does not load, such as a key replaced a moment before its certificate, is refused and the
+  previous certificate keeps serving.
+- **One app listener only.** You cannot run plain HTTP and TLS side by side for apps, because two
+  listeners would serve every app both ways. `redirect_from_port` adds the one plain port that is
+  allowed: it answers every request with a `301` to the same host and path over TLS and serves
+  nothing.
+
+```toml
+[proxy.http]
+listen_address = "0.0.0.0"
+port = 443
+redirect_from_port = 80
+```
 
 ## Client certificates
 

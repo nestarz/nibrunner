@@ -95,6 +95,7 @@ testing = ["dep:mockall"]
 schema = ["protocol/schema"]
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 mockall.workspace = true
