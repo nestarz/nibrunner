@@ -90,7 +90,7 @@ Volumes are sparse files under `paths.state_dir`. There is nothing else to confi
 default.
 
 The limitation: volumes do not survive the machine. Checkpoints and exports are not supported on
-this backend, because they are taken in the object store.
+this backend, because they are taken in the object store, so `[exports]` may be left out.
 
 ### `zerofs`
 
