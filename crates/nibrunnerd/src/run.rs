@@ -203,7 +203,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         cron_runs: Arc::new(crate::domain::cron::runs::CronRuns::default()),
         guest_memory_mib: guest_memory_mib(read_host_memory_mib(), volumes.reserved_cache().memory_mib()),
         guest_image_version,
-        state,
+        state: state.clone(),
         allocator: allocator.clone(),
         repositories,
         exports,
@@ -217,7 +217,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         artifacts,
         payloads,
         firewall: Arc::new(HostFirewall::new(commands)),
-        router: Router::with_concurrency(
+        router: Router::with_state(
             metrics.clone(),
             Some(http_log),
             config
@@ -225,6 +225,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
                 .http
                 .as_ref()
                 .and_then(|http| http.concurrency.clone()),
+            state,
         ),
         tls,
         metrics,

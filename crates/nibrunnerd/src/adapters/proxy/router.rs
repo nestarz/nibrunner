@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use crate::adapters::proxy::forward::{
     forward, hostname_of, note_the_hop, say, ProxyBody, Unreachable, Upstreams,
 };
-use crate::adapters::proxy::http_log::{HttpRequestLog, HttpRequestRecord};
+use crate::adapters::proxy::http_log::{HttpRequestLog, HttpRequestRecord, HttpRequestScope};
 use crate::adapters::proxy::pem;
 use crate::domain::metrics::proxy::Handshake;
 use crate::domain::report::routes::RouteTarget;
@@ -108,6 +108,7 @@ pub struct Router {
     metrics: Arc<HostMetrics>,
     http_log: Option<Arc<HttpRequestLog>>,
     concurrency: Option<super::concurrency::ConcurrencyLimiter>,
+    state: crate::state::SharedState,
 }
 
 impl Router {
@@ -120,7 +121,19 @@ impl Router {
         http_log: Option<Arc<HttpRequestLog>>,
         limits: Option<crate::config::HttpConcurrency>,
     ) -> Arc<Self> {
+        Self::with_state(metrics, http_log, limits, crate::state::HostState::shared())
+    }
+
+    /// A router that refuses an app whose deployment the host's records say has expired, and
+    /// counts every request it carries as the app's activity under the same lock that expires it.
+    pub(crate) fn with_state(
+        metrics: Arc<HostMetrics>,
+        http_log: Option<Arc<HttpRequestLog>>,
+        limits: Option<crate::config::HttpConcurrency>,
+        state: crate::state::SharedState,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            state,
             concurrency: limits.map(super::concurrency::ConcurrencyLimiter::new),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
@@ -228,6 +241,14 @@ impl Router {
             };
             (route, logging)
         };
+        if self
+            .state
+            .record(&route.app_id)
+            .await
+            .is_some_and(|record| record.expired_at_ms.is_some())
+        {
+            return self.logged(expired(), Outcome::Refused, route, logging, started);
+        }
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
         let permit = self
             .concurrency
@@ -247,8 +268,15 @@ impl Router {
                 (response, Outcome::Refused)
             }
             Ok(permit) => {
-                let open =
-                    super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit);
+                let admitted = self
+                    .state
+                    .admit(&route.app_id, crate::clock::now_ms(), || {
+                        super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit)
+                    })
+                    .await;
+                let Some(open) = admitted else {
+                    return self.logged(expired(), Outcome::Refused, route, logging, started);
+                };
                 let upstream = self.upstreams.to(&route.app_id).await;
                 let response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
                 let reached = response.extensions().get::<Unreachable>().is_none();
@@ -263,6 +291,17 @@ impl Router {
                 (response, outcome)
             }
         };
+        self.logged(response, outcome, route, logging, started)
+    }
+
+    fn logged(
+        &self,
+        response: Response<ProxyBody>,
+        outcome: Outcome,
+        route: Route,
+        logging: Option<(HttpRequestScope, String, hyper::Uri)>,
+        started: std::time::Instant,
+    ) -> (Response<ProxyBody>, Outcome, Option<Route>) {
         if let (Some(log), Some((scope, method, uri))) = (&self.http_log, logging) {
             log.record(
                 scope,
@@ -277,6 +316,10 @@ impl Router {
         }
         (response, outcome, Some(route))
     }
+}
+
+fn expired() -> Response<ProxyBody> {
+    say(StatusCode::GONE, "This revision has expired.\n")
 }
 
 // A reply leaves this proxy as more than one write — the headers, then the body, and under TLS the

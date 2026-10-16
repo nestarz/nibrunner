@@ -468,6 +468,8 @@ fn a_report_omits_what_it_does_not_know() {
         last_restart: None,
         started_at: None,
         converged_at: None,
+        last_active_at: None,
+        expired_at: None,
         last_exit_code: Some(0),
         message: None,
     };
@@ -475,6 +477,7 @@ fn a_report_omits_what_it_does_not_know() {
     assert_eq!(written["lastExitCode"], 0);
     assert!(written.get("startedAt").is_none());
     assert!(written.get("convergedAt").is_none());
+    assert!(written.get("lastActiveAt").is_none());
     assert!(written.get("message").is_none());
     assert!(written.get("lastRestart").is_none());
     assert_eq!(written["hostPort"], 21000);
@@ -857,6 +860,8 @@ mod schema {
                 }),
                 started_at: Some(now.clone()),
                 converged_at: Some(now.clone()),
+        last_active_at: None,
+        expired_at: None,
                 last_exit_code: Some(0),
                 message: Some(StateMessage::new("healthy")),
             }],
@@ -891,6 +896,30 @@ mod schema {
             "/instances/0/activation",
             policy,
         )
+    }
+
+    #[test]
+    fn expiry_schema_and_parser_agree_on_state_and_bounds() {
+        let validator = validator(crate::schema::desired_state());
+        for state in ["on-request", "running", "stopped"] {
+            for idle in [
+                MIN_EXPIRY_IDLE_MS - 1,
+                MIN_EXPIRY_IDLE_MS,
+                MAX_EXPIRY_IDLE_MS,
+                MAX_EXPIRY_IDLE_MS + 1,
+            ] {
+                let mut document = desired_json();
+                document["instances"][0]["desiredState"] = state.into();
+                document["instances"][0]["expiry"] = serde_json::json!({"idleMs": idle});
+                let accepted =
+                    state == "on-request" && (MIN_EXPIRY_IDLE_MS..=MAX_EXPIRY_IDLE_MS).contains(&idle);
+                assert_eq!(
+                    serde_json::from_value::<HostDesiredState>(document.clone()).is_ok(),
+                    accepted
+                );
+                assert_eq!(validator.is_valid(&document), accepted);
+            }
+        }
     }
 
     #[test]
@@ -1155,4 +1184,41 @@ mod schema {
             assert_eq!(id, format!("{}{filename}", crate::schema::SCHEMA_ID_BASE));
         }
     }
+}
+
+#[test]
+fn expiry_is_bounded_optional_and_only_for_on_request_instances() {
+    for value in [MIN_EXPIRY_IDLE_MS, MAX_EXPIRY_IDLE_MS] {
+        let mut document = desired_json();
+        document["instances"][0]["expiry"] = serde_json::json!({"idleMs": value});
+        let parsed: HostDesiredState = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(parsed.instances[0].expiry.as_ref().unwrap().idle_ms.get(), value);
+        for state in ["running", "stopped"] {
+            document["instances"][0]["desiredState"] = state.into();
+            assert!(serde_json::from_value::<HostDesiredState>(document.clone()).is_err());
+        }
+    }
+    for value in [MIN_EXPIRY_IDLE_MS - 1, MAX_EXPIRY_IDLE_MS + 1] {
+        assert!(ExpiryIdleMs::try_from(value).is_err());
+    }
+    let parsed: HostDesiredState = serde_json::from_value(desired_json()).unwrap();
+    assert_eq!(parsed.instances[0].expiry, None);
+    assert!(serde_json::to_value(parsed).unwrap()["instances"][0]
+        .get("expiry")
+        .is_none());
+}
+
+#[test]
+fn expiry_deadlines_are_validated_instants_and_legacy_policies_keep_their_encoding() {
+    let legacy = serde_json::json!({"idleMs": MIN_EXPIRY_IDLE_MS});
+    let mut policy: ExpiryPolicy = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!policy.deadline_reached(i64::MAX));
+    assert_eq!(serde_json::to_value(&policy).unwrap(), legacy);
+    policy.deadline = Some(Timestamp::from_epoch_ms(60_000));
+    assert!(!policy.deadline_reached(59_999));
+    assert!(policy.deadline_reached(60_000));
+    assert!(serde_json::from_value::<ExpiryPolicy>(serde_json::json!({
+        "idleMs": MIN_EXPIRY_IDLE_MS, "deadline": "tomorrow"
+    }))
+    .is_err());
 }

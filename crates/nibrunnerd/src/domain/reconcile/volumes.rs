@@ -246,6 +246,11 @@ async fn tear_down_volume(host: &Host, desired: &protocol::DesiredVolume) {
     );
     match torn_down {
         Ok(()) => {
+            if host.state.record(&desired.app_id).await.is_some_and(|r| {
+                r.expired_at_ms.is_some() && r.volume_id == desired.volume_id && r.hostnames.is_empty()
+            }) {
+                host.state.drop_record(&desired.app_id).await;
+            }
             give_back_slot(host, &desired.app_id).await;
             let report = ReportedVolume {
                 volume_id: desired.volume_id.clone(),
