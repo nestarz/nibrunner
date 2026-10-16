@@ -528,6 +528,7 @@ fn a_report_omits_what_it_does_not_know() {
         message: None,
         cutover: None,
         labels: InstanceLabels::default(),
+        cron: Vec::new(),
     };
     let written = serde_json::to_value(&instance).unwrap();
     assert_eq!(written["lastExitCode"], 0);
@@ -538,6 +539,20 @@ fn a_report_omits_what_it_does_not_know() {
     assert!(written.get("message").is_none());
     assert!(written.get("lastRestart").is_none());
     assert_eq!(written["hostPort"], 21000);
+}
+
+#[test]
+fn a_reported_cron_job_names_its_schedule_and_a_digest_of_its_command_but_never_the_command() {
+    let job = ReportedCronJob {
+        job_id: "cron-1".into(),
+        schedule: CronSchedule::parse("@daily").unwrap(),
+        command_digest: Sha256Digest::parse("d".repeat(64)).unwrap(),
+        next_run: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&job).unwrap(),
+        serde_json::json!({ "jobId": "cron-1", "schedule": "@daily", "commandDigest": "d".repeat(64) })
+    );
 }
 
 #[test]
@@ -1047,6 +1062,12 @@ mod schema {
                 message: Some(StateMessage::new("healthy")),
                 cutover: None,
                 labels: serde_json::from_value(serde_json::json!({ "app": "shop", "rev": "r-12" })).unwrap(),
+                cron: vec![ReportedCronJob {
+                    job_id: "cron-mp9IEQFcHoMd3455mmb0Ns4z4GEyMthWViIRFWvri7Y".into(),
+                    schedule: CronSchedule::parse("*/5 * * * *").unwrap(),
+                    command_digest: Sha256Digest::parse("d".repeat(64)).unwrap(),
+                    next_run: Some(now.clone()),
+                }],
             }],
             checkpoints: vec![ReportedCheckpoint {
                 checkpoint_id: CheckpointId::parse("ckpt-1").unwrap(),
@@ -1529,6 +1550,17 @@ mod schema {
             without(reported_json(), "/instances/0/lastRestart/reason"),
             with(reported_json(), "/volumes/0/state", serde_json::json!("lost")),
             without(reported_json(), "/capacity"),
+            with(
+                reported_json(),
+                "/instances/0/cron/0/schedule",
+                serde_json::json!(""),
+            ),
+            with(
+                reported_json(),
+                "/instances/0/cron/0/commandDigest",
+                serde_json::json!("echo hi"),
+            ),
+            without(reported_json(), "/instances/0/cron/0/jobId"),
         ];
         for document in broken {
             assert!(

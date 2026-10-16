@@ -267,7 +267,7 @@ impl Router {
             .as_ref()
             .map(|limits| limits.acquire(&route.app_id))
             .transpose();
-        let (mut response, outcome) = match permit {
+        let (response, outcome) = match permit {
             Err(()) => {
                 let mut response = say(
                     StatusCode::SERVICE_UNAVAILABLE,
