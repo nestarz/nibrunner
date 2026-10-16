@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into memory_profiles (app_id, deployment_id, vcpu_count, memory_mib, peak_bytes, observed_at_ms)\n                 values (?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "71ff5ecf237b96fa500a2e0ee68a5065fbbfa2e512eba146f5fbaa1c3f72722f"
+}

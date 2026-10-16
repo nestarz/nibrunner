@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "select app_id, deployment_id, vcpu_count, memory_mib, peak_bytes, observed_at_ms from memory_profiles",
+  "describe": {
+    "columns": [
+      {
+        "name": "app_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "deployment_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "vcpu_count",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "memory_mib",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "peak_bytes",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "observed_at_ms",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "31a082126f1c1cb58122a8c5c14ecb91d6d77a5eac89ba0e3656ad8cb55b61b5"
+}

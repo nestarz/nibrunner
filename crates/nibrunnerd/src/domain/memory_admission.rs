@@ -8,22 +8,165 @@ const BYTES_PER_MIB: u64 = 1_048_576;
 const MAX_SAMPLE_AGE_MS: i64 = 5_000;
 const MIN_MARGIN_BYTES: u64 = 64 * BYTES_PER_MIB;
 
-/// What a start or a wake is measured against: what the host has available now, what each
-/// running VM has been seen to use, and what each VM may grow to.
+pub type MemoryProfiles = BTreeMap<(AppId, protocol::DeploymentId), MemoryProfile>;
+const MAX_PROFILES: usize = 1024;
+const PROFILE_REFRESH_MS: i64 = 60 * 60 * 1000;
+const PROFILE_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The highest working set one deployment was measured at, under the resources it ran with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryProfile {
+    pub app_id: AppId,
+    pub deployment_id: protocol::DeploymentId,
+    pub resources: InstanceResources,
+    pub peak_bytes: u64,
+    pub observed_at_ms: i64,
+}
+
+impl MemoryProfile {
+    pub(crate) fn peak_for(&self, resources: InstanceResources, now_ms: i64) -> Option<u64> {
+        (self.resources == resources
+            && (0..PROFILE_LIFETIME_MS).contains(&now_ms.saturating_sub(self.observed_at_ms)))
+        .then_some(self.peak_bytes)
+    }
+}
+
+pub(crate) fn prune_profiles(profiles: &mut MemoryProfiles, now_ms: i64) {
+    profiles.retain(|_, p| (0..PROFILE_LIFETIME_MS).contains(&now_ms.saturating_sub(p.observed_at_ms)));
+    while profiles.len() > MAX_PROFILES {
+        let Some(key) = profiles
+            .iter()
+            .min_by_key(|(_, p)| p.observed_at_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        profiles.remove(&key);
+    }
+}
+
+pub(crate) fn remember_profile(profiles: &mut MemoryProfiles, record: &InstanceRecord, now_ms: i64) {
+    if let Some(peak_bytes) = record.memory_peak_bytes.filter(|peak| *peak > 0) {
+        let key = (record.app_id.clone(), record.deployment_id.clone());
+        if profiles.get(&key).is_some_and(|p| {
+            p.resources == record.resources
+                && p.peak_bytes >= peak_bytes
+                && (0..PROFILE_REFRESH_MS).contains(&now_ms.saturating_sub(p.observed_at_ms))
+        }) {
+            prune_profiles(profiles, now_ms);
+            return;
+        }
+        let peak_bytes = profiles
+            .get(&key)
+            .filter(|p| p.resources == record.resources)
+            .map_or(peak_bytes, |p| p.peak_bytes.max(peak_bytes));
+        profiles.insert(
+            key,
+            MemoryProfile {
+                app_id: record.app_id.clone(),
+                deployment_id: record.deployment_id.clone(),
+                resources: record.resources,
+                peak_bytes,
+                observed_at_ms: now_ms,
+            },
+        );
+    }
+    prune_profiles(profiles, now_ms);
+}
+
+pub(crate) fn restore_profile(profiles: &MemoryProfiles, record: &mut InstanceRecord, now_ms: i64) {
+    if let Some(profile) = profiles
+        .get(&(record.app_id.clone(), record.deployment_id.clone()))
+        .filter(|p| {
+            p.resources == record.resources
+                && (0..PROFILE_LIFETIME_MS).contains(&now_ms.saturating_sub(p.observed_at_ms))
+        })
+    {
+        record.memory_peak_bytes = Some(record.memory_peak_bytes.unwrap_or(0).max(profile.peak_bytes));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryOperation {
+    Start,
+    Snapshot,
+}
+
+pub(crate) struct StartupMemory {
+    pub deployment_id: protocol::DeploymentId,
+    pub resources: InstanceResources,
+    pub peak_bytes: Option<u64>,
+}
+
+pub(crate) fn target_from_peak(ceiling: u64, peak: u64) -> u64 {
+    peak.saturating_add((peak / 4).max(MIN_MARGIN_BYTES)).min(ceiling)
+}
+
 pub(crate) struct MemoryReadings {
+    pub startup: Option<StartupMemory>,
+    pub reservation_generation: u64,
     pub available_bytes: u64,
     pub headroom_bytes: u64,
     pub measured_at_ms: i64,
     pub apps: BTreeMap<AppId, ReportedMemory>,
+    pub pool: Option<PoolMemory>,
+}
+
+pub(crate) struct PoolMemory {
+    pub membership: String,
+    pub current_bytes: u64,
+    pub reclaimable_file_bytes: u64,
+    pub high_bytes: u64,
+    pub max_bytes: u64,
+    pub all_workloads_contained: bool,
+}
+
+impl PoolMemory {
+    pub(crate) fn working_set_bytes(&self) -> u64 {
+        self.current_bytes.saturating_sub(self.reclaimable_file_bytes)
+    }
+
+    pub(crate) fn contains(&self, membership: &str) -> bool {
+        std::path::Path::new(membership).starts_with(&self.membership) && membership != self.membership
+    }
 }
 
 impl MemoryReadings {
-    /// The most a VM of these resources can make its cgroup charge: the ceiling the jailer gives it.
-    pub(crate) fn ceiling(resources: InstanceResources) -> u64 {
-        crate::adapters::vm::limits::memory_max_bytes(resources.memory_mib)
+    pub(crate) fn is_fresh(&self, now_ms: i64) -> bool {
+        now_ms
+            .checked_sub(self.measured_at_ms)
+            .is_some_and(|age| (0..=MAX_SAMPLE_AGE_MS).contains(&age))
     }
 
-    fn running_memory(&self, record: &InstanceRecord) -> Option<&ReportedMemory> {
+    /// The most a VM can make its cgroup charge: the ceiling the jailer gives these resources, or
+    /// the larger one a VM still running under earlier resources was measured with.
+    pub(crate) fn ceiling(&self, app: &AppId, resources: InstanceResources) -> u64 {
+        let observed = self
+            .apps
+            .get(app)
+            .and_then(|memory| memory.limits.as_ref())
+            .and_then(|limits| limits.max_bytes)
+            .unwrap_or(0);
+        crate::adapters::vm::limits::memory_max_bytes(resources.memory_mib).max(observed)
+    }
+
+    pub(crate) fn strict_pool_shortfall_mib(
+        &self,
+        records: &[InstanceRecord],
+        reserved_bytes: u64,
+        wanted_bytes: u64,
+    ) -> u64 {
+        let Some(pool) = &self.pool else { return 0 };
+        let committed = records
+            .iter()
+            .filter(|record| super::report::capacity::holds_something(record))
+            .fold(reserved_bytes.saturating_add(wanted_bytes), |total, record| {
+                total.saturating_add(self.ceiling(&record.app_id, record.resources))
+            });
+        committed.saturating_sub(pool.max_bytes).div_ceil(BYTES_PER_MIB)
+    }
+
+    fn resident_memory(&self, record: &InstanceRecord) -> Option<&ReportedMemory> {
         if record.state != InstanceState::Running {
             return None;
         }
@@ -32,44 +175,79 @@ impl MemoryReadings {
         if !(0..=MAX_SAMPLE_AGE_MS).contains(&age)
             || memory.measured_at.epoch_ms() < record.started_at.as_ref()?.epoch_ms()
             || memory.limits.as_ref()?.max_bytes.is_none()
+            || memory.proportional_set_bytes.is_none()
         {
             return None;
         }
         Some(memory)
     }
 
-    fn growth_bytes(&self, record: &InstanceRecord) -> u64 {
-        let ceiling = Self::ceiling(record.resources);
-        let Some(memory) = self.running_memory(record) else {
-            return ceiling;
-        };
-        let ceiling = ceiling.max(
+    pub(crate) fn observed_peak_bytes(&self, record: &InstanceRecord) -> Option<u64> {
+        let memory = self.resident_memory(record)?;
+        Some(
             memory
-                .limits
-                .as_ref()
-                .and_then(|limits| limits.max_bytes)
-                .unwrap_or(ceiling),
-        );
-        // Swapped pages can fault back in. Compressed swap is never extra physical capacity.
-        let peak = memory
-            .peak_bytes
-            .unwrap_or(memory.current_bytes)
-            .max(memory.current_bytes)
-            .saturating_add(memory.swap_bytes);
-        let target = peak.saturating_add((peak / 4).max(MIN_MARGIN_BYTES)).min(ceiling);
-        target.saturating_sub(memory.current_bytes)
+                .peak_bytes
+                .unwrap_or(memory.current_bytes)
+                .max(memory.current_bytes)
+                .max(memory.proportional_set_bytes.unwrap_or(0))
+                .saturating_add(memory.swap_bytes),
+        )
     }
 
-    /// What the host is short of growing every VM that holds memory to its measured target and
-    /// starting one more of `wanted_bytes`, beside `capacity_mib` and what is available now.
+    pub(crate) fn wake_target_bytes(&self, record: &InstanceRecord) -> u64 {
+        let ceiling = self.ceiling(&record.app_id, record.resources).max(
+            self.resident_memory(record)
+                .and_then(|memory| memory.limits.as_ref())
+                .and_then(|limits| limits.max_bytes)
+                .unwrap_or(0),
+        );
+        let Some(peak) = self
+            .observed_peak_bytes(record)
+            .into_iter()
+            .chain(record.memory_peak_bytes)
+            .max()
+        else {
+            return ceiling;
+        };
+        target_from_peak(ceiling, peak)
+    }
+
+    fn growth_bytes(&self, record: &InstanceRecord) -> u64 {
+        let ceiling = self.ceiling(&record.app_id, record.resources);
+        let Some(memory) = self.resident_memory(record) else {
+            if record.state == InstanceState::Starting && record.memory_peak_bytes.is_some() {
+                return self.wake_target_bytes(record);
+            }
+            return ceiling;
+        };
+        self.wake_target_bytes(record)
+            .saturating_sub(memory.current_bytes)
+    }
+
+    pub(crate) fn anonymous_resident_bytes(&self, record: &InstanceRecord) -> u64 {
+        self.resident_memory(record)
+            .map(|memory| {
+                memory
+                    .anonymous_set_bytes
+                    .unwrap_or(0)
+                    .min(memory.proportional_set_bytes.unwrap_or(0))
+                    .min(memory.current_bytes)
+            })
+            .unwrap_or(0)
+    }
+
     pub(crate) fn shortfall_mib(
         &self,
         capacity_mib: u64,
         records: &[InstanceRecord],
+        reserved_bytes: u64,
+        resident_reserved_bytes: u64,
         wanted_bytes: u64,
     ) -> u64 {
-        let mut future = wanted_bytes;
-        let mut targets = future;
+        let mut future = reserved_bytes
+            .saturating_sub(resident_reserved_bytes)
+            .saturating_add(wanted_bytes);
+        let mut targets = reserved_bytes.saturating_add(wanted_bytes);
         for record in records
             .iter()
             .filter(|record| super::report::capacity::holds_something(record))
@@ -77,7 +255,7 @@ impl MemoryReadings {
             let growth = self.growth_bytes(record);
             future = future.saturating_add(growth);
             targets = targets.saturating_add(growth).saturating_add(
-                self.running_memory(record)
+                self.resident_memory(record)
                     .map_or(0, |memory| memory.current_bytes),
             );
         }
@@ -85,7 +263,17 @@ impl MemoryReadings {
             .saturating_add(self.headroom_bytes)
             .saturating_sub(self.available_bytes);
         let budget_shortfall = targets.saturating_sub(capacity_mib.saturating_mul(BYTES_PER_MIB));
-        physical_shortfall.max(budget_shortfall).div_ceil(BYTES_PER_MIB)
+        let pool_shortfall = self.pool.as_ref().map_or(0, |pool| {
+            let budget = pool.high_bytes.min(pool.max_bytes);
+            let available = budget.saturating_sub(pool.working_set_bytes());
+            future
+                .saturating_sub(available)
+                .max(targets.saturating_sub(budget))
+        });
+        physical_shortfall
+            .max(budget_shortfall)
+            .max(pool_shortfall)
+            .div_ceil(BYTES_PER_MIB)
     }
 }
 
@@ -95,24 +283,25 @@ mod tests {
     use crate::test_support::{app_id, instance_record};
     use protocol::{ReportedMemoryLimits, Timestamp};
 
-    const CEILING_MIB: u64 = 2048;
-
     fn readings() -> MemoryReadings {
         MemoryReadings {
+            startup: None,
+            pool: None,
+            reservation_generation: 0,
             available_bytes: 2048 * BYTES_PER_MIB,
             headroom_bytes: 1024 * BYTES_PER_MIB,
             measured_at_ms: 10_000,
             apps: BTreeMap::from([(
                 app_id(),
                 ReportedMemory {
-                    measured_at: Timestamp::from_epoch_ms(10_000),
                     cgroup: None,
-                    proportional_set_bytes: None,
-                    anonymous_set_bytes: None,
+                    proportional_set_bytes: Some(256 * BYTES_PER_MIB),
+                    anonymous_set_bytes: Some(256 * BYTES_PER_MIB),
+                    measured_at: Timestamp::from_epoch_ms(10_000),
                     limits: Some(ReportedMemoryLimits {
                         low_bytes: 0,
                         high_bytes: None,
-                        max_bytes: Some(CEILING_MIB * BYTES_PER_MIB),
+                        max_bytes: Some(2048 * BYTES_PER_MIB),
                         swap_max_bytes: None,
                     }),
                     current_bytes: 256 * BYTES_PER_MIB,
@@ -134,32 +323,189 @@ mod tests {
         })
     }
 
+    fn pool(current_mib: u64) -> PoolMemory {
+        PoolMemory {
+            membership: "/workloads.slice".into(),
+            current_bytes: current_mib * BYTES_PER_MIB,
+            reclaimable_file_bytes: 0,
+            high_bytes: 1800 * BYTES_PER_MIB,
+            max_bytes: 2048 * BYTES_PER_MIB,
+            all_workloads_contained: true,
+        }
+    }
+
+    #[test]
+    fn startup_history_expires_is_bounded_and_never_crosses_resource_changes() {
+        let now = PROFILE_LIFETIME_MS * 2;
+        let mut profiles = MemoryProfiles::new();
+        for index in 0..MAX_PROFILES + 5 {
+            let record = crate::test_support::instance_record(|r| {
+                r.app_id = AppId::parse(format!("app-{index}")).unwrap();
+                r.memory_peak_bytes = Some(128 * BYTES_PER_MIB);
+            });
+            remember_profile(&mut profiles, &record, now + index as i64);
+        }
+        assert_eq!(profiles.len(), MAX_PROFILES);
+        let mut record = crate::test_support::instance_record(|r| {
+            r.app_id = AppId::parse(format!("app-{}", MAX_PROFILES)).unwrap();
+        });
+        restore_profile(&profiles, &mut record, now + MAX_PROFILES as i64);
+        assert_eq!(record.memory_peak_bytes, Some(128 * BYTES_PER_MIB));
+        record.memory_peak_bytes = None;
+        record.resources.memory_mib += 1;
+        restore_profile(&profiles, &mut record, now + MAX_PROFILES as i64);
+        assert_eq!(record.memory_peak_bytes, None);
+        prune_profiles(&mut profiles, now + PROFILE_LIFETIME_MS + 2048);
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn parent_usage_limits_admission_even_when_the_host_has_free_memory() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        observed.pool = Some(pool(1700));
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 156);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 412);
+        observed.pool = Some(pool(2200));
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 256);
+    }
+
+    #[test]
+    fn clean_inactive_file_cache_does_not_block_admission_or_expand_the_hard_budget() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        let mut pool = pool(1700);
+        pool.reclaimable_file_bytes = 300 * BYTES_PER_MIB;
+        observed.pool = Some(pool);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 0);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 112);
+        assert_eq!(
+            observed.strict_pool_shortfall_mib(&[], 0, 2304 * BYTES_PER_MIB),
+            256
+        );
+        observed.available_bytes = 1024 * BYTES_PER_MIB;
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 256 * BYTES_PER_MIB), 256);
+    }
+
+    #[test]
+    fn strict_pool_admission_charges_host_limits_including_vm_overhead() {
+        let mut observed = readings();
+        observed.pool = Some(pool(256));
+        assert_eq!(
+            observed.strict_pool_shortfall_mib(&[running()], 0, 256 * BYTES_PER_MIB),
+            256
+        );
+        assert_eq!(
+            observed.shortfall_mib(8192, &[running()], 0, 0, 256 * BYTES_PER_MIB),
+            0
+        );
+    }
+
+    #[test]
+    fn a_changing_soft_budget_queues_growth_without_changing_the_hard_quota() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        let mut measured = pool(1024);
+        measured.high_bytes = 1280 * BYTES_PER_MIB;
+        observed.pool = Some(measured);
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 256);
+        observed.pool.as_mut().unwrap().high_bytes = 1800 * BYTES_PER_MIB;
+        assert_eq!(observed.shortfall_mib(8192, &[], 0, 0, 512 * BYTES_PER_MIB), 0);
+        assert_eq!(observed.pool.as_ref().unwrap().max_bytes, 2048 * BYTES_PER_MIB);
+        assert_eq!(
+            observed.strict_pool_shortfall_mib(&[], 0, 2304 * BYTES_PER_MIB),
+            256
+        );
+    }
+
+    #[test]
+    fn containment_requires_a_child_group_and_checks_path_components() {
+        let pool = pool(0);
+        assert!(pool.contains("/workloads.slice/build.slice/compile.service"));
+        assert!(!pool.contains("/workloads.slice"));
+        assert!(!pool.contains("/workloads.slice-other/app.scope"));
+        assert!(!pool.contains("/system.slice/app.scope"));
+    }
+
+    #[test]
+    fn resident_build_memory_reduces_future_growth_but_not_the_reserved_budget() {
+        let observed = readings();
+        assert_eq!(
+            observed.shortfall_mib(8192, &[], 1536 * BYTES_PER_MIB, 0, 512 * BYTES_PER_MIB),
+            1024
+        );
+        assert_eq!(
+            observed.shortfall_mib(
+                8192,
+                &[],
+                1536 * BYTES_PER_MIB,
+                1024 * BYTES_PER_MIB,
+                512 * BYTES_PER_MIB
+            ),
+            0
+        );
+        assert_eq!(
+            observed.shortfall_mib(
+                1024,
+                &[],
+                1536 * BYTES_PER_MIB,
+                1024 * BYTES_PER_MIB,
+                512 * BYTES_PER_MIB
+            ),
+            1024
+        );
+    }
+
     #[test]
     fn a_running_app_reserves_its_peak_margin_without_counting_resident_memory_twice() {
         let observed = readings();
         assert_eq!(observed.growth_bytes(&running()), 384 * BYTES_PER_MIB);
-        assert_eq!(observed.shortfall_mib(8192, &[running()], 512 * BYTES_PER_MIB), 0);
         assert_eq!(
-            observed.shortfall_mib(8192, &[running()], 1024 * BYTES_PER_MIB),
+            observed.shortfall_mib(8192, &[running()], 0, 0, 512 * BYTES_PER_MIB),
+            0
+        );
+        assert_eq!(
+            observed.shortfall_mib(8192, &[running()], 0, 0, 1024 * BYTES_PER_MIB),
             384
         );
     }
 
     #[test]
-    fn swapped_pages_and_host_headroom_are_not_free_capacity() {
+    fn swaps_reservations_and_host_headroom_are_not_free_capacity() {
         let mut observed = readings();
         observed.apps.get_mut(&app_id()).unwrap().swap_bytes = 256 * BYTES_PER_MIB;
         assert_eq!(observed.growth_bytes(&running()), 704 * BYTES_PER_MIB);
         assert_eq!(
-            observed.shortfall_mib(8192, &[running()], 1024 * BYTES_PER_MIB),
+            observed.shortfall_mib(8192, &[running()], 512 * BYTES_PER_MIB, 0, 512 * BYTES_PER_MIB),
             704
         );
     }
 
     #[test]
+    fn a_known_boot_keeps_its_startup_target_until_fresh_running_measurements_arrive() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        observed.pool = Some(pool(300));
+        let mut record = running();
+        record.state = InstanceState::Starting;
+        record.memory_peak_bytes = Some(512 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&record), 640 * BYTES_PER_MIB);
+        assert_eq!(observed.anonymous_resident_bytes(&record), 0);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record.clone()], 640 * BYTES_PER_MIB, 0, 0),
+            0
+        );
+        record.memory_peak_bytes = None;
+        assert_eq!(observed.growth_bytes(&record), 2048 * BYTES_PER_MIB);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record], 640 * BYTES_PER_MIB, 0, 0),
+            1188
+        );
+    }
+
+    #[test]
     fn absent_stale_future_unbounded_or_previous_process_samples_reserve_the_ceiling() {
-        let ceiling = MemoryReadings::ceiling(running().resources);
-        for case in 0..5 {
+        for case in 0..6 {
             let mut observed = readings();
             let memory = observed.apps.get_mut(&app_id()).unwrap();
             match case {
@@ -169,8 +515,10 @@ mod tests {
                 1 => memory.measured_at = Timestamp::from_epoch_ms(4999),
                 2 => memory.measured_at = Timestamp::from_epoch_ms(10_001),
                 3 => memory.limits = None,
+                4 => memory.proportional_set_bytes = None,
                 _ => memory.measured_at = Timestamp::from_epoch_ms(999),
             }
+            let ceiling = observed.ceiling(&app_id(), running().resources);
             assert_eq!(observed.growth_bytes(&running()), ceiling, "case {case}");
         }
     }
@@ -179,12 +527,12 @@ mod tests {
     fn booting_apps_reserve_the_ceiling_even_when_their_first_pages_have_been_measured() {
         let mut record = running();
         record.state = InstanceState::Starting;
-        assert_eq!(
-            readings().growth_bytes(&record),
-            MemoryReadings::ceiling(record.resources)
-        );
+        assert_eq!(readings().growth_bytes(&record), 2048 * BYTES_PER_MIB);
         record.state = InstanceState::Idle;
-        assert_eq!(readings().shortfall_mib(8192, &[record], 1024 * BYTES_PER_MIB), 0);
+        assert_eq!(
+            readings().shortfall_mib(8192, &[record], 0, 0, 1024 * BYTES_PER_MIB),
+            0
+        );
     }
 
     #[test]
@@ -192,8 +540,23 @@ mod tests {
         let mut observed = readings();
         observed.available_bytes = 8192 * BYTES_PER_MIB;
         assert_eq!(
-            observed.shortfall_mib(1024, &[running()], 512 * BYTES_PER_MIB),
+            observed.shortfall_mib(1024, &[running()], 0, 0, 512 * BYTES_PER_MIB),
             128
         );
+    }
+
+    #[test]
+    fn a_host_sample_that_waited_too_long_for_admission_is_no_longer_usable() {
+        let observed = readings();
+        assert!(observed.is_fresh(15_000));
+        assert!(!observed.is_fresh(15_001));
+        assert!(!observed.is_fresh(9_999));
+    }
+
+    #[test]
+    fn snapshot_mappings_charged_elsewhere_still_reserve_their_resident_working_set() {
+        let mut observed = readings();
+        observed.apps.get_mut(&app_id()).unwrap().proportional_set_bytes = Some(1024 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&running()), 1024 * BYTES_PER_MIB);
     }
 }
