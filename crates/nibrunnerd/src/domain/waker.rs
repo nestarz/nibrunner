@@ -39,16 +39,17 @@ impl AppWaker {
         app_id: &AppId,
         wanted: &protocol::InstanceResources,
     ) -> Option<WakeRefusal> {
-        let others: Vec<_> = self
-            .host
-            .state
-            .records()
-            .await
-            .into_iter()
+        let records = self.host.state.records().await;
+        let others: Vec<_> = records
+            .iter()
             .filter(|record| &record.app_id != app_id)
+            .cloned()
             .collect();
         let shortfall =
             memory_shortfall_mib(self.host.guest_memory_mib, &committed_resources(&others), wanted);
+        self.host
+            .observe_memory_admission(app_id, wanted, &records, shortfall)
+            .await;
         (shortfall > 0).then_some(WakeRefusal::NoRoom {
             shortfall_mib: shortfall,
         })

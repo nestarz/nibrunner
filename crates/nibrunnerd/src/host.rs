@@ -59,6 +59,47 @@ pub struct Host {
 }
 
 impl Host {
+    /// Under `[memory_admission] mode = "observe"`, what a measured decision would have said about
+    /// a start or a wake the ceilings decided, logged beside it. It never changes the decision.
+    pub(crate) async fn observe_memory_admission(
+        &self,
+        app_id: &AppId,
+        wanted: &protocol::InstanceResources,
+        records: &[crate::domain::report::InstanceRecord],
+        strict_shortfall_mib: u64,
+    ) {
+        let Some(policy) = &self.config.memory_admission else {
+            return;
+        };
+        let Some(available_bytes) = crate::domain::report::capacity::read_memory_available_bytes() else {
+            return;
+        };
+        let others: Vec<_> = records
+            .iter()
+            .filter(|record| &record.app_id != app_id)
+            .cloned()
+            .collect();
+        let ids: Vec<_> = others.iter().map(|record| record.app_id.clone()).collect();
+        let readings = crate::domain::memory_admission::MemoryReadings {
+            available_bytes,
+            headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
+            measured_at_ms: crate::clock::now_ms(),
+            apps: self.vms.memory(&ids).await,
+        };
+        let measured_shortfall_mib = readings.shortfall_mib(
+            self.guest_memory_mib,
+            &others,
+            crate::domain::memory_admission::MemoryReadings::ceiling(*wanted),
+        );
+        tracing::info!(
+            %app_id,
+            mode = ?policy.mode,
+            strict_shortfall_mib,
+            measured_shortfall_mib,
+            "memory admission evaluated"
+        );
+    }
+
     pub async fn slot_for(
         &self,
         app_id: &AppId,

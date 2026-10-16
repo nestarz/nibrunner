@@ -251,6 +251,7 @@ mod tests {
                     packets: 3,
                     bytes: 4096
                 },
+                activity: Counted::default(),
             })
         );
     }
