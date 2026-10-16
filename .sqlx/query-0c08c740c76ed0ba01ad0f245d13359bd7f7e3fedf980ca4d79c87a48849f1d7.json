@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from memory_leases",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "0c08c740c76ed0ba01ad0f245d13359bd7f7e3fedf980ca4d79c87a48849f1d7"
+}
