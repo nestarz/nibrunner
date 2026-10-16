@@ -34,6 +34,27 @@ pub struct HttpRequestRecord {
     status: u16,
     duration_micros: u64,
     deployment_id: DeploymentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake_micros: Option<u64>,
+}
+
+/// The header on which the activator hands back how long it held a request for its app to wake,
+/// to the router that writes the request record and strips it. Named afresh each run, because a
+/// guest that is up answers the router itself and could otherwise claim a wake that never was.
+pub(super) fn wake_header() -> &'static hyper::header::HeaderName {
+    static NAME: std::sync::OnceLock<hyper::header::HeaderName> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        hyper::header::HeaderName::try_from(format!("x-nibrunner-wake-{}", uuid::Uuid::new_v4().simple()))
+            .expect("a UUID in hex is a header name")
+    })
+}
+
+/// How long the activator held the response's request for a wake, taken off the response so that
+/// no client sees it.
+pub(super) fn take_wake_micros(headers: &mut hyper::HeaderMap) -> Option<u64> {
+    headers
+        .remove(wake_header())
+        .and_then(|value| value.to_str().ok()?.parse().ok())
 }
 
 impl HttpRequestRecord {
@@ -51,7 +72,14 @@ impl HttpRequestRecord {
             status,
             duration_micros,
             deployment_id,
+            wake_micros: None,
         }
+    }
+
+    /// The part of `duration_micros` the request spent held for a restore or a cold boot.
+    pub fn woken_for(mut self, wake_micros: Option<u64>) -> Self {
+        self.wake_micros = wake_micros;
+        self
     }
 }
 
@@ -265,6 +293,34 @@ fn write_records(mut receiver: Receiver<HttpLogCommand>, directory: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_says_how_long_its_request_waited_for_a_wake_only_when_it_did() {
+        let uri: Uri = "/".parse().expect("a request URI");
+        let record = |wake_micros| {
+            serde_json::to_value(
+                HttpRequestRecord::new("GET", &uri, 200, 312_000, crate::test_support::deployment_id())
+                    .woken_for(wake_micros),
+            )
+            .expect("a record")
+        };
+        assert_eq!(record(Some(240_000))["wakeMicros"], 240_000);
+        assert!(record(None).get("wakeMicros").is_none());
+    }
+
+    #[test]
+    fn the_wake_a_response_carries_is_taken_off_it_before_any_client_sees_it() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(wake_header(), hyper::header::HeaderValue::from(240_000u64));
+        headers.insert("x-nibrunner-wake", hyper::header::HeaderValue::from_static("1"));
+        assert_eq!(take_wake_micros(&mut headers), Some(240_000));
+        assert!(headers.get(wake_header()).is_none());
+        assert_eq!(
+            take_wake_micros(&mut headers),
+            None,
+            "a name a guest could guess is not it"
+        );
+    }
 
     #[tokio::test]
     async fn http_records_leave_query_strings_out_of_per_app_files() {

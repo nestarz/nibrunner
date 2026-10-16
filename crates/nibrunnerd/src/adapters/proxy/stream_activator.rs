@@ -246,8 +246,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Waker for AlwaysWakes {
-        async fn wake(&self, _app_id: &AppId) -> Result<(), WakeRefusal> {
-            Ok(())
+        async fn wake(&self, _app_id: &AppId) -> Result<crate::ports::WakeOutcome, WakeRefusal> {
+            Ok(crate::ports::WakeOutcome::Restored)
         }
     }
 
