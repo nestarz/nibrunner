@@ -489,6 +489,11 @@ impl VolumeBackend for HeldProvisions {
     }
 }
 
+pub fn body(bytes: Vec<u8>) -> crate::ports::ArtifactBody {
+    use futures::StreamExt;
+    futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed()
+}
+
 pub fn artifacts_holding(bytes: impl Into<Vec<u8>>) -> Arc<MockArtifactStore> {
     let bytes = bytes.into();
     artifacts_answering(move |_| Ok(bytes.clone()))
@@ -498,7 +503,9 @@ pub fn artifacts_answering(
     answer: impl Fn(&ObjectKey) -> Result<Vec<u8>, ArtifactError> + Send + Sync + 'static,
 ) -> Arc<MockArtifactStore> {
     let mut artifacts = MockArtifactStore::new();
-    artifacts.expect_read().returning(move |key| answer(key));
+    artifacts
+        .expect_read()
+        .returning(move |key| answer(key).map(body));
     Arc::new(artifacts)
 }
 
