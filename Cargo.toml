@@ -58,7 +58,7 @@ zstd = "0.13"
 # Stored and deflated entries, through the flate2 already here: what `zip -r` writes.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 thiserror = "2"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 chrono-tz = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "sync", "time", "signal"] }
 futures = "0.3"
