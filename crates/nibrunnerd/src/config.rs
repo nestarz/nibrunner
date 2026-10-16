@@ -153,6 +153,9 @@ pub struct RawPorts {
 pub struct MetricsConfig {
     pub port: u16,
     pub listen_address: IpAddr,
+    /// Where the per-unit hour and day rollups of this page are written, every 300 s that a
+    /// counter moved: a control plane's `s3://<bucket>/fleets/<fleet>`.
+    pub sink: Option<String>,
 }
 
 /// Where something on this host asks what a guest holds.
@@ -172,6 +175,15 @@ pub struct FilesystemConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogsConfig {
     pub keep_bytes_per_app: u64,
+    pub sink: Option<LogsSink>,
+}
+
+/// Where every labelled instance's output and requests are also shipped, sealed: a live tail every
+/// 5 s and a chunk every 300 s, in the objects a microfleets control plane reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsSink {
+    pub store_url: String,
+    pub seal_key_file: PathBuf,
 }
 
 /// 256 MiB: weeks of an app that logs a line per request, and about a minute of the one that
@@ -180,6 +192,7 @@ impl Default for LogsConfig {
     fn default() -> Self {
         Self {
             keep_bytes_per_app: 256 * BYTES_PER_MEBIBYTE,
+            sink: None,
         }
     }
 }
@@ -565,6 +578,11 @@ mod file {
         pub(super) port: Option<u16>,
         /// An IP address to bind.
         pub(super) listen_address: Option<String>,
+        /// Optional. A control plane's `s3://<bucket>/fleets/<fleet>` (or a directory ending in
+        /// `fleets/<fleet>`): every 300 s that a counter moved, each labelled unit's counters are
+        /// added to `metrics/<hostId>/<yyyymmddhh>.json` and `<yyyymmdd>.json` there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) sink: Option<String>,
     }
 
     /// What a guest holds, listed on request over a socket on this machine. Nothing here is an
@@ -591,6 +609,17 @@ mod file {
         /// of an app that logs a line per request, and about a minute of one that floods.
         #[schemars(range(min = 1))]
         pub(super) keep_mib_per_app: Option<u64>,
+        /// Optional, with `seal_key_file`. A control plane's `s3://<bucket>/fleets/<fleet>` (or a
+        /// directory ending in `fleets/<fleet>`): the output and requests of every instance whose
+        /// document labels it with an `app` are shipped there, sealed, as
+        /// `logs/<app>/live-<hostId>.jsonl.gz` every 5 s and `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz`
+        /// every 300 s and when the instance is forgotten.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) sink: Option<String>,
+        /// The fleet key the objects are sealed under: a file of exactly 32 raw bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(pattern(ABSOLUTE_PATH))]
+        pub(super) seal_key_file: Option<String>,
     }
 }
 
@@ -793,6 +822,7 @@ impl HostConfig {
         starter.metrics = Some(MetricsConfig {
             port: 9100,
             listen_address: IpAddr::from([127, 0, 0, 1]),
+            sink: None,
         });
         starter
     }
@@ -894,12 +924,19 @@ impl HostConfig {
             metrics: Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([127, 0, 0, 1]),
+                sink: Some("s3://microfleets-eu-west-2-123456789012/fleets/apps-example-com".to_string()),
             }),
             filesystem: Some(FilesystemConfig {
                 socket: PathBuf::from("/run/nibrunner/filesystem.sock"),
             }),
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2).expect("a positive start limit"),
-            logs: LogsConfig::default(),
+            logs: LogsConfig {
+                sink: Some(LogsSink {
+                    store_url: "s3://microfleets-eu-west-2-123456789012/fleets/apps-example-com".to_string(),
+                    seal_key_file: PathBuf::from("/etc/nibrunner/seal.key"),
+                }),
+                ..LogsConfig::default()
+            },
             export_store_url: "s3://nibrunner-exports-eu-west-2-123456789012/exports".to_string(),
             export_staging_dir: PathBuf::from("/var/lib/nibrunner/exports"),
         }
@@ -998,6 +1035,7 @@ impl HostConfig {
             metrics: self.metrics.as_ref().map(|metrics| file::Metrics {
                 port: Some(metrics.port),
                 listen_address: Some(metrics.listen_address.to_string()),
+                sink: metrics.sink.clone(),
             }),
             filesystem: self.filesystem.as_ref().map(|filesystem| file::Filesystem {
                 socket: text(&filesystem.socket),
@@ -1005,6 +1043,8 @@ impl HostConfig {
             max_concurrent_vm_starts: Some(self.max_concurrent_vm_starts),
             logs: Some(file::Logs {
                 keep_mib_per_app: Some(self.logs.keep_bytes_per_app / BYTES_PER_MEBIBYTE),
+                sink: self.logs.sink.as_ref().map(|sink| sink.store_url.clone()),
+                seal_key_file: self.logs.sink.as_ref().and_then(|sink| text(&sink.seal_key_file)),
             }),
         }
     }
@@ -1167,6 +1207,11 @@ fn metrics(
     Ok(Some(MetricsConfig {
         port,
         listen_address: bind_address("metrics.listen_address", &document.listen_address)?,
+        sink: document
+            .sink
+            .as_deref()
+            .map(|sink| telemetry_sink("metrics.sink", sink))
+            .transpose()?,
     }))
 }
 
@@ -1189,11 +1234,45 @@ fn logs(document: Option<&file::Logs>) -> Result<LogsConfig, ConfigError> {
     if mebibytes == 0 {
         return Err(ConfigError::invalid(field, "more than nothing"));
     }
+    let sink = match (&document.sink, &document.seal_key_file) {
+        (None, None) => None,
+        (Some(sink), Some(_)) => Some(LogsSink {
+            store_url: telemetry_sink("logs.sink", sink)?,
+            seal_key_file: path_key("logs.seal_key_file", &document.seal_key_file)?,
+        }),
+        (Some(_), None) => {
+            return Err(ConfigError::invalid(
+                "logs.seal_key_file",
+                "specified with logs.sink",
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(ConfigError::invalid(
+                "logs.sink",
+                "specified with logs.seal_key_file",
+            ))
+        }
+    };
     Ok(LogsConfig {
         keep_bytes_per_app: mebibytes
             .checked_mul(BYTES_PER_MEBIBYTE)
             .ok_or_else(|| ConfigError::invalid(field, "a size this machine could hold"))?,
+        sink,
     })
+}
+
+/// The objects are a control plane's, under its fleet: the fleet is what a sealed one is bound to.
+fn telemetry_sink(field: &str, value: &str) -> Result<String, ConfigError> {
+    let url = object_store_url(field, value)?;
+    let mut segments = url.trim_end_matches('/').rsplit('/');
+    let fleet = segments.next().unwrap_or_default();
+    if fleet.is_empty() || segments.next() != Some("fleets") {
+        return Err(ConfigError::invalid(
+            field,
+            "a store URL ending in fleets/<fleet>",
+        ));
+    }
+    Ok(url)
 }
 
 /// Nothing this daemon reads has a value it may leave out: a key that is here is a key the
@@ -1830,6 +1909,7 @@ denied_egress_addresses_v6 = []
             Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([0, 0, 0, 0]),
+                sink: None,
             })
         );
 
@@ -1874,6 +1954,30 @@ denied_egress_addresses_v6 = []
                 .contains("logs.keep_mib_per_app")
         );
         assert!(refused(&document(&[], "[logs]\nkeep_mib_per_app = 256\nfiles = 3\n")).contains("files"));
+    }
+
+    #[test]
+    fn a_telemetry_sink_is_a_fleet_in_a_store_and_logs_name_the_key_they_are_sealed_under() {
+        let sink = "s3://bucket/fleets/acme";
+        let logs = with(&format!(
+            "[logs]\nkeep_mib_per_app = 8\nsink = \"{sink}\"\nseal_key_file = \"/etc/nibrunner/seal.key\"\n"
+        ))
+        .logs
+        .sink
+        .unwrap();
+        assert_eq!(
+            (logs.store_url.as_str(), logs.seal_key_file),
+            (sink, PathBuf::from("/etc/nibrunner/seal.key"))
+        );
+        let unsealed = refused(&document(
+            &[],
+            &format!("[logs]\nkeep_mib_per_app = 8\nsink = \"{sink}\"\n"),
+        ));
+        assert!(unsealed.contains("logs.seal_key_file"), "{unsealed}");
+        let metrics = format!("[metrics]\nport = 9100\nlisten_address = \"127.0.0.1\"\nsink = \"{sink}\"\n");
+        assert_eq!(with(&metrics).metrics.unwrap().sink.as_deref(), Some(sink));
+        let fleetless = metrics.replace("fleets/acme", "acme");
+        assert!(refused(&document(&[], &fleetless)).contains("metrics.sink"));
     }
 
     #[test]
@@ -2256,6 +2360,7 @@ keep_mib_per_app = 64
             Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([127, 0, 0, 1]),
+                sink: None,
             })
         );
         assert_eq!(config.logs.keep_bytes_per_app, 64 * 1024 * 1024);

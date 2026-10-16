@@ -11,32 +11,33 @@ pub struct ObjectArtifactStore {
     prefix: Option<String>,
 }
 
+/// The store a `store_url` names: `s3://<bucket>[/<prefix>]`, credentials from the environment, or
+/// a directory on this machine. The prefix comes back beside it, for every key to go under.
+pub(crate) fn open_store(url: &str) -> Result<(Arc<dyn ObjectStore>, Option<String>), ArtifactError> {
+    if let Some(rest) = url.strip_prefix("s3://") {
+        crate::install_crypto_provider();
+        let (bucket, prefix) = match rest.split_once('/') {
+            Some((bucket, prefix)) => (bucket, Some(prefix.trim_end_matches('/').to_string())),
+            None => (rest, None),
+        };
+        let store = object_store::aws::AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()
+            .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
+        return Ok((Arc::new(store), prefix.filter(|prefix| !prefix.is_empty())));
+    }
+    let directory = std::path::PathBuf::from(url);
+    crate::json_store::make_directory(&directory, 0o700)
+        .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
+    let store = object_store::local::LocalFileSystem::new_with_prefix(&directory)
+        .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
+    Ok((Arc::new(store), None))
+}
+
 impl ObjectArtifactStore {
     pub fn open(url: &str) -> Result<Self, ArtifactError> {
-        if let Some(rest) = url.strip_prefix("s3://") {
-            crate::install_crypto_provider();
-            let (bucket, prefix) = match rest.split_once('/') {
-                Some((bucket, prefix)) => (bucket, Some(prefix.trim_end_matches('/').to_string())),
-                None => (rest, None),
-            };
-            let store = object_store::aws::AmazonS3Builder::from_env()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
-            return Ok(Self {
-                store: Arc::new(store),
-                prefix: prefix.filter(|prefix| !prefix.is_empty()),
-            });
-        }
-        let directory = std::path::PathBuf::from(url);
-        crate::json_store::make_directory(&directory, 0o700)
-            .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
-        let store = object_store::local::LocalFileSystem::new_with_prefix(&directory)
-            .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
-        Ok(Self {
-            store: Arc::new(store),
-            prefix: None,
-        })
+        let (store, prefix) = open_store(url)?;
+        Ok(Self { store, prefix })
     }
 
     fn path_for(&self, object_key: &ObjectKey) -> object_store::path::Path {
