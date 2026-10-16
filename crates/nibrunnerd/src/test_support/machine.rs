@@ -142,6 +142,7 @@ pub async fn started_with(edit: impl FnOnce(&mut crate::config::HostConfig)) -> 
             listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
             tls: None,
+            redirect_from_port: None,
         }),
         raw: Some(crate::config::RawPorts {
             listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
