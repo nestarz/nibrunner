@@ -495,7 +495,7 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$"
     },
     "FirstBoot": {
-      "description": "When an `on-request` instance is first booted. `lazy` leaves it as one asleep with nothing to\nwake from: its layers are fetched and its hostnames answer, but no memory is held for it until a\nrequest boots it. Refused on anything but an `on-request` instance, which nothing would wake.",
+      "description": "When an `on-request` instance is first booted. `lazy` leaves it as one asleep with nothing to\nwake from: its hostnames answer, but neither its layers nor any memory are held for it until a\nrequest fetches and boots it. Refused on anything but an `on-request` instance, which nothing would wake.",
       "type": "string",
       "enum": [
         "eager",

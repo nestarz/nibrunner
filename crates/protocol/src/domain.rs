@@ -465,8 +465,8 @@ pub struct ActivationPolicy {
 }
 
 /// When an `on-request` instance is first booted. `lazy` leaves it as one asleep with nothing to
-/// wake from: its layers are fetched and its hostnames answer, but no memory is held for it until a
-/// request boots it. Refused on anything but an `on-request` instance, which nothing would wake.
+/// wake from: its hostnames answer, but neither its layers nor any memory are held for it until a
+/// request fetches and boots it. Refused on anything but an `on-request` instance, which nothing would wake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
