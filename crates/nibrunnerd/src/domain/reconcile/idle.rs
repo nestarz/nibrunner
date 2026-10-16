@@ -808,6 +808,7 @@ mod sleep_tests {
     fn default_idle_policy() -> ActivationPolicy {
         ActivationPolicy {
             first_boot: protocol::FirstBoot::Eager,
+            snapshot_ttl_ms: None,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },
@@ -1046,6 +1047,7 @@ mod sleep_tests {
             sleep_when: protocol::SleepPolicy::MaxLifetime {
                 ttl_ms: protocol::MaxLifetimeMs::try_from(ttl_ms).unwrap(),
             },
+            snapshot_ttl_ms: None,
         }
     }
 
@@ -1108,6 +1110,7 @@ mod sleep_tests {
         let never = protocol::ActivationPolicy {
             first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::Never,
+            snapshot_ttl_ms: None,
         };
         let host = host_under(never).await;
         last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 * 10).await;

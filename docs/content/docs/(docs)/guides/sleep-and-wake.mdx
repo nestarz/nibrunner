@@ -134,6 +134,20 @@ Any inbound traffic: an HTTP request on one of its hostnames, or anything on a
 app's [health check](/docs/guides/health-checks) passes. The client sees a slow first response,
 not a refused connection.
 
+## Snapshot lifetime
+
+A snapshot holds the guest's whole memory on the host's disk. `activation.snapshotTtlMs` limits
+how long it is kept without a wake. Past that it is deleted and the instance stays `idle`; the
+next request boots it afresh from its layers and volume, as after a host reboot. Without
+`snapshotTtlMs` a snapshot is kept until the next wake.
+
+```json
+"activation": {
+  "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 300000 },
+  "snapshotTtlMs": 86400000
+}
+```
+
 ## Snapshot integrity
 
 Before resuming a restored app, the host sets the guest's wall clock to the current host time.

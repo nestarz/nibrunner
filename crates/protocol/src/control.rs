@@ -423,6 +423,7 @@ impl DesiredInstance {
                 DesiredInstanceState::Running | DesiredInstanceState::Stopped => SleepPolicy::Never,
             },
             first_boot: FirstBoot::Eager,
+            snapshot_ttl_ms: None,
         })
     }
 

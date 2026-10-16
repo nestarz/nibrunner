@@ -361,6 +361,7 @@ async fn a_document_this_host_refused_changes_nothing_about_the_app_it_is_alread
         instance.desired_state = DesiredInstanceState::Running;
         instance.activation = Some(protocol::ActivationPolicy {
             first_boot: protocol::FirstBoot::Eager,
+            snapshot_ttl_ms: None,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },
@@ -450,6 +451,7 @@ async fn a_lazy_instance_is_routed_without_booting_and_its_first_request_boots_i
     let app = host.tenant(1).on_request(60_000).edited(|instance| {
         instance.idle_timeout_ms = None;
         instance.activation = Some(protocol::ActivationPolicy {
+            snapshot_ttl_ms: None,
             first_boot: protocol::FirstBoot::Lazy,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,

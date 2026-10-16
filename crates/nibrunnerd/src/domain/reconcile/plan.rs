@@ -777,6 +777,7 @@ mod tests {
             desired_instance(|instance| {
                 instance.desired_state = DesiredInstanceState::OnRequest;
                 instance.activation = Some(protocol::ActivationPolicy {
+                    snapshot_ttl_ms: None,
                     sleep_when: protocol::SleepPolicy::TrafficIdle {
                         timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
                     },
