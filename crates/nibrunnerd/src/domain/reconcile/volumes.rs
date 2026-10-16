@@ -23,7 +23,7 @@ pub fn volume_owners(
 ) -> BTreeMap<VolumeId, AppId> {
     let mut owners: BTreeMap<VolumeId, AppId> = records
         .values()
-        .map(|record| (record.volume_id.clone(), record.app_id.clone()))
+        .filter_map(|record| Some((record.volume_id.clone()?, record.app_id.clone())))
         .collect();
     for volume in &desired.volumes {
         owners.insert(volume.volume_id.clone(), volume.app_id.clone());

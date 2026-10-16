@@ -139,6 +139,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         processes,
         network,
         volumes: volumes.clone(),
+        commands: commands.clone(),
         logs,
         cron_registration,
         sink,

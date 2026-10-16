@@ -46,6 +46,10 @@ mod tests {
     use guest_contract::firecracker::{render_firecracker_config, VmNetwork, VmPaths, VmVsock};
 
     fn config() -> FirecrackerConfig {
+        config_writing_to(Some("/dev/nbd0".into()))
+    }
+
+    fn config_writing_to(data_device_path: Option<String>) -> FirecrackerConfig {
         let slot = nft_render::describe_slot(0, app_id());
         render_firecracker_config(
             protocol::DEFAULT_INSTANCE_RESOURCES,
@@ -53,7 +57,7 @@ mod tests {
                 kernel_path: "/guest/kernel".into(),
                 rootfs_path: "/guest/rootfs".into(),
                 instance_config_image_path: "/vm/config".into(),
-                data_device_path: "/dev/nbd0".into(),
+                data_device_path,
                 layer_image_paths: vec!["/cache/layer".into()],
             },
             &VmNetwork {
@@ -109,5 +113,16 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn a_guest_writing_to_memory_is_staged_with_no_writable_input() {
+        let directory = tempfile::tempdir().unwrap();
+        stage(directory.path(), 7, config_writing_to(None)).unwrap();
+        let inputs: Inputs = crate::json_store::read_json(&directory.path().join(INPUTS_FILENAME))
+            .unwrap()
+            .unwrap();
+        assert!(inputs.files.iter().all(|input| input.read_only));
+        assert!(inputs.config.drives.iter().all(|drive| drive.drive_id != "data"));
     }
 }

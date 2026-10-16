@@ -116,11 +116,20 @@ impl<T: CommandRunner + ?Sized> CommandRunnerExt for T {
     }
 }
 
+/// What a guest stacks writable over its layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Writable {
+    /// The app's volume, attached at this path on the host.
+    Volume { device_path: String },
+    /// A scratch the hypervisor makes for this boot alone.
+    Scratch(protocol::Scratch),
+}
+
 #[derive(Debug, Clone)]
 pub struct BootRequest {
     pub desired: DesiredInstance,
     pub slot: nft_render::AppSlot,
-    pub data_device_path: String,
+    pub writable: Writable,
     pub payload: PreparedPayload,
 }
 
