@@ -837,6 +837,10 @@ impl Vmm for VmManager {
             .map_err(|error| VmError::Host(format!("the instance's limits could not be applied: {error}")))
     }
 
+    fn holds_snapshot(&self, app_id: &AppId) -> bool {
+        snapshot_paths(&self.snapshot_dir, app_id).stamp_path.exists()
+    }
+
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
         // The deployment its output should be stamped with is the one the record remembers. A
         // guest this host holds no record of has nothing to attribute its lines to, so it is left

@@ -249,6 +249,7 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
         push(&calls, VmCall::ApplyLimits);
         Ok(())
     });
+    vms.expect_holds_snapshot().returning(|_| false);
     let verdict = spy.verdict.clone();
     vms.expect_guest_verdict().returning(move |_| held(&verdict));
     vms.expect_working_dir()

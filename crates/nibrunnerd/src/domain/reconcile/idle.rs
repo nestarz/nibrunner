@@ -807,6 +807,7 @@ mod sleep_tests {
 
     fn default_idle_policy() -> ActivationPolicy {
         ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },
@@ -1041,6 +1042,7 @@ mod sleep_tests {
 
     fn max_lifetime(ttl_ms: u64) -> protocol::ActivationPolicy {
         protocol::ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::MaxLifetime {
                 ttl_ms: protocol::MaxLifetimeMs::try_from(ttl_ms).unwrap(),
             },
@@ -1104,6 +1106,7 @@ mod sleep_tests {
     #[tokio::test]
     async fn an_app_told_never_to_sleep_is_kept_up_where_a_timeout_would_have_let_it_go() {
         let never = protocol::ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::Never,
         };
         let host = host_under(never).await;

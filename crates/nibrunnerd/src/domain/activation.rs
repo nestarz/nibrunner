@@ -99,6 +99,7 @@ mod tests {
 
     fn traffic_idle() -> ActivationPolicy {
         ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: SleepPolicy::TrafficIdle {
                 timeout_ms: IdleTimeoutMs::try_from(TIMEOUT_MS).unwrap(),
             },
@@ -107,6 +108,7 @@ mod tests {
 
     fn max_lifetime() -> ActivationPolicy {
         ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: SleepPolicy::MaxLifetime {
                 ttl_ms: MaxLifetimeMs::try_from(TTL_MS).unwrap(),
             },
@@ -115,6 +117,7 @@ mod tests {
 
     fn never() -> ActivationPolicy {
         ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: SleepPolicy::Never,
         }
     }

@@ -394,6 +394,43 @@ pub async fn sleep_instance(host: &Host, desired: &DesiredInstance) {
     }
 }
 
+/// What an earlier deployment left is let go of first, snapshot and all, so the request that
+/// finds the declaration boots the deployment the document names rather than restoring the last.
+/// One refused before it came up is declared again rather than started, for the next request to
+/// try.
+pub async fn declare_instance(host: &Host, desired: &DesiredInstance) {
+    let _transition = host.state.transition(&desired.app_id).await;
+    if host
+        .state
+        .record(&desired.app_id)
+        .await
+        .is_some_and(|record| record.deployment_id != desired.deployment_id)
+    {
+        let _ = host.vms.discard(&desired.app_id).await;
+        host.state.drop_record(&desired.app_id).await;
+    }
+    let Ok(slot) = host.slot_for(&desired.app_id).await else {
+        tracing::error!(app_id = %desired.app_id, "this host has no slot left to answer for the app");
+        return;
+    };
+    let existing = host.state.record(&desired.app_id).await;
+    if refused_out_of_reach(host, desired, existing.clone(), &slot).await {
+        return;
+    }
+    let fields = record_fields(desired, &slot);
+    let declared = match existing {
+        Some(mut record) => {
+            record.adopt(fields);
+            record.state = InstanceState::Idle;
+            record.message = None;
+            record
+        }
+        None => InstanceRecord::new(fields, InstanceState::Idle, initial_tracker()),
+    };
+    host.state.put_record(declared).await;
+    tracing::info!(app_id = %desired.app_id, host_port = %slot.host_port, "app is declared and waits for its first request");
+}
+
 /// A stop leaves a record behind, and it is the record that keeps the app's hostnames answering
 /// that it is stopped rather than that it is not here; an app that arrives already stopped is
 /// owed the same one.
@@ -439,6 +476,37 @@ pub async fn wait_for_room(host: &Host, desired: &DesiredInstance, shortfall_mib
     host.state.put_record(waiting).await;
 }
 
+// Before anything is fetched or attached, and before it counts as an attempt: a microVM this
+// host could not have put within reach is a cost paid for an app nobody could have reached, and
+// the document that asked for it is wrong in a way no retry mends. So the window is left alone,
+// the reason stays on the record for every pass that finds it, and it is said once.
+async fn refused_out_of_reach(
+    host: &Host,
+    desired: &DesiredInstance,
+    existing: Option<InstanceRecord>,
+    slot: &nft_render::AppSlot,
+) -> bool {
+    let Some(refusal) = crate::domain::reconcile::ingress::ingress_refusal(desired, &host.config) else {
+        return false;
+    };
+    let mut refused = existing.unwrap_or_else(|| {
+        InstanceRecord::new(
+            record_fields(desired, slot),
+            InstanceState::Failed,
+            initial_tracker(),
+        )
+    });
+    refused.adopt(record_fields(desired, slot));
+    refused.state = InstanceState::Failed;
+    refused.stop_requested = false;
+    host.state.put_record(refused).await;
+    if say(host, &desired.app_id, StateMessage::new(refusal.clone())).await {
+        host.metrics.health.failed(&desired.app_id, Failure::Refused);
+        tracing::error!(app_id = %desired.app_id, refusal, "instance refused before it was started");
+    }
+    true
+}
+
 pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     let now = now_ms();
     let existing = host.state.record(&desired.app_id).await;
@@ -460,26 +528,7 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
         return;
     };
 
-    // Before anything is fetched or attached, and before it counts as an attempt: a microVM this
-    // host could not have put within reach is a cost paid for an app nobody could have reached,
-    // and the document that asked for it is wrong in a way no retry mends. So the window is left
-    // alone, the reason stays on the record for every pass that finds it, and it is said once.
-    if let Some(refusal) = crate::domain::reconcile::ingress::ingress_refusal(desired, &host.config) {
-        let mut refused = existing.unwrap_or_else(|| {
-            InstanceRecord::new(
-                record_fields(desired, &slot),
-                InstanceState::Failed,
-                initial_tracker(),
-            )
-        });
-        refused.adopt(record_fields(desired, &slot));
-        refused.state = InstanceState::Failed;
-        refused.stop_requested = false;
-        host.state.put_record(refused).await;
-        if say(host, &desired.app_id, StateMessage::new(refusal.clone())).await {
-            host.metrics.health.failed(&desired.app_id, Failure::Refused);
-            tracing::error!(app_id = %desired.app_id, refusal, "instance refused before it was started");
-        }
+    if refused_out_of_reach(host, desired, existing.clone(), &slot).await {
         return;
     }
 
@@ -938,17 +987,19 @@ async fn settle(
     host.state.signal_report();
 }
 
-fn starting(plan: &ReconcilePlan) -> impl Iterator<Item = &DesiredInstance> {
+fn fetching(plan: &ReconcilePlan) -> impl Iterator<Item = &DesiredInstance> {
     plan.instances.iter().filter_map(|action| match action {
         InstancePlan::Start { desired }
         | InstancePlan::Replace { desired }
         | InstancePlan::Recover { desired } => Some(desired),
+        // A declared app's layers are fetched by the request that first wakes it, so a host can
+        // declare every preview it may be asked for and hold on disk only those that are.
         _ => None,
     })
 }
 
-pub fn layers_to_start(plan: &ReconcilePlan) -> Vec<protocol::DesiredLayer> {
-    layers_of(starting(plan))
+pub fn layers_to_fetch(plan: &ReconcilePlan) -> Vec<protocol::DesiredLayer> {
+    layers_of(fetching(plan))
 }
 
 fn layers_of<'a>(instances: impl Iterator<Item = &'a DesiredInstance>) -> Vec<protocol::DesiredLayer> {
@@ -963,7 +1014,7 @@ fn layers_of<'a>(instances: impl Iterator<Item = &'a DesiredInstance>) -> Vec<pr
 pub async fn prefetch_layers(host: &Host, plan: &ReconcilePlan) {
     // An app the start below will refuse is not fetched for either: nothing it needs is worth
     // having, and a pass that finds the same refusal standing would otherwise look it up again.
-    let mut waiting: Vec<&DesiredInstance> = starting(plan)
+    let mut waiting: Vec<&DesiredInstance> = fetching(plan)
         .filter(|desired| crate::domain::reconcile::ingress::ingress_refusal(desired, &host.config).is_none())
         .collect();
     let mut prepared = BTreeSet::new();
@@ -1030,12 +1081,12 @@ mod tests {
             ],
             ..Default::default()
         };
-        let wanted = layers_to_start(&plan);
+        let wanted = layers_to_fetch(&plan);
         assert_eq!(wanted, vec![base_layer(), same.clone()]);
         let whole = protocol::DesiredLayer::Filesystem {
             object: same.stored_object().unwrap().clone(),
         };
-        let same_bytes_twice = layers_to_start(&ReconcilePlan {
+        let same_bytes_twice = layers_to_fetch(&ReconcilePlan {
             instances: vec![InstancePlan::Start {
                 desired: desired_instance(|instance| instance.layers = vec![whole.clone(), same.clone()]),
             }],
@@ -1046,7 +1097,7 @@ mod tests {
             vec![whole, same],
             "one digest as two kinds is two images"
         );
-        assert!(layers_to_start(&ReconcilePlan {
+        assert!(layers_to_fetch(&ReconcilePlan {
             instances: vec![InstancePlan::Sleep {
                 desired: desired_instance(|_| {})
             }],

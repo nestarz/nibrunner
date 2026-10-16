@@ -267,6 +267,7 @@ mod tests {
             state.instances = vec![desired_instance(|instance| {
                 instance.desired_state = protocol::DesiredInstanceState::OnRequest;
                 instance.activation = Some(ActivationPolicy {
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                 });
             })]
@@ -343,6 +344,7 @@ mod tests {
             state.instances = vec![desired_instance(|instance| {
                 instance.desired_state = protocol::DesiredInstanceState::OnRequest;
                 instance.activation = Some(ActivationPolicy {
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                 });
             })];

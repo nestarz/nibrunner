@@ -182,8 +182,10 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
 
 async fn apply_sleeps(host: &Host, plan: &ReconcilePlan) {
     for action in &plan.instances {
-        if let InstancePlan::Sleep { desired } = action {
-            instances::sleep_instance(host, desired).await;
+        match action {
+            InstancePlan::Sleep { desired } => instances::sleep_instance(host, desired).await,
+            InstancePlan::Declare { desired } => instances::declare_instance(host, desired).await,
+            _ => {}
         }
     }
 }
@@ -302,6 +304,12 @@ pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Tr
     converge::observe(host, crate::clock::now_ms()).await;
     host.persist().await;
 
+    let retention = layer_retention(host, desired).await;
+    match host.payloads.retain(&retention).await {
+        Ok(retained) => host.metrics.resources.layer_cache_held(retained),
+        Err(error) => tracing::warn!(error = %error.message(), "unused layer images could not be removed"),
+    }
+
     host.cron_runs.synchronize(&enabled).await;
     host.state.modify(|snapshot| snapshot.converged = true).await;
     host.state.signal_report();
@@ -313,6 +321,44 @@ pub async fn refresh(host: &Arc<Host>) {
     network::apply_network(host).await;
     network::apply_routes(host).await;
     host.persist().await;
+}
+
+/// Whether a record's layers are what a guest is up on, or what one asleep on a snapshot will be
+/// restored onto. One declared and never booted, or asleep with its snapshot gone, boots afresh
+/// from layers fetched again, so its are the cache's to evict.
+fn stands_on_its_layers(host: &Host, record: &crate::domain::report::InstanceRecord) -> bool {
+    match record.state {
+        InstanceState::Pending
+        | InstanceState::Starting
+        | InstanceState::Running
+        | InstanceState::Frozen
+        | InstanceState::Unhealthy
+        | InstanceState::Stopping => true,
+        InstanceState::Idle => host.vms.holds_snapshot(&record.app_id),
+        InstanceState::Stopped | InstanceState::Expired | InstanceState::Failed | InstanceState::Exited => {
+            false
+        }
+    }
+}
+
+async fn layer_retention(host: &Host, desired: &HostDesiredState) -> crate::ports::LayerRetention {
+    let records = host.state.records().await;
+    let mut named: BTreeSet<_> = desired
+        .instances
+        .iter()
+        .flat_map(|instance| instance.layers.iter().map(|layer| layer.digest().clone()))
+        .collect();
+    named.extend(
+        records
+            .iter()
+            .flat_map(|record| record.layer_digests.iter().cloned()),
+    );
+    let pinned = records
+        .iter()
+        .filter(|record| stands_on_its_layers(host, record))
+        .flat_map(|record| record.layer_digests.iter().cloned())
+        .collect();
+    crate::ports::LayerRetention { named, pinned }
 }
 
 #[cfg(test)]
@@ -743,6 +789,134 @@ mod tests {
         );
         assert_eq!(host.repositories.instances.all().await.unwrap().len(), 1);
         assert_eq!(host.repositories.slots.all().await.unwrap().len(), 1);
+    }
+
+    fn lazy_app(deployment: &str) -> protocol::HostDesiredState {
+        desired_state(|state| {
+            state.volumes = vec![desired_volume(|_| {})];
+            state.instances = vec![desired_instance(|instance| {
+                instance.deployment_id = protocol::DeploymentId::parse(deployment).unwrap();
+                instance.desired_state = DesiredInstanceState::OnRequest;
+                instance.activation = Some(protocol::ActivationPolicy {
+                    sleep_when: protocol::SleepPolicy::TrafficIdle {
+                        timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
+                    },
+                    first_boot: protocol::FirstBoot::Lazy,
+                });
+                instance.hostnames = vec![app_hostname()];
+            })];
+        })
+    }
+
+    #[tokio::test]
+    async fn the_layers_of_an_app_that_is_up_are_pinned_and_those_of_one_only_declared_are_named() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let up = instance_record(|record| record.state = InstanceState::Running);
+        let digests: BTreeSet<_> = up.layer_digests.iter().cloned().collect();
+        assert!(!digests.is_empty());
+        host.state.put_record(up).await;
+
+        let retention = layer_retention(&host, &desired_state(|_| {})).await;
+        assert_eq!(retention.pinned, digests);
+
+        host.state
+            .put_record(instance_record(|record| record.state = InstanceState::Idle))
+            .await;
+        let retention = layer_retention(&host, &desired_state(|_| {})).await;
+        assert!(retention.pinned.is_empty(), "nothing restores onto them");
+        assert_eq!(retention.named, digests);
+    }
+
+    #[tokio::test]
+    async fn a_lazy_app_is_declared_routable_without_its_layers_being_fetched_or_booted() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Change).await;
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Tick).await;
+
+        assert!(host.vms.calls().is_empty());
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Idle);
+        assert_eq!(record.started_at, None);
+        assert_eq!(
+            host.router
+                .routes()
+                .await
+                .port_for(app_hostname().hostname.as_str()),
+            record.host_port
+        );
+        assert_eq!(host.activator.listening_for().await, vec![app_id()]);
+        assert!(!crate::adapters::vm::layers::layer_image_path(
+            &host.config.artifact_cache_dir(),
+            &layer(|_| {})
+        )
+        .exists());
+    }
+
+    #[tokio::test]
+    async fn the_first_request_to_a_lazy_app_boots_it_as_a_wake_with_nothing_to_restore_does() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Change).await;
+        host.vms.refuse_wake(VmError::SnapshotUnusable {
+            reason: "this host kept none".into(),
+        });
+
+        let outcome = instances::resume_instance(&host, &lazy_app("dep-1").instances[0])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::ports::WakeOutcome::ColdBoot);
+        assert_eq!(host.vms.calls(), vec![VmCall::Wake, VmCall::Boot]);
+        assert!(
+            crate::adapters::vm::layers::layer_image_path(&host.config.artifact_cache_dir(), &layer(|_| {}))
+                .exists(),
+            "the wake fetched what the declaration did not"
+        );
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().state,
+            InstanceState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lazy_app_never_booted_still_expires_at_its_deadline() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let mut desired = lazy_app("dep-1");
+        desired.instances[0].expiry = Some(protocol::ExpiryPolicy {
+            idle_ms: protocol::ExpiryIdleMs::try_from(protocol::MIN_EXPIRY_IDLE_MS).unwrap(),
+            deadline: Some(protocol::Timestamp::from_epoch_ms(1)),
+        });
+        reconcile(host.arc(), &desired, Trigger::Change).await;
+
+        expiry::apply(host.arc(), crate::clock::now_ms()).await;
+
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Expired);
+        assert!(host
+            .state
+            .admit(&app_id(), crate::clock::now_ms(), || ())
+            .await
+            .is_none());
+        reconcile(host.arc(), &desired, Trigger::Tick).await;
+        assert!(!host.vms.calls().contains(&VmCall::Boot));
+    }
+
+    #[tokio::test]
+    async fn a_new_deployment_of_a_lazy_app_never_booted_only_replaces_its_declaration() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        reconcile(host.arc(), &lazy_app("dep-1"), Trigger::Change).await;
+
+        reconcile(host.arc(), &lazy_app("dep-2"), Trigger::Change).await;
+
+        assert_eq!(host.vms.calls(), vec![VmCall::Discard]);
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Idle);
+        assert_eq!(record.deployment_id.as_str(), "dep-2");
     }
 
     #[tokio::test]

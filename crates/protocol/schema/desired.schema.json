@@ -58,6 +58,10 @@
     "ActivationPolicy": {
       "type": "object",
       "properties": {
+        "firstBoot": {
+          "description": "Whether the host boots the instance once it is declared, or leaves it to its first request.",
+          "$ref": "#/$defs/FirstBoot"
+        },
         "sleepWhen": {
           "$ref": "#/$defs/SleepPolicy"
         }
@@ -380,6 +384,9 @@
         "properties": {
           "activation": {
             "properties": {
+              "firstBoot": {
+                "const": "eager"
+              },
               "sleepWhen": {
                 "properties": {
                   "kind": {
@@ -401,7 +408,7 @@
           "const": "running"
         },
         {
-          "description": "Brings the microVM up for the first deploy and for every request that finds it asleep, and\nlets it sleep again once it has been quiet for `idleTimeoutMs`.",
+          "description": "Brings the microVM up for the first deploy (unless `activation.firstBoot` is `lazy`, when the\nfirst request does) and for every request that finds it asleep, and\nlets it sleep again once it has been quiet for `idleTimeoutMs`.",
           "type": "string",
           "const": "on-request"
         },
@@ -660,6 +667,14 @@
       "description": "an identifier",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$"
+    },
+    "FirstBoot": {
+      "description": "When an `on-request` instance is first booted. `lazy` leaves it as one asleep with nothing to\nwake from: its hostnames answer, but neither its layers nor any memory are held for it until a\nrequest fetches and boots it. Refused on anything but an `on-request` instance, which nothing would wake.",
+      "type": "string",
+      "enum": [
+        "eager",
+        "lazy"
+      ]
     },
     "GuestPath": {
       "description": "a guest path",
