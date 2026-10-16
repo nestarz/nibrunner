@@ -30,7 +30,7 @@ async fn concurrent_requests_restore_one_guest_and_every_caller_is_answered() {
     assert_eq!(host.get(&app, "/remember").await.expect("an answer").body, "1");
     host.let_sleep(&app).await;
 
-    let [restores_before, _, cold_boots_before] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [restores_before, _, cold_boots_before, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     let barrier = tokio::sync::Barrier::new(CALLERS as usize);
     let requests = (0..CALLERS).map(|_| async {
         barrier.wait().await;
@@ -54,7 +54,7 @@ async fn concurrent_requests_restore_one_guest_and_every_caller_is_answered() {
         (2..=CALLERS + 1).collect::<Vec<_>>(),
         "the restored guest lost or duplicated state"
     );
-    let [restores_after, _, cold_boots_after] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [restores_after, _, cold_boots_after, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     assert_eq!(
         restores_after - restores_before,
         1,
@@ -179,12 +179,12 @@ async fn a_corrupt_snapshot_cold_boots_the_app_and_still_answers_the_request() {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&byte).unwrap();
         drop(file);
-        let [restored_before, cold_before, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+        let [restored_before, cold_before, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
 
         let answer = host.get(&app, "/remember").await.expect("the cold boot answers");
         assert_eq!(answer.status, 200, "{answer:?}");
         assert_eq!(answer.body, "1", "the corrupted snapshot was restored");
-        let [restored_after, cold_after, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+        let [restored_after, cold_after, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
         assert_eq!(restored_after, restored_before);
         assert_eq!(cold_after, cold_before + 1);
         assert!(!paths.directory.exists());
@@ -265,5 +265,42 @@ async fn an_abandoned_tenant_freeze_expires_without_restarting_the_app() {
     drop(wire);
     tokio::time::sleep(Duration::from_millis(control::TENANT_FREEZE_LEASE_MS) + timeout).await;
     assert_eq!(host.get(&app, "/remember").await.unwrap().body, "2");
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frozen_guest_keeps_its_memory_in_place_and_answers_once_thawed() {
+    let Some(host) = crate::host().await else {
+        return;
+    };
+    let app = host.tenant(1);
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Running).await;
+    assert_eq!(host.get(&app, "/allocate?mib=32").await.unwrap().status, 200);
+    let pid = |host: &nibrunnerd::test_support::machine::RunningHost| {
+        nibrunnerd::adapters::vm::process::VmProcesses::new(host.host.config.runtime_dir.clone())
+            .read_record(&app.app_id)
+            .unwrap()
+            .pid
+    };
+    let before = pid(&host);
+
+    host.host.vms.freeze(&app.app_id).await.unwrap();
+    let statuses = host.host.vms.statuses(std::slice::from_ref(&app.app_id)).await;
+    assert!(statuses[&app.app_id].frozen);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), host.get(&app, "/"))
+            .await
+            .is_err(),
+        "a paused guest answers nothing"
+    );
+
+    host.host.vms.thaw(&app.app_id).await.unwrap();
+    assert!(!host.host.vms.statuses(std::slice::from_ref(&app.app_id)).await[&app.app_id].frozen);
+    assert_eq!(pid(&host), before, "thawed in place, not restored");
+    assert_eq!(
+        host.get(&app, "/allocated").await.unwrap().body,
+        format!("{}:1", 32 * 1024 * 1024)
+    );
     host.stop().await;
 }

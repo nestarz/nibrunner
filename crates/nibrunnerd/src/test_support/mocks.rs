@@ -102,6 +102,7 @@ pub struct VmmSpy {
     on_boot: Arc<Mutex<Option<VmError>>>,
     on_sleep: Arc<Mutex<Option<VmError>>>,
     on_wake: Arc<Mutex<Option<VmError>>>,
+    on_thaw: Arc<Mutex<Option<VmError>>>,
     verdict: Arc<Mutex<Option<String>>>,
     adopted: Arc<Mutex<Vec<AppId>>>,
 }
@@ -116,6 +117,7 @@ impl Default for VmmSpy {
             on_boot: shared(None),
             on_sleep: shared(None),
             on_wake: shared(None),
+            on_thaw: shared(None),
             verdict: shared(None),
             adopted: shared(Vec::new()),
         }
@@ -137,6 +139,10 @@ impl VmmSpy {
 
     pub fn refuse_sleep(&self, error: VmError) {
         *self.on_sleep.lock().expect("no panic holds this lock") = Some(error);
+    }
+
+    pub fn refuse_thaw(&self, error: VmError) {
+        *self.on_thaw.lock().expect("no panic holds this lock") = Some(error);
     }
 
     pub fn refuse_wake(&self, error: VmError) {
@@ -219,6 +225,25 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
     vms.expect_adopted_app_ids().returning(move || held(&adopted));
     vms.expect_memory().returning(|_| BTreeMap::new());
     vms.expect_readopt().returning(|_: &AppId| Ok(()));
+    let (calls, status) = (spy.calls.clone(), spy.status.clone());
+    vms.expect_freeze().returning(move |_| {
+        push(&calls, VmCall::Freeze);
+        if let Ok(mut held) = status.lock() {
+            held.frozen = true;
+        }
+        Ok(())
+    });
+    let (calls, status, on_thaw) = (spy.calls.clone(), spy.status.clone(), spy.on_thaw.clone());
+    vms.expect_thaw().returning(move |_| {
+        push(&calls, VmCall::Thaw);
+        if let Some(error) = held(&on_thaw) {
+            return Err(error);
+        }
+        if let Ok(mut held) = status.lock() {
+            held.frozen = false;
+        }
+        Ok(())
+    });
     let calls = spy.calls.clone();
     vms.expect_apply_limits().returning(move |_, _, _| {
         push(&calls, VmCall::ApplyLimits);

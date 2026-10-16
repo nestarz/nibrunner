@@ -167,7 +167,7 @@ impl MemoryReadings {
     }
 
     fn resident_memory(&self, record: &InstanceRecord) -> Option<&ReportedMemory> {
-        if record.state != InstanceState::Running {
+        if !matches!(record.state, InstanceState::Running | InstanceState::Frozen) {
             return None;
         }
         let memory = self.apps.get(&record.app_id)?;
@@ -220,6 +220,14 @@ impl MemoryReadings {
             }
             return ceiling;
         };
+        if record.state == InstanceState::Frozen {
+            // A paused VM cannot fault its swapped pages back in until a wake or a snapshot, and
+            // each of those reserves them for itself.
+            return memory
+                .proportional_set_bytes
+                .unwrap_or(0)
+                .saturating_sub(memory.current_bytes);
+        }
         self.wake_target_bytes(record)
             .saturating_sub(memory.current_bytes)
     }
@@ -558,5 +566,25 @@ mod tests {
         let mut observed = readings();
         observed.apps.get_mut(&app_id()).unwrap().proportional_set_bytes = Some(1024 * BYTES_PER_MIB);
         assert_eq!(observed.growth_bytes(&running()), 1024 * BYTES_PER_MIB);
+    }
+
+    #[test]
+    fn frozen_working_sets_do_not_reserve_swapped_pages_until_a_wake_or_snapshot() {
+        let mut observed = readings();
+        let mut record = running();
+        record.state = InstanceState::Frozen;
+        observed.apps.get_mut(&app_id()).unwrap().swap_bytes = 1024 * BYTES_PER_MIB;
+        assert_eq!(observed.growth_bytes(&record), 0);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record.clone()], 0, 0, 1024 * BYTES_PER_MIB),
+            0
+        );
+        observed.apps.get_mut(&app_id()).unwrap().proportional_set_bytes = Some(512 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&record), 256 * BYTES_PER_MIB);
+        observed.apps.clear();
+        assert_eq!(
+            observed.growth_bytes(&record),
+            observed.ceiling(&app_id(), record.resources)
+        );
     }
 }

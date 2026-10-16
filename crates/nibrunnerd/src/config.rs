@@ -118,6 +118,11 @@ pub struct MemoryAdmission {
     /// placed under it, and admission respects what is left of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<WorkloadPool>,
+    /// Pause quiet on-request `traffic-idle` apps in place this long after their last request,
+    /// before their snapshot deadline: a request resumes them without a restore. Values under
+    /// 30000 are taken as 30000. Omit to freeze nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_after_ms: Option<std::num::NonZeroU64>,
     /// Put quiet on-request apps to sleep before refusing a start or a wake, and while the host or
     /// the pool is short of memory.
     #[serde(default)]
@@ -1001,6 +1006,7 @@ impl HostConfig {
             memory_admission: Some(MemoryAdmission {
                 mode: MemoryAdmissionMode::Observe,
                 pool: None,
+                freeze_after_ms: None,
                 reclaim: false,
                 headroom_mib: std::num::NonZeroU32::new(1024).expect("positive headroom"),
             }),

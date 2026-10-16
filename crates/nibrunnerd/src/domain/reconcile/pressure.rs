@@ -120,14 +120,16 @@ fn eligible(
         && record.desired_running
         // Established raw flows bypass proxy request accounting, including between packets.
         && record.ports.is_empty()
-        && record.state == InstanceState::Running
+        && matches!(record.state, InstanceState::Running | InstanceState::Frozen)
         && matches!(policy.sleep_when, SleepPolicy::TrafficIdle { .. })
         && !(purpose == ReclaimPurpose::Deployment && priority == MemoryPriority::Production)
         && signals.requests_open == 0
-        // A reading from the future is a clock that moved, not a reading.
-        && signals
-            .measured_at_ms
-            .is_some_and(|at| at <= now && signals.measured_lately(now))
+        // A frozen guest has nothing to measure; a running one needs a reading, and one from the
+        // future is a clock that moved rather than a reading.
+        && (record.state == InstanceState::Frozen
+            || signals
+                .measured_at_ms
+                .is_some_and(|at| at <= now && signals.measured_lately(now)))
         && signals
             .last_active_at_ms
             .is_some_and(|at| now.saturating_sub(at) >= QUIET_MS)
@@ -195,11 +197,19 @@ pub(crate) async fn reclaim_one(
                 priority,
                 now,
             )
-            .then(|| (eviction_order(priority), signals.last_active_at_ms, id.clone()))
+            // Frozen first within a priority: what is already paused costs least to snapshot.
+            .then(|| {
+                (
+                    eviction_order(priority),
+                    record.state != InstanceState::Frozen,
+                    signals.last_active_at_ms,
+                    id.clone(),
+                )
+            })
         })
         .collect();
     candidates.sort();
-    for (_, _, app) in candidates {
+    for (_, _, _, app) in candidates {
         let Some(transition) = host.state.try_transition(&app) else {
             continue;
         };
@@ -232,9 +242,27 @@ pub(crate) async fn reclaim_one(
         {
             continue;
         }
+        // A full snapshot faults the whole guest back in. Pausing first gives memory back without
+        // needing that much room to make progress.
+        let freeze_first = record.state == InstanceState::Running
+            && host
+                .config
+                .memory_admission
+                .as_ref()
+                .is_some_and(|policy| policy.freeze_after_ms.is_some());
         snapshot.memory_pressure.attempted_at.insert(app.clone(), now);
+        if freeze_first {
+            snapshot.freeze_attempted_at_ms.insert(app.clone(), now);
+            snapshot.snapshotting.insert(app.clone());
+        }
         drop(snapshot);
         tracing::info!(app_id = %app, ?purpose, "reclaiming a quiet workload's memory");
+        if freeze_first {
+            if super::frozen::freeze_marked(host, &app, transition).await {
+                return true;
+            }
+            continue;
+        }
         host.metrics
             .sleep_wake
             .sleep_due(SleepReason::MemoryPressure, std::time::Duration::ZERO);
@@ -553,6 +581,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pressure_freezes_first_without_a_full_snapshot_and_respects_open_requests() {
+        let mut host = workloads().await;
+        let inner = std::sync::Arc::get_mut(&mut host.host).unwrap();
+        inner.guest_memory_mib = 0;
+        inner.config.memory_admission = Some(crate::config::MemoryAdmission {
+            pool: None,
+            mode: crate::config::MemoryAdmissionMode::Observe,
+            freeze_after_ms: Some(60_000.try_into().unwrap()),
+            reclaim: true,
+            headroom_mib: 1024.try_into().unwrap(),
+        });
+        host.vms.set_status(crate::adapters::vm::VmStatus {
+            active: true,
+            ..Default::default()
+        });
+        let preview = AppId::parse("preview").unwrap();
+        let production = AppId::parse("production").unwrap();
+        let request = host.metrics.proxy.open(&preview);
+        let _reclaiming = host.state.reclaim.lock().await;
+        assert!(!reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+        assert!(host.vms.calls().is_empty());
+        drop(request);
+        assert!(reclaim_one(host.arc(), ReclaimPurpose::Deployment, None).await);
+        assert_eq!(host.vms.calls(), [crate::ports::VmCall::Freeze]);
+        assert_eq!(
+            host.state.record(&preview).await.unwrap().state,
+            InstanceState::Frozen
+        );
+        assert_eq!(
+            host.state.record(&production).await.unwrap().state,
+            InstanceState::Running
+        );
+        assert!(!host.state.is_snapshotting(&preview).await);
+    }
+
+    #[tokio::test]
     async fn a_reclaim_does_not_wait_for_or_interrupt_an_app_transition() {
         let host = workloads().await;
         let preview = AppId::parse("preview").unwrap();
@@ -616,6 +680,7 @@ mod tests {
         inner.config.memory_admission = Some(crate::config::MemoryAdmission {
             pool: None,
             mode: crate::config::MemoryAdmissionMode::Observe,
+            freeze_after_ms: None,
             reclaim: true,
             headroom_mib: 1024.try_into().unwrap(),
         });

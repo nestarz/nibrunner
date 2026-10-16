@@ -183,6 +183,12 @@
       "description": "Optional. Absent, admission sums ceilings and takes no samples.",
       "type": "object",
       "properties": {
+        "freeze_after_ms": {
+          "description": "Pause quiet on-request `traffic-idle` apps in place this long after their last request,\nbefore their snapshot deadline: a request resumes them without a restore. Values under\n30000 are taken as 30000. Omit to freeze nothing.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
         "headroom_mib": {
           "description": "Physical memory held back for the host and bursts; swap never increases this capacity.",
           "type": "integer",

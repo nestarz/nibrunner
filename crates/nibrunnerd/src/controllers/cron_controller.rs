@@ -145,11 +145,13 @@ impl CronController {
             }
             let record = host.state.record(&run.key.app_id).await?;
             if record.deployment_id != run.key.deployment_id
-                || (record.stop_requested && record.state != InstanceState::Idle)
+                || (record.stop_requested
+                    && !matches!(record.state, InstanceState::Idle | InstanceState::Frozen))
                 || !record.desired_running
                 || !matches!(
                     record.state,
                     InstanceState::Idle
+                        | InstanceState::Frozen
                         | InstanceState::Running
                         | InstanceState::Starting
                         | InstanceState::Unhealthy
@@ -159,7 +161,7 @@ impl CronController {
             }
             (
                 host.state.cron_activity(&run.key.app_id),
-                record.state == InstanceState::Idle,
+                matches!(record.state, InstanceState::Idle | InstanceState::Frozen),
             )
         };
         if needs_wake {
