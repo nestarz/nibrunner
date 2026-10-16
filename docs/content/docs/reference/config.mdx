@@ -13,6 +13,10 @@ A snapshot under `paths.snapshot_dir` outlives a host reboot when the host comes
 kernel and CPU with the same Firecracker; otherwise `nibrunnerd start` removes it and the app's next
 request boots it afresh.
 
+`[logs] sink` with `seal_key_file`, and `[metrics] sink`, are optional: they ship what an app
+printed and counted to a bucket, as
+[Logs and metrics](/docs/guides/logs-and-metrics#ship-logs-and-metrics-to-a-bucket) explains.
+
 An editor with TOML schema support (Even Better TOML for VS Code, taplo) validates and
 autocompletes the file when its first line is:
 

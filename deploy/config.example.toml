@@ -85,9 +85,12 @@ max_ports_per_guest = 1
 [metrics]
 port = 9100
 listen_address = "127.0.0.1"
+sink = "s3://telemetry-example/fleets/apps-example-com"
 
 [filesystem]
 socket = "/run/nibrunner/filesystem.sock"
 
 [logs]
 keep_mib_per_app = 256
+sink = "s3://telemetry-example/fleets/apps-example-com"
+seal_key_file = "/etc/nibrunner/seal.key"

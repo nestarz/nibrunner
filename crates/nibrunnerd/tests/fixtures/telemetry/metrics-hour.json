@@ -1,0 +1,1 @@
+{"hour":"2026101612","at":"2026-10-16T12:10:00Z","units":{"site":{"app":"site","requests":3,"by_status":{"2xx":2,"5xx":1},"latency_hist":{"+Inf":1,"0.005":2},"cpu_s":1.5,"mem_peak_mib":64,"rx_bytes":100,"tx_bytes":200,"wakes":1,"sleeps":0}}}

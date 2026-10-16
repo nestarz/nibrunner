@@ -8,6 +8,7 @@ use crate::controllers::converge_controller::ConvergeController;
 use crate::controllers::idle_controller::IdleController;
 use crate::controllers::measurement_controller::MeasurementController;
 use crate::controllers::status_controller::StatusController;
+use crate::controllers::telemetry_controller::TelemetryController;
 use crate::controllers::Controller;
 use crate::host::Host;
 use crate::services::idle_service::HostIdle;
@@ -28,6 +29,10 @@ impl LifecycleController {
 
     pub async fn start(&self) {
         self.host.load().await;
+        if let (Some(telemetry), Some(accepted)) = (&self.host.telemetry, self.host.accepted_document().await)
+        {
+            telemetry.learn(&accepted.desired);
+        }
         let adopted = self.host.vms.adopted_app_ids().await;
         if !adopted.is_empty() {
             tracing::info!(adopted = adopted.len(), "microVMs from an earlier daemon adopted");
@@ -50,7 +55,7 @@ impl LifecycleController {
         let measurements = VsockMeasurements::new(self.host.clone());
         let idle = HostIdle::new(self.host.clone());
 
-        let held: Vec<Arc<dyn Controller>> = vec![
+        let mut held: Vec<Arc<dyn Controller>> = vec![
             crate::controllers::cron_controller::CronController::new(
                 self.host.clone(),
                 self.host.cron.clone(),
@@ -61,6 +66,9 @@ impl LifecycleController {
             IdleController::new(idle),
             MeasurementController::new(HostUsage::new(self.host.clone(), measurements)),
         ];
+        if self.host.telemetry.is_some() {
+            held.push(TelemetryController::new(self.host.clone()));
+        }
         held
     }
 
