@@ -894,6 +894,39 @@ mod schema {
     }
 
     #[test]
+    fn limits_schema_and_parser_agree_on_integer_bounds() {
+        let validator = validator(crate::schema::desired_state());
+        for (pointer, maximum) in [
+            ("/instances/0/limits/concurrent", u64::from(u16::MAX)),
+            ("/instances/0/limits/cpuPercent", u64::from(u16::MAX)),
+            ("/instances/0/limits/memory/targetMib", u64::from(u32::MAX)),
+        ] {
+            // JSON Schema has no integer width, so the schema only bounds what a u16 holds.
+            let past = (maximum == u64::from(u16::MAX)).then_some(maximum + 1);
+            for value in [0, 1, maximum].into_iter().chain(past) {
+                let mut document = desired_json();
+                document["instances"][0]["limits"] = serde_json::json!({
+                    "concurrent": 8,
+                    "cpuPercent": 100,
+                    "memory": {"targetMib": 512, "swapMib": 0, "priority": "standard"}
+                });
+                let document = with(document, pointer, value.into());
+                let accepted = value > 0 && value <= maximum;
+                assert_eq!(
+                    serde_json::from_value::<HostDesiredState>(document.clone()).is_ok(),
+                    accepted,
+                    "the parser on {pointer} = {value}"
+                );
+                assert_eq!(
+                    validator.is_valid(&document),
+                    accepted,
+                    "the schema on {pointer} = {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_desired_state_schema_accepts_what_the_parser_accepts() {
         let validator = validator(crate::schema::desired_state());
         let accepted = [
@@ -1154,5 +1187,52 @@ mod schema {
             let id = schema.get("$id").and_then(serde_json::Value::as_str).unwrap();
             assert_eq!(id, format!("{}{filename}", crate::schema::SCHEMA_ID_BASE));
         }
+    }
+}
+
+#[test]
+fn instance_limits_are_optional_and_every_field_in_them_is_too() {
+    let parsed: HostDesiredState = serde_json::from_value(desired_json()).unwrap();
+    assert_eq!(parsed.instances[0].limits, None);
+    assert!(serde_json::to_value(&parsed).unwrap()["instances"][0]
+        .get("limits")
+        .is_none());
+    for limits in [
+        serde_json::json!({}),
+        serde_json::json!({"concurrent": 8}),
+        serde_json::json!({"cpuPercent": 25}),
+        serde_json::json!({"memory": {"targetMib": 384, "swapMib": 0, "priority": "build"}}),
+        serde_json::json!({
+            "concurrent": 8,
+            "cpuPercent": 150,
+            "memory": {"targetMib": 384, "swapMib": 512, "priority": "production"}
+        }),
+    ] {
+        let mut document = desired_json();
+        document["instances"][0]["limits"] = limits.clone();
+        let parsed: HostDesiredState = serde_json::from_value(document).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["instances"][0]["limits"],
+            limits
+        );
+    }
+}
+
+#[test]
+fn instance_limits_refuse_zero_unknown_and_removed_fields() {
+    for limits in [
+        serde_json::json!({"concurrent": 0}),
+        serde_json::json!({"cpuPercent": 0}),
+        serde_json::json!({"memoryMib": 512}),
+        serde_json::json!({"memory": {"targetMib": 0, "swapMib": 0, "priority": "standard"}}),
+        serde_json::json!({"memory": {"targetMib": 1, "swapMib": 0, "priority": "urgent"}}),
+        serde_json::json!({"memory": {"targetMib": 1, "priority": "standard"}}),
+    ] {
+        let mut document = desired_json();
+        document["instances"][0]["limits"] = limits.clone();
+        assert!(
+            serde_json::from_value::<HostDesiredState>(document).is_err(),
+            "{limits}"
+        );
     }
 }

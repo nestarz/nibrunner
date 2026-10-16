@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use guest_contract::firecracker::MachineConfig;
+use protocol::{InstanceLimits, InstanceResources, MemoryPriority};
 
 pub(crate) const CGROUP_PARENT: &str = "nibrunner-jailer";
 const CPU_PERIOD_US: u64 = 100_000;
@@ -69,6 +70,113 @@ impl VmLimits {
             previous,
             restored: false,
         }))
+    }
+}
+
+/// What an instance's `limits` add to the ceilings its resources give its cgroup. With no
+/// `limits` every value is the one the jailer already set, so applying them changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeControls {
+    cpu_quota_us: u64,
+    memory_low_bytes: u64,
+    memory_high_bytes: Option<u64>,
+    swap_max_bytes: u64,
+    oom_score_adj: i32,
+}
+
+impl RuntimeControls {
+    pub(crate) fn for_instance(resources: InstanceResources, limits: Option<&InstanceLimits>) -> Self {
+        let cores_us = u64::from(resources.vcpu_count) * CPU_PERIOD_US;
+        let cpu_quota_us = limits
+            .and_then(|limits| limits.cpu_percent)
+            .map_or(cores_us, |percent| {
+                (u64::from(percent.get()) * CPU_PERIOD_US / 100).min(cores_us)
+            });
+        let mut controls = Self {
+            cpu_quota_us,
+            memory_low_bytes: 0,
+            memory_high_bytes: None,
+            swap_max_bytes: 0,
+            oom_score_adj: 0,
+        };
+        if let Some(policy) = limits.and_then(|limits| limits.memory) {
+            let target = u64::from(policy.target_mib.get().min(resources.memory_mib)) * BYTES_PER_MIB;
+            controls.swap_max_bytes = u64::from(policy.swap_mib) * BYTES_PER_MIB;
+            match policy.priority {
+                MemoryPriority::Production => {
+                    controls.memory_low_bytes = target;
+                    controls.oom_score_adj = -500;
+                }
+                MemoryPriority::Standard => {}
+                MemoryPriority::Preview => {
+                    controls.memory_high_bytes = Some(target);
+                    controls.oom_score_adj = 500;
+                }
+                MemoryPriority::Build => {
+                    controls.memory_high_bytes = Some(target);
+                    controls.oom_score_adj = 1000;
+                }
+            }
+        }
+        controls
+    }
+
+    /// Writes the controls into a running VMM's cgroup and its OOM score. Each cgroup file takes its
+    /// value whole, so a VMM is never seen with half of a change.
+    pub(crate) fn write(&self, cgroup: &Path, pid: i32) -> std::io::Result<()> {
+        let write = |name: &str, value: String| std::fs::write(cgroup.join(name), value);
+        write("cpu.max", format!("{} {CPU_PERIOD_US}", self.cpu_quota_us))?;
+        write("memory.low", self.memory_low_bytes.to_string())?;
+        write(
+            "memory.high",
+            self.memory_high_bytes
+                .map_or_else(|| "max".to_string(), |bytes| bytes.to_string()),
+        )?;
+        write("memory.swap.max", self.swap_max_bytes.to_string())?;
+        std::fs::write(
+            format!("/proc/{pid}/oom_score_adj"),
+            self.oom_score_adj.to_string(),
+        )
+    }
+}
+
+/// `memory.high` lifted for as long as a snapshot is being written: the buffered writes are charged
+/// to the VMM's cgroup, and a throttled preview or build would take that much longer to sleep.
+pub(crate) struct MemoryHighLift {
+    high: File,
+    previous: String,
+}
+
+pub(crate) fn lift_memory_high(cgroup: &Path) -> std::io::Result<Option<MemoryHighLift>> {
+    let mut high = match File::options()
+        .read(true)
+        .write(true)
+        .open(cgroup.join("memory.high"))
+    {
+        Ok(high) => high,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut previous = String::new();
+    high.read_to_string(&mut previous)?;
+    let previous = previous.trim().to_string();
+    if previous == "max" {
+        return Ok(None);
+    }
+    high.seek(SeekFrom::Start(0))?;
+    high.write_all(b"max")?;
+    Ok(Some(MemoryHighLift { high, previous }))
+}
+
+impl Drop for MemoryHighLift {
+    fn drop(&mut self) {
+        let restored = self
+            .high
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.high.write_all(self.previous.as_bytes()));
+        if let Err(error) = restored {
+            tracing::error!(%error, "the VM's memory.high could not be restored after snapshotting");
+        }
     }
 }
 
@@ -163,6 +271,121 @@ mod tests {
                 ]
             );
         }
+    }
+
+    fn resources(vcpu_count: u32, memory_mib: u32) -> InstanceResources {
+        InstanceResources {
+            vcpu_count,
+            memory_mib,
+        }
+    }
+
+    fn limits(cpu_percent: Option<u16>, memory: Option<protocol::MemoryPolicy>) -> InstanceLimits {
+        InstanceLimits {
+            concurrent: None,
+            cpu_percent: cpu_percent.map(|percent| percent.try_into().unwrap()),
+            memory,
+        }
+    }
+
+    #[test]
+    fn without_limits_the_controls_are_the_ones_the_jailer_already_set() {
+        let controls = RuntimeControls::for_instance(resources(2, 512), None);
+        assert_eq!(
+            controls,
+            RuntimeControls {
+                cpu_quota_us: 200_000,
+                memory_low_bytes: 0,
+                memory_high_bytes: None,
+                swap_max_bytes: 0,
+                oom_score_adj: 0,
+            }
+        );
+        assert_eq!(
+            RuntimeControls::for_instance(resources(2, 512), Some(&InstanceLimits::default())),
+            controls
+        );
+    }
+
+    #[test]
+    fn a_cpu_percent_only_ever_tightens_the_cores_the_resources_give() {
+        for (vcpus, percent, quota) in [
+            (1, 25, 25_000),
+            (2, 150, 150_000),
+            (1, 400, 100_000),
+            (4, 1, 1_000),
+        ] {
+            assert_eq!(
+                RuntimeControls::for_instance(resources(vcpus, 256), Some(&limits(Some(percent), None)))
+                    .cpu_quota_us,
+                quota,
+                "{vcpus} vCPUs at {percent}%"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_priorities_protect_production_and_throttle_disposable_work_without_lowering_hard_limits() {
+        let policy = |priority| protocol::MemoryPolicy {
+            target_mib: 384.try_into().unwrap(),
+            swap_mib: 512,
+            priority,
+        };
+        let production = RuntimeControls::for_instance(
+            resources(1, 1024),
+            Some(&limits(None, Some(policy(MemoryPriority::Production)))),
+        );
+        assert_eq!(production.memory_low_bytes, 384 * BYTES_PER_MIB);
+        assert_eq!(production.memory_high_bytes, None);
+        assert_eq!(production.swap_max_bytes, 512 * BYTES_PER_MIB);
+        assert_eq!(production.oom_score_adj, -500);
+        let standard = RuntimeControls::for_instance(
+            resources(1, 1024),
+            Some(&limits(None, Some(policy(MemoryPriority::Standard)))),
+        );
+        assert_eq!(
+            (
+                standard.memory_low_bytes,
+                standard.memory_high_bytes,
+                standard.oom_score_adj
+            ),
+            (0, None, 0)
+        );
+        for (priority, score) in [(MemoryPriority::Preview, 500), (MemoryPriority::Build, 1000)] {
+            let disposable = RuntimeControls::for_instance(
+                resources(1, 1024),
+                Some(&limits(None, Some(policy(priority)))),
+            );
+            assert_eq!(disposable.memory_low_bytes, 0);
+            assert_eq!(disposable.memory_high_bytes, Some(384 * BYTES_PER_MIB));
+            assert_eq!(disposable.oom_score_adj, score);
+        }
+        let mut larger = policy(MemoryPriority::Build);
+        larger.target_mib = 4096.try_into().unwrap();
+        assert_eq!(
+            RuntimeControls::for_instance(resources(1, 1024), Some(&limits(None, Some(larger))))
+                .memory_high_bytes,
+            Some(1024 * BYTES_PER_MIB),
+            "a target is capped at the guest's memory"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_lifts_memory_high_while_it_is_written_and_puts_it_back() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            lift_memory_high(directory.path()).unwrap().is_none(),
+            "no file, nothing to lift"
+        );
+        let path = directory.path().join("memory.high");
+        std::fs::write(&path, "max\n").unwrap();
+        assert!(lift_memory_high(directory.path()).unwrap().is_none());
+        std::fs::write(&path, "402653184\n").unwrap();
+        let lifted = lift_memory_high(directory.path()).unwrap().unwrap();
+        // A cgroup file takes each write whole; a plain file keeps what the write did not cover.
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("max"));
+        drop(lifted);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "402653184");
     }
 
     #[test]

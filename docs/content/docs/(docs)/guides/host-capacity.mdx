@@ -151,3 +151,28 @@ consuming the restored VM's running limit. This also applies to snapshots on tmp
 The host must provide the cgroup v2 CPU and memory controllers. If limits cannot
 be applied, the VM fails to start. Existing VMs keep their current limits until
 their next boot or restore; restarting the daemon readopts them.
+
+### Per-instance limits
+
+An instance's optional `limits` tighten what its `resources` give it, and are applied without a
+new deployment: a running VM's cgroup is rewritten when the document changes, and a sleeping one
+takes them as it wakes.
+
+```json
+"limits": {
+  "concurrent": 8,
+  "cpuPercent": 25,
+  "memory": { "targetMib": 384, "swapMib": 512, "priority": "preview" }
+}
+```
+
+| Field | Effect |
+| --- | --- |
+| `concurrent` | Requests the proxy carries to this instance at once, in place of `app_concurrent`. The host-wide limit still applies. |
+| `cpuPercent` | `cpu.max` quota in percent of one core, never above `vcpuCount` cores: `25` is a quarter of a core. |
+| `memory.targetMib` | The working-set target, capped at the guest's memory. It never changes the hard ceiling. |
+| `memory.swapMib` | `memory.swap.max`. `0` keeps the VM out of swap, as without `limits`. |
+| `memory.priority` | `production` holds its target with `memory.low` and an OOM score of −500; `standard` changes nothing; `preview` and `build` are throttled at their target with `memory.high` and score 500 and 1000. |
+
+While a snapshot is written, `memory.high` is lifted so that a throttled VM does not take longer
+to sleep, and restored if the sleep fails.
