@@ -30,7 +30,10 @@ A layer names content by its digest, either in the artifact store or in a public
 ]
 ```
 
-Downloaded layers are cached by digest. Apps on the same host share cached layers.
+Downloaded layers are cached by digest. Apps on the same host share cached layers. A filesystem or
+executable layer is streamed from the store to the cache and checked against its digest as it
+arrives, so the daemon never holds it in memory whole; an OCI archive is still read whole to be
+flattened.
 
 ## The volume
 

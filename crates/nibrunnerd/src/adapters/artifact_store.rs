@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt};
 use protocol::ObjectKey;
 
-use crate::ports::{ArtifactError, ArtifactStore};
+use crate::ports::{ArtifactBody, ArtifactError, ArtifactStore};
 
 pub struct ObjectArtifactStore {
     store: Arc<dyn ObjectStore>,
@@ -49,23 +50,76 @@ impl ObjectArtifactStore {
 
 #[async_trait]
 impl ArtifactStore for ObjectArtifactStore {
-    async fn read(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ArtifactError> {
+    async fn read(&self, object_key: &ObjectKey) -> Result<ArtifactBody, ArtifactError> {
+        let transferred = |error: object_store::Error| ArtifactError::Transfer(error.to_string());
         let result = self
             .store
             .get(&self.path_for(object_key))
             .await
-            .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| ArtifactError::Transfer(error.to_string()))?;
-        Ok(bytes.to_vec())
+            .map_err(transferred)?;
+        Ok(result.into_stream().map_err(transferred).boxed())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::{land_within, ArtifactStoreExt};
+
+    async fn whole(body: ArtifactBody) -> Vec<u8> {
+        body.map_ok(|chunk| chunk.to_vec()).try_concat().await.unwrap()
+    }
+
+    fn arriving_in(chunks: &[&'static [u8]]) -> ArtifactBody {
+        let chunks: Vec<_> = chunks
+            .iter()
+            .map(|chunk| Ok(bytes::Bytes::from_static(chunk)))
+            .collect();
+        futures::stream::iter(chunks).boxed()
+    }
+
+    #[tokio::test]
+    async fn a_body_lands_in_its_file_chunk_by_chunk_and_is_hashed_on_the_way() {
+        use sha2::Digest;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("object");
+        let landed = land_within(arriving_in(&[b"a bin", b"ary"]), &destination, 8)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"a binary");
+        assert_eq!(landed.bytes, 8);
+        assert_eq!(landed.sha256, hex::encode(sha2::Sha256::digest(b"a binary")));
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_refused_part_way_and_leaves_no_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("object");
+        let error = land_within(arriving_in(&[b"a bin", b"ary"]), &destination, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            error.message().contains("larger than an artifact may be"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn an_object_that_hashes_to_something_else_leaves_no_file_where_it_was_landed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjectArtifactStore::open(&directory.path().display().to_string()).unwrap();
+        std::fs::create_dir_all(directory.path().join("artifacts")).unwrap();
+        std::fs::write(directory.path().join("artifacts/one"), b"a binary").unwrap();
+        let object = protocol::StoredObject {
+            object_key: ObjectKey::parse("artifacts/one").unwrap(),
+            digest: protocol::Sha256Digest::parse("0".repeat(64)).unwrap(),
+        };
+        let destination = directory.path().join("landed");
+        let error = store.land_verified(&object, &destination).await.unwrap_err();
+        assert!(matches!(error, ArtifactError::DigestMismatch { .. }), "{error}");
+        assert!(!destination.exists());
+    }
 
     #[tokio::test]
     async fn a_directory_is_a_bucket_a_single_machine_already_has() {
@@ -74,7 +128,7 @@ mod tests {
         std::fs::create_dir_all(directory.path().join("artifacts")).unwrap();
         std::fs::write(directory.path().join("artifacts/one"), b"a binary").unwrap();
         let key = ObjectKey::parse("artifacts/one").unwrap();
-        assert_eq!(store.read(&key).await.unwrap(), b"a binary");
+        assert_eq!(whole(store.read(&key).await.unwrap()).await, b"a binary");
 
         let missing = ObjectKey::parse("artifacts/absent").unwrap();
         assert!(matches!(
@@ -142,6 +196,6 @@ mod tests {
         std::fs::create_dir_all(directory.path().join("hosts/host-1/artifacts")).unwrap();
         std::fs::write(directory.path().join("hosts/host-1/artifacts/one"), b"a binary").unwrap();
         let key = ObjectKey::parse("artifacts/one").unwrap();
-        assert_eq!(store.read(&key).await.unwrap(), b"a binary");
+        assert_eq!(whole(store.read(&key).await.unwrap()).await, b"a binary");
     }
 }
