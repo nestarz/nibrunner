@@ -1,11 +1,11 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use backhand::compression::{CompressionOptions, Compressor, Zstd};
 use backhand::{FilesystemCompressor, FilesystemWriter, NodeHeader};
-use protocol::{DesiredLayer, OciSource};
+use protocol::{DesiredLayer, DownloadUrl, OciSource, Sha256Digest, TarEntry, ZipEntry};
 
 use crate::json_store::make_directory;
 use crate::ports::{
@@ -22,6 +22,13 @@ const CONFIG_MODE: u16 = 0o600;
 const DIRECTORY_MODE: u16 = 0o755;
 const CACHE_DIR_MODE: u32 = 0o755;
 const VM_DIR_MODE: u32 = 0o700;
+
+/// What one program may inflate to, so that a small zip cannot fill the host's memory.
+const MAX_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What the xz decoder may hold. `xz -9`, the most any writer asks of a reader, needs 65 MiB; a
+/// stream that asks for more is refused rather than handed the host's memory.
+const XZ_DECODER_LIMIT_KIB: u32 = 128 * 1024;
 
 const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
 const EXT4_MAGIC_OFFSET: usize = 0x438;
@@ -98,7 +105,8 @@ pub fn layer_image_path(cache_dir: &Path, layer: &DesiredLayer) -> PathBuf {
     match layer {
         DesiredLayer::Oci { .. } => directory.join("oci.ext4"),
         DesiredLayer::Filesystem { .. } => directory.join(VERBATIM_IMAGE_FILENAME),
-        DesiredLayer::Executable { destination_path, .. } => directory.join(format!(
+        DesiredLayer::Executable { destination_path, .. }
+        | DesiredLayer::DownloadedExecutable { destination_path, .. } => directory.join(format!(
             "executable-{}.squashfs",
             short_hash(destination_path.as_str())
         )),
@@ -140,6 +148,97 @@ impl PayloadBuilder for LayerImages {
             fetched_bytes,
         })
     }
+}
+
+/// Where in what was downloaded the program is.
+#[derive(Clone, Copy)]
+enum Within<'a> {
+    Body,
+    Zip(&'a ZipEntry),
+    TarXz(&'a TarEntry),
+}
+
+impl<'a> Within<'a> {
+    fn of(zip_entry: Option<&'a ZipEntry>, tar_entry: Option<&'a TarEntry>) -> Self {
+        match (zip_entry, tar_entry) {
+            (Some(entry), _) => Within::Zip(entry),
+            (None, Some(entry)) => Within::TarXz(entry),
+            (None, None) => Within::Body,
+        }
+    }
+}
+
+fn from_zip(body: Vec<u8>, entry: &ZipEntry, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(body))
+        .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
+    let file = archive
+        .by_name(entry.as_str())
+        .map_err(|_| ArtifactError::NotInArchive {
+            url: url.clone(),
+            entry: entry.as_str().to_owned(),
+        })?;
+    let mut program = Vec::new();
+    std::io::Read::take(file, MAX_PROGRAM_BYTES)
+        .read_to_end(&mut program)
+        .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
+    Ok(program)
+}
+
+// GNU tar run as `tar -C dir -cJf x.tar.xz .` names every entry from `./`, so the same archive is
+// read the same whether or not its writer put that in front.
+fn names_entry(path: &[u8], entry: &TarEntry) -> bool {
+    path.strip_prefix(b"./").unwrap_or(path) == entry.as_str().as_bytes()
+}
+
+fn from_tar_xz(body: Vec<u8>, entry: &TarEntry, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError> {
+    let unpackable = |error: std::io::Error| ArtifactError::Unpackable(error.to_string());
+    let decoder = lzma_rust2::XzReader::new_mem_limit(Cursor::new(body), true, XZ_DECODER_LIMIT_KIB);
+    let mut archive = tar::Archive::new(decoder);
+    for file in archive.entries().map_err(unpackable)? {
+        let file = file.map_err(unpackable)?;
+        if !names_entry(&file.path_bytes(), entry) {
+            continue;
+        }
+        if !file.header().entry_type().is_file() {
+            return Err(ArtifactError::NotAFile {
+                url: url.clone(),
+                entry: entry.as_str().to_owned(),
+            });
+        }
+        let mut program = Vec::new();
+        file.take(MAX_PROGRAM_BYTES)
+            .read_to_end(&mut program)
+            .map_err(unpackable)?;
+        return Ok(program);
+    }
+    Err(ArtifactError::NotInArchive {
+        url: url.clone(),
+        entry: entry.as_str().to_owned(),
+    })
+}
+
+async fn downloaded_program(
+    store: &Arc<dyn ArtifactStore>,
+    url: &DownloadUrl,
+    digest: &Sha256Digest,
+    within: Within<'_>,
+) -> Result<Vec<u8>, ArtifactError> {
+    use sha2::Digest;
+
+    let body = store.download(url).await?;
+    let program = match within {
+        Within::Body => body,
+        Within::Zip(entry) => from_zip(body, entry, url)?,
+        Within::TarXz(entry) => from_tar_xz(body, entry, url)?,
+    };
+    let actual = hex::encode(sha2::Sha256::digest(&program));
+    if actual != digest.as_str() {
+        return Err(ArtifactError::DigestMismatch {
+            expected: digest.clone(),
+            actual,
+        });
+    }
+    Ok(program)
 }
 
 /// A layer's image in the cache, and what putting it there cost: nothing for one already held.
@@ -186,6 +285,23 @@ pub async fn ensure_layer_image(
             let fetched_bytes = bytes.len() as u64;
             (bytes, fetched_bytes)
         }
+        DesiredLayer::DownloadedExecutable {
+            url,
+            digest,
+            zip_entry,
+            tar_entry,
+            ..
+        } => {
+            let bytes = downloaded_program(
+                store,
+                url,
+                digest,
+                Within::of(zip_entry.as_ref(), tar_entry.as_ref()),
+            )
+            .await?;
+            let fetched_bytes = bytes.len() as u64;
+            (bytes, fetched_bytes)
+        }
     };
     let image = match layer {
         DesiredLayer::Oci { .. } => {
@@ -201,7 +317,8 @@ pub async fn ensure_layer_image(
                 digest: object.digest.clone(),
             })
         }
-        DesiredLayer::Executable { destination_path, .. } => {
+        DesiredLayer::Executable { destination_path, .. }
+        | DesiredLayer::DownloadedExecutable { destination_path, .. } => {
             pack(&[(destination_path.as_str(), &bytes, BINARY_MODE)])?
         }
     };
@@ -255,7 +372,8 @@ mod tests {
     use super::*;
     use crate::test_support::mocks;
     use crate::test_support::{base_layer, layer, ARTIFACT_BYTES, ARTIFACT_DIGEST, BASE_LAYER_BYTES};
-    use protocol::{ExecutablePath, Sha256Digest};
+    use protocol::ExecutablePath;
+    use sha2::Digest;
 
     fn artifact_bytes() -> Vec<u8> {
         ARTIFACT_BYTES.to_vec()
@@ -564,5 +682,175 @@ mod tests {
             .unwrap();
         let touched = std::fs::metadata(&image_path).unwrap().modified().unwrap();
         assert!(touched > backdated, "the image was not touched on a cache hit");
+    }
+
+    fn downloaded(body: &[u8], zip_entry: Option<&str>) -> (DesiredLayer, Arc<dyn ArtifactStore>) {
+        downloaded_from(body, zip_entry, None)
+    }
+
+    fn downloaded_from(
+        body: &[u8],
+        zip_entry: Option<&str>,
+        tar_entry: Option<&str>,
+    ) -> (DesiredLayer, Arc<dyn ArtifactStore>) {
+        let served = body.to_vec();
+        let mut artifacts = crate::ports::MockArtifactStore::new();
+        artifacts.expect_download().returning(move |_| Ok(served.clone()));
+        let layer = DesiredLayer::DownloadedExecutable {
+            url: DownloadUrl::parse("https://example.test/program").unwrap(),
+            digest: Sha256Digest::parse(hex::encode(sha2::Sha256::digest(artifact_bytes()))).unwrap(),
+            zip_entry: zip_entry.map(|entry| ZipEntry::parse(entry).unwrap()),
+            tar_entry: tar_entry.map(|entry| TarEntry::parse(entry).unwrap()),
+            destination_path: ExecutablePath::parse("/opt/tool/tool").unwrap(),
+        };
+        (layer, Arc::new(artifacts))
+    }
+
+    enum Member<'a> {
+        File(&'a str, &'a [u8]),
+        Directory(&'a str),
+        Symlink(&'a str, &'a str),
+    }
+
+    fn tarred_xz(members: &[Member<'_>]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for member in members {
+            let mut header = tar::Header::new_gnu();
+            match member {
+                Member::File(path, bytes) => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_mode(0o755);
+                    header.set_size(bytes.len() as u64);
+                    builder.append_data(&mut header, path, *bytes).unwrap();
+                }
+                Member::Directory(path) => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(0o755);
+                    header.set_size(0);
+                    builder.append_data(&mut header, path, std::io::empty()).unwrap();
+                }
+                Member::Symlink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_size(0);
+                    builder.append_link(&mut header, path, target).unwrap();
+                }
+            }
+        }
+        let tar = builder.into_inner().unwrap();
+        let mut writer =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6)).unwrap();
+        std::io::Write::write_all(&mut writer, &tar).unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_program_is_taken_from_the_tar_entry_the_document_names_and_its_digest_is_the_programs() {
+        for written_as in ["zig-linux/zig", "./zig-linux/zig"] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = tarred_xz(&[
+                Member::Directory("zig-linux/"),
+                Member::File("zig-linux/README", b"not it"),
+                Member::File(written_as, &artifact_bytes()),
+            ]);
+            let (layer, store) = downloaded_from(&archive, None, Some("zig-linux/zig"));
+            let image = prepare_layer(&store, directory.path(), &layer).await.unwrap();
+            assert_eq!(
+                read_back(&std::fs::read(image.path).unwrap(), "/opt/tool/tool"),
+                artifact_bytes(),
+                "{written_as}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tar_entry_the_archive_does_not_hold_is_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = tarred_xz(&[Member::File("README", b"x")]);
+        let (layer, store) = downloaded_from(&archive, None, Some("zig"));
+        let error = prepare_layer(&store, directory.path(), &layer).await.unwrap_err();
+        assert!(matches!(error, ArtifactError::NotInArchive { ref entry, .. } if entry == "zig"));
+    }
+
+    #[tokio::test]
+    async fn a_tar_entry_that_is_a_symlink_or_a_directory_is_no_program_to_run() {
+        for member in [Member::Symlink("zig", "/bin/sh"), Member::Directory("zig")] {
+            let directory = tempfile::tempdir().unwrap();
+            let (layer, store) = downloaded_from(&tarred_xz(&[member]), None, Some("zig"));
+            let error = prepare_layer(&store, directory.path(), &layer).await.unwrap_err();
+            assert!(
+                matches!(error, ArtifactError::NotAFile { ref entry, .. } if entry == "zig"),
+                "{error}"
+            );
+            assert!(!layer_image_path(directory.path(), &layer).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tar_entry_named_in_something_that_is_not_a_tar_xz_is_refused_as_unpackable() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded_from(&zipped(&[("zig", &artifact_bytes())]), None, Some("zig"));
+        let error = prepare_layer(&store, directory.path(), &layer).await.unwrap_err();
+        assert!(matches!(error, ArtifactError::Unpackable(_)), "{error}");
+    }
+
+    fn zipped(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_program_is_packed_where_the_document_put_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(&artifact_bytes(), None);
+        let image = prepare_layer(&store, directory.path(), &layer).await.unwrap();
+        assert_eq!(
+            read_back(&std::fs::read(image.path).unwrap(), "/opt/tool/tool"),
+            artifact_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_program_is_taken_from_the_zip_entry_the_document_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = zipped(&[("README", b"not it"), ("tool", &artifact_bytes())]);
+        let (layer, store) = downloaded(&archive, Some("tool"));
+        let image = prepare_layer(&store, directory.path(), &layer).await.unwrap();
+        assert_eq!(
+            read_back(&std::fs::read(image.path).unwrap(), "/opt/tool/tool"),
+            artifact_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_that_hashes_to_something_else_never_reaches_a_guest() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(b"something else", None);
+        let error = prepare_layer(&store, directory.path(), &layer).await.unwrap_err();
+        assert!(matches!(error, ArtifactError::DigestMismatch { .. }));
+        assert!(!layer_image_path(directory.path(), &layer).exists());
+    }
+
+    #[tokio::test]
+    async fn an_entry_the_archive_does_not_hold_is_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(&zipped(&[("README", b"x")]), Some("tool"));
+        let error = prepare_layer(&store, directory.path(), &layer).await.unwrap_err();
+        assert!(matches!(error, ArtifactError::NotInArchive { ref entry, .. } if entry == "tool"));
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_program_is_fetched_once_however_often_it_is_asked_for() {
+        let directory = tempfile::tempdir().unwrap();
+        let (layer, store) = downloaded(&artifact_bytes(), None);
+        prepare_layer(&store, directory.path(), &layer).await.unwrap();
+        let again = prepare_layer(&store, directory.path(), &layer).await.unwrap();
+        assert_eq!(again.fetched_bytes, 0);
     }
 }
