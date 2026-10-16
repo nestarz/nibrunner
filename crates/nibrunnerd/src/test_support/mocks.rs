@@ -218,6 +218,7 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
     let adopted = spy.adopted.clone();
     vms.expect_adopted_app_ids().returning(move || held(&adopted));
     vms.expect_readopt().returning(|_: &AppId| Ok(()));
+    vms.expect_holds_snapshot().returning(|_| false);
     let verdict = spy.verdict.clone();
     vms.expect_guest_verdict().returning(move |_| held(&verdict));
     vms.expect_working_dir()

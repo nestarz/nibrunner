@@ -29,6 +29,7 @@ versions_file = "/var/lib/nibrunner/versions.json"
 
 [artifacts]
 store_url = "s3://nibrunner-artifacts-eu-west-2-123456789012/artifacts"
+cache_max_gib = 32
 
 [volumes]
 backend = "zerofs"

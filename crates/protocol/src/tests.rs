@@ -736,6 +736,65 @@ fn only_an_on_request_instance_may_name_a_sleep_policy_that_fires() {
 }
 
 #[test]
+fn a_lazy_first_boot_round_trips_and_an_unnamed_one_is_eager() {
+    let lazy = read(instance_with(|document| {
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 900000 },
+            "firstBoot": "lazy"
+        });
+    }))
+    .expect("parses");
+    assert!(lazy.boots_lazily());
+    let written = serde_json::to_value(&lazy).expect("serialises");
+    assert_eq!(written["activation"]["firstBoot"], "lazy");
+
+    let unnamed = read(instance_with(|document| {
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 900000 }
+        });
+    }))
+    .expect("parses");
+    assert_eq!(unnamed.activation().first_boot, FirstBoot::Eager);
+    let written = serde_json::to_value(&unnamed).expect("serialises");
+    assert!(written["activation"].get("firstBoot").is_none());
+    assert!(!read(instance_json()).expect("parses").boots_lazily());
+}
+
+#[test]
+fn only_an_on_request_instance_may_wait_for_its_first_request_to_boot() {
+    for state in ["running", "stopped"] {
+        let refused = read(instance_with(|document| {
+            document["desiredState"] = serde_json::json!(state);
+            document["activation"] = serde_json::json!({
+                "sleepWhen": { "kind": "never" },
+                "firstBoot": "lazy"
+            });
+        }))
+        .expect_err("no request would ever boot it");
+        assert!(refused.to_string().contains("firstBoot"), "{state}: {refused}");
+
+        assert!(
+            read(instance_with(|document| {
+                document["desiredState"] = serde_json::json!(state);
+                document["activation"] = serde_json::json!({
+                    "sleepWhen": { "kind": "never" },
+                    "firstBoot": "eager"
+                });
+            }))
+            .is_ok(),
+            "{state} may still say it boots eagerly"
+        );
+    }
+    assert!(read(instance_with(|document| {
+        document["activation"] = serde_json::json!({
+            "sleepWhen": { "kind": "never" },
+            "firstBoot": "sometime"
+        });
+    }))
+    .is_err());
+}
+
+#[test]
 fn a_policy_this_host_does_not_offer_is_refused_by_name_rather_than_ignored() {
     assert!(read(instance_with(|document| {
         document["activation"] = serde_json::json!({ "sleepWhen": { "kind": "no-sessions" } });
@@ -908,6 +967,15 @@ mod schema {
                 "/instances/0/desiredState",
                 serde_json::json!("running"),
             ),
+            activated(serde_json::json!({
+                "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 900000 },
+                "firstBoot": "lazy"
+            })),
+            with(
+                activated(serde_json::json!({ "sleepWhen": { "kind": "never" }, "firstBoot": "eager" })),
+                "/instances/0/desiredState",
+                serde_json::json!("running"),
+            ),
         ];
         for document in accepted {
             serde_json::from_value::<HostDesiredState>(document.clone()).unwrap();
@@ -1061,6 +1129,12 @@ mod schema {
             ),
             activated(serde_json::json!({ "sleepWhen": { "kind": "no-sessions" } })),
             activated(serde_json::json!({ "sleepWhen": { "kind": "max-lifetime", "ttlMs": 1000 } })),
+            with(
+                activated(serde_json::json!({ "sleepWhen": { "kind": "never" }, "firstBoot": "lazy" })),
+                "/instances/0/desiredState",
+                serde_json::json!("running"),
+            ),
+            activated(serde_json::json!({ "sleepWhen": { "kind": "never" }, "firstBoot": "sometime" })),
             with(
                 desired_json(),
                 "/instances/0/config/healthCheck",

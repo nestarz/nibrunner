@@ -184,6 +184,10 @@ pub trait Vmm: Send + Sync {
     async fn tap_names(&self) -> Vec<String>;
     async fn statuses(&self, app_ids: &[AppId]) -> BTreeMap<AppId, VmStatus>;
     async fn adopted_app_ids(&self) -> Vec<AppId>;
+    /// Whether a microVM asleep has a snapshot to be restored from, which then stands on its layers.
+    fn holds_snapshot(&self, _app_id: &AppId) -> bool {
+        false
+    }
     /// Listen again for the log output of a microVM adopted from an earlier daemon run. The
     /// guest keeps its end of the socket across a daemon restart, but a fresh receiver never
     /// bound the host end, so without this its output would go nowhere for the rest of its life.
@@ -265,6 +269,23 @@ pub struct PreparedPayload {
 #[async_trait]
 pub trait PayloadBuilder: Send + Sync {
     async fn prepare(&self, layers: &[DesiredLayer]) -> Result<PreparedPayload, ArtifactError>;
+    /// Prunes the cache to what `retention` names, then evicts down to the cap what nothing pins.
+    async fn retain(&self, retention: &LayerRetention) -> Result<RetainedLayers, ArtifactError>;
+}
+
+/// What a pass keeps of the layer cache: every layer the document or a record names, and among
+/// them the ones an app that is up, or asleep on a snapshot, stands on, which no cap evicts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayerRetention {
+    pub named: std::collections::BTreeSet<Sha256Digest>,
+    pub pinned: std::collections::BTreeSet<Sha256Digest>,
+}
+
+/// What the layer cache holds once a pass has pruned it, and how many layers the cap took.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainedLayers {
+    pub held_bytes: u64,
+    pub evicted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

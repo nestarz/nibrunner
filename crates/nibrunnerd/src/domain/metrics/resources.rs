@@ -131,6 +131,8 @@ pub struct ResourceMetrics {
     operations: Vec<Histogram>,
     layers_cached: AtomicU64,
     layer_fetch_bytes: AtomicU64,
+    layer_cache_bytes: AtomicU64,
+    layer_evictions: AtomicU64,
     start_refusals: Vec<AtomicU64>,
 }
 
@@ -142,6 +144,8 @@ impl Default for ResourceMetrics {
                 .collect(),
             layers_cached: AtomicU64::new(0),
             layer_fetch_bytes: AtomicU64::new(0),
+            layer_cache_bytes: AtomicU64::new(0),
+            layer_evictions: AtomicU64::new(0),
             start_refusals: START_REFUSALS.iter().map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -163,6 +167,13 @@ impl ResourceMetrics {
 
     pub fn layer_cached(&self) {
         self.layers_cached.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn layer_cache_held(&self, retained: crate::ports::RetainedLayers) {
+        self.layer_cache_bytes
+            .store(retained.held_bytes, Ordering::Relaxed);
+        self.layer_evictions
+            .fetch_add(retained.evicted, Ordering::Relaxed);
     }
 
     pub fn starts_refused(&self, refusal: StartRefusal, count: usize) {
@@ -187,6 +198,20 @@ static LAYERS_CACHED_TOTAL: Metric = Metric {
 static LAYER_FETCH_BYTES_TOTAL: Metric = Metric {
     name: "nibrunner_layer_fetch_bytes_total",
     help: "What has been pulled from the artifact store, as the store sized it.",
+    kind: Kind::Counter,
+    labels: &[],
+};
+
+static LAYER_CACHE_BYTES: Metric = Metric {
+    name: "nibrunner_layer_cache_bytes",
+    help: "What the layer cache held on disk once the last pass pruned it.",
+    kind: Kind::Gauge,
+    labels: &[],
+};
+
+static LAYER_EVICTIONS_TOTAL: Metric = Metric {
+    name: "nibrunner_layer_evictions_total",
+    help: "Layers the cache evicted to stay under cache_max_gib: each is fetched again by the next boot that needs it.",
     kind: Kind::Counter,
     labels: &[],
 };
@@ -265,6 +290,8 @@ pub(super) static DECLARED: &[&Metric] = &[
     &STORAGE_OPERATION_SECONDS,
     &LAYERS_CACHED_TOTAL,
     &LAYER_FETCH_BYTES_TOTAL,
+    &LAYER_CACHE_BYTES,
+    &LAYER_EVICTIONS_TOTAL,
     &VOLUME_STATE,
     &VOLUME_SIZE_BYTES,
     &VOLUME_USED_BYTES,
@@ -301,6 +328,20 @@ pub(super) fn render(page: &mut Page, metrics: &ResourceMetrics, scrape: &Scrape
         &LAYER_FETCH_BYTES_TOTAL,
         &[],
         metrics.layer_fetch_bytes.load(Ordering::Relaxed),
+    );
+
+    page.declare(&LAYER_CACHE_BYTES);
+    page.value(
+        &LAYER_CACHE_BYTES,
+        &[],
+        metrics.layer_cache_bytes.load(Ordering::Relaxed),
+    );
+
+    page.declare(&LAYER_EVICTIONS_TOTAL);
+    page.value(
+        &LAYER_EVICTIONS_TOTAL,
+        &[],
+        metrics.layer_evictions.load(Ordering::Relaxed),
     );
 
     page.declare(&VOLUME_STATE);

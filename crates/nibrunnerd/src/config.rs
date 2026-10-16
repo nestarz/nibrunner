@@ -7,6 +7,7 @@ pub const CONFIG_FILE_VARIABLE: &str = "NIBRUNNER_CONFIG";
 const MAX_STORAGE_PREFIX_BYTES: usize = 512;
 const MEBIBYTES_PER_GIBIBYTE: u64 = 1024;
 const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
+const BYTES_PER_GIBIBYTE: u64 = BYTES_PER_MEBIBYTE * MEBIBYTES_PER_GIBIBYTE;
 
 /// Where ZeroFS serves its own scrape page, on loopback. It is a constant rather than a key
 /// because it is nibrun's, and `nibrunnerd install` renders it into ZeroFS's config — but a host
@@ -212,6 +213,9 @@ pub struct HostConfig {
     pub desired_state_file: PathBuf,
     pub versions_file: PathBuf,
     pub artifact_store_url: String,
+    /// What the layer cache may hold before the least recently used layers no running, frozen or
+    /// snapshotted app stands on are evicted. Absent keeps every layer the document names.
+    pub artifact_cache_max_gib: Option<std::num::NonZeroU32>,
     pub storage_prefix: String,
     pub volumes: VolumeBackend,
     pub denied_egress_addresses_v4: Vec<String>,
@@ -255,6 +259,11 @@ impl HostConfig {
 
     pub fn artifact_cache_dir(&self) -> PathBuf {
         self.in_state_dir("artifacts")
+    }
+
+    pub fn artifact_cache_max_bytes(&self) -> Option<u64> {
+        self.artifact_cache_max_gib
+            .map(|gib| u64::from(gib.get()) * BYTES_PER_GIBIBYTE)
     }
 
     pub fn vm_dir(&self) -> PathBuf {
@@ -377,6 +386,12 @@ mod file {
         /// `s3://bucket[/prefix]`, or an absolute path.
         #[schemars(pattern(STORE_URL))]
         pub(super) store_url: Option<String>,
+        /// What the layer cache may hold, in GiB. Past it the least recently used layers that no
+        /// running, frozen or snapshotted app stands on are evicted, and fetched again on the next
+        /// wake that needs them. Absent keeps every layer the document names.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(range(min = 1))]
+        pub(super) cache_max_gib: Option<std::num::NonZeroU32>,
     }
 
     /// The store a bundle is put in, and the disk it is assembled on first.
@@ -732,6 +747,7 @@ impl HostConfig {
                 "artifacts.store_url",
                 required_str("artifacts.store_url", &artifacts.store_url)?,
             )?,
+            artifact_cache_max_gib: artifacts.cache_max_gib,
             storage_prefix: storage_prefix(
                 "volumes.storage_prefix",
                 required_str("volumes.storage_prefix", &volumes.storage_prefix)?,
@@ -814,6 +830,7 @@ impl HostConfig {
             desired_state_file: state_dir.join("desired.json"),
             versions_file: state_dir.join("versions.json"),
             artifact_store_url: state_dir.join("artifact-store").display().to_string(),
+            artifact_cache_max_gib: None,
             storage_prefix: "volumes".to_string(),
             volumes: VolumeBackend::LocalFile,
             denied_egress_addresses_v4: vec![],
@@ -854,6 +871,7 @@ impl HostConfig {
             desired_state_file: PathBuf::from("/var/lib/nibrunner/desired.json"),
             versions_file: PathBuf::from("/var/lib/nibrunner/versions.json"),
             artifact_store_url: "s3://nibrunner-artifacts-eu-west-2-123456789012/artifacts".to_string(),
+            artifact_cache_max_gib: std::num::NonZeroU32::new(32),
             storage_prefix: "hetzner-1".to_string(),
             volumes: VolumeBackend::Zerofs(Box::new(ZerofsSettings {
                 binary: PathBuf::from("/opt/nibrunner/bin/zerofs"),
@@ -948,6 +966,7 @@ impl HostConfig {
             }),
             artifacts: Some(file::Artifacts {
                 store_url: Some(self.artifact_store_url.clone()),
+                cache_max_gib: self.artifact_cache_max_gib,
             }),
             volumes: Some(file::Volumes {
                 backend: Some(self.volumes.as_str().to_string()),
@@ -1909,6 +1928,20 @@ denied_egress_addresses_v6 = []
             .denied_egress_addresses_v6,
             vec!["fd00::/8".to_string()]
         );
+    }
+
+    #[test]
+    fn a_layer_cache_is_unbounded_unless_the_document_caps_it_in_whole_gibibytes() {
+        assert_eq!(parsed(WHOLE).artifact_cache_max_bytes(), None);
+        let capped = with("")
+            .to_toml()
+            .replace("[artifacts]\n", "[artifacts]\ncache_max_gib = 4\n");
+        assert_eq!(parsed(&capped).artifact_cache_max_bytes(), Some(4 << 30));
+        assert_eq!(
+            parsed(&parsed(&capped).to_toml()).artifact_cache_max_gib,
+            parsed(&capped).artifact_cache_max_gib
+        );
+        assert!(HostConfig::from_toml(&capped.replace("cache_max_gib = 4", "cache_max_gib = 0")).is_err());
     }
 
     #[test]
