@@ -63,6 +63,8 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
 
 async fn sync_desired(host: &Host, desired: &HostDesiredState) {
     for wanted in &desired.instances {
+        host.logs
+            .label(&wanted.app_id, &wanted.deployment_id, wanted.labels.clone());
         host.state
             .update_record(&wanted.app_id, |record| {
                 record.hostnames = wanted.hostnames.clone();
@@ -72,6 +74,9 @@ async fn sync_desired(host: &Host, desired: &HostDesiredState) {
                 record.desired_running = wanted.desired_state != DesiredInstanceState::Stopped;
                 record.on_request = wanted.desired_state == DesiredInstanceState::OnRequest;
                 record.http_port = wanted.config.http_port;
+                if record.deployment_id == wanted.deployment_id {
+                    record.labels = wanted.labels.clone();
+                }
             })
             .await;
     }
@@ -1169,6 +1174,29 @@ mod tests {
         assert!(record.on_request);
         assert!(record.desired_running);
         assert_eq!(record.hostnames, vec![app_hostname()]);
+    }
+
+    #[tokio::test]
+    async fn new_labels_are_taken_up_by_the_running_deployment_and_not_by_one_being_replaced() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let labels: protocol::InstanceLabels =
+            serde_json::from_value(serde_json::json!({ "rev": "r-2" })).unwrap();
+        let labelled = |deployment: &str| {
+            desired_state(|state| {
+                state.instances = vec![desired_instance(|instance| {
+                    instance.deployment_id = protocol::DeploymentId::parse(deployment).unwrap();
+                    instance.labels = labels.clone();
+                })]
+            })
+        };
+
+        sync_desired(&host, &labelled("dep-next")).await;
+        assert!(host.state.record(&app_id()).await.unwrap().labels.is_empty());
+
+        sync_desired(&host, &labelled(deployment_id().as_str())).await;
+        assert_eq!(host.state.record(&app_id()).await.unwrap().labels, labels);
+        assert!(host.vms.calls().is_empty());
     }
 
     #[tokio::test]

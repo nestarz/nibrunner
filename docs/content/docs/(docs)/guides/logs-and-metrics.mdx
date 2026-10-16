@@ -34,6 +34,16 @@ the line's sequence number in that session, then the line itself. If the host co
 a line says how many bytes were dropped. If the program restarted inside the guest, a line on
 `stderr` says why.
 
+An instance whose `desired.json` entry has `labels` writes each of them, sorted by key, as
+`label.<key>=<value>` between the sequence number and the line:
+
+```
+2026-09-16T10:41:07.318Z stdout 6f1c…/42 label.app=shop label.rev=r-12 listening on :3000
+```
+
+The host reads none of them; they are there so that whoever collects the file can tell which of
+its own deployments wrote a line without a lookup.
+
 The host keeps the newest 256 MiB per app, in two files. When `<appId>.log` reaches the limit it
 is renamed to `<appId>.log.1`, replacing the previous one, and a new `<appId>.log` starts.
 `tail -F` follows across the rotation. An app that logs too much fills only its own share of the
@@ -50,7 +60,8 @@ a log you want to read after the app is gone.
 
 The HTTP proxy also writes one JSON line per routed request to
 `<paths.state_dir>/logs/<appId>.http.jsonl`. Each line has `at`, `method`, `path`, `status`,
-`durationMicros` and `deploymentId`. The path excludes its query string; headers and request
+`durationMicros` and `deploymentId`, and `labels` as an object when the instance has any. The
+path excludes its query string; headers and request
 bodies are not kept. `at` is when the proxy had the response headers;
 `durationMicros` measures the wait for those headers, including a cold wake, rather than the
 transfer of the response body.

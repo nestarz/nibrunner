@@ -16,7 +16,7 @@ use tokio::sync::{
 };
 
 use hyper::Uri;
-use protocol::{AppId, DeploymentId, Timestamp};
+use protocol::{AppId, DeploymentId, InstanceLabels, Timestamp};
 use serde::Serialize;
 
 use crate::json_store::make_directory;
@@ -34,6 +34,8 @@ pub struct HttpRequestRecord {
     status: u16,
     duration_micros: u64,
     deployment_id: DeploymentId,
+    #[serde(skip_serializing_if = "InstanceLabels::is_empty")]
+    labels: InstanceLabels,
 }
 
 impl HttpRequestRecord {
@@ -51,7 +53,13 @@ impl HttpRequestRecord {
             status,
             duration_micros,
             deployment_id,
+            labels: InstanceLabels::default(),
         }
+    }
+
+    pub fn labelled(mut self, labels: InstanceLabels) -> Self {
+        self.labels = labels;
+        self
     }
 }
 
@@ -265,6 +273,25 @@ fn write_records(mut receiver: Receiver<HttpLogCommand>, directory: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_carries_its_instances_labels_only_when_the_document_gave_some() {
+        let uri: Uri = "/".parse().expect("a request URI");
+        let record = |labels| {
+            serde_json::to_value(
+                HttpRequestRecord::new("GET", &uri, 200, 1, crate::test_support::deployment_id())
+                    .labelled(labels),
+            )
+            .expect("a record")
+        };
+        let labels: InstanceLabels =
+            serde_json::from_value(serde_json::json!({ "app": "shop", "rev": "r-12" })).expect("labels");
+        assert_eq!(
+            record(labels)["labels"],
+            serde_json::json!({ "app": "shop", "rev": "r-12" })
+        );
+        assert!(record(InstanceLabels::default()).get("labels").is_none());
+    }
 
     #[tokio::test]
     async fn http_records_leave_query_strings_out_of_per_app_files() {
