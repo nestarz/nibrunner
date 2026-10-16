@@ -219,6 +219,11 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
     vms.expect_adopted_app_ids().returning(move || held(&adopted));
     vms.expect_memory().returning(|_| BTreeMap::new());
     vms.expect_readopt().returning(|_: &AppId| Ok(()));
+    let calls = spy.calls.clone();
+    vms.expect_apply_limits().returning(move |_, _, _| {
+        push(&calls, VmCall::ApplyLimits);
+        Ok(())
+    });
     let verdict = spy.verdict.clone();
     vms.expect_guest_verdict().returning(move |_| held(&verdict));
     vms.expect_working_dir()

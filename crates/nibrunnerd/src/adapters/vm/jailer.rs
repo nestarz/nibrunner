@@ -215,6 +215,20 @@ impl Jail {
         }
     }
 
+    /// Writes an instance's runtime controls into the cgroup the jailer just made for `pid`.
+    pub(crate) fn apply_controls(
+        &self,
+        app_id: &AppId,
+        pid: i32,
+        controls: &super::limits::RuntimeControls,
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fake_mounts {
+            return Ok(());
+        }
+        controls.write(&super::limits::cgroup_path(app_id), pid)
+    }
+
     pub(crate) fn grant_socket(&self, path: &Path) -> std::io::Result<()> {
         own(path, self.uid, self.gid)
     }

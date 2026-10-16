@@ -198,6 +198,15 @@ pub trait Vmm: Send + Sync {
         BTreeMap::new()
     }
     async fn adopted_app_ids(&self) -> Vec<AppId>;
+    /// Rewrites a running microVM's runtime controls for limits the document changed.
+    async fn apply_limits(
+        &self,
+        _app_id: &AppId,
+        _resources: protocol::InstanceResources,
+        _limits: Option<protocol::InstanceLimits>,
+    ) -> Result<(), VmError> {
+        Ok(())
+    }
     /// Listen again for the log output of a microVM adopted from an earlier daemon run. The
     /// guest keeps its end of the socket across a daemon restart, but a fresh receiver never
     /// bound the host end, so without this its output would go nowhere for the rest of its life.
@@ -376,6 +385,7 @@ pub enum VmCall {
     Stop,
     Discard,
     DeleteTap,
+    ApplyLimits,
 }
 
 #[cfg(test)]

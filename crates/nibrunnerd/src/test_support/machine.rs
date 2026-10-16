@@ -262,6 +262,7 @@ impl RunningHost {
                 idle_timeout_ms: None,
                 expiry: None,
                 activation: None,
+                limits: None,
                 layers: vec![DesiredLayer::Executable {
                     object: StoredObject {
                         digest: self.tenant_digest.clone(),

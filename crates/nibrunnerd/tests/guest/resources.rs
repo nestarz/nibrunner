@@ -170,6 +170,64 @@ async fn memory_survives_sleep_restore_and_redeployment(snapshot_directory: Opti
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn instance_limits_tighten_the_cgroup_live_and_survive_a_sleep() {
+    let Some(host) = crate::host().await else {
+        return;
+    };
+    let limited = |cpu_percent: u16, priority| protocol::InstanceLimits {
+        concurrent: None,
+        cpu_percent: Some(cpu_percent.try_into().unwrap()),
+        memory: Some(protocol::MemoryPolicy {
+            target_mib: 128.try_into().unwrap(),
+            swap_mib: 0,
+            priority,
+        }),
+    };
+    let app = host
+        .tenant(1)
+        .on_request(IDLE_TIMEOUT_MS)
+        .edited(|instance| instance.limits = Some(limited(25, protocol::MemoryPriority::Build)));
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Running).await;
+    let path = cgroup(&host, &app);
+    let oom_score = |host: &RunningHost| {
+        let pid = processes(host).read_record(&app.app_id).unwrap().pid;
+        std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj")).unwrap()
+    };
+    assert_eq!(
+        std::fs::read_to_string(path.join("cpu.max")).unwrap().trim(),
+        "25000 100000"
+    );
+    assert_eq!(number(&path, "memory.high"), 128 * BYTES_PER_MIB);
+    assert_eq!(oom_score(&host).trim(), "1000");
+
+    let relaxed = app
+        .clone()
+        .edited(|instance| instance.limits = Some(limited(50, protocol::MemoryPriority::Production)));
+    host.deploy(std::slice::from_ref(&relaxed)).await;
+    host.until("the new limits to reach the running VM", |_| {
+        std::fs::read_to_string(path.join("cpu.max")).is_ok_and(|max| max.trim() == "50000 100000")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(path.join("memory.high")).unwrap().trim(),
+        "max"
+    );
+    assert_eq!(number(&path, "memory.low"), 128 * BYTES_PER_MIB);
+    assert_eq!(oom_score(&host).trim(), "-500");
+
+    host.let_sleep(&relaxed).await;
+    assert_eq!(host.get(&relaxed, "/").await.unwrap().status, 200);
+    let restored = cgroup(&host, &relaxed);
+    assert_eq!(
+        std::fs::read_to_string(restored.join("cpu.max")).unwrap().trim(),
+        "50000 100000"
+    );
+    assert_eq!(oom_score(&host).trim(), "-500");
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_kernel_throttles_cpu_work_at_the_vms_resource_ceiling() {
     let Some(host) = crate::host().await else {
         return;

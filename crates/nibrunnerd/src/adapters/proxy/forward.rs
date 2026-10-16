@@ -862,12 +862,12 @@ mod tests {
         let metrics = std::sync::Arc::new(crate::domain::metrics::ProxyMetrics::default());
         let open = || metrics.open_requests_for(&crate::test_support::app_id());
         let upstream = echoing_once_it_is_no_longer_http().await;
-        let limiter = Arc::new(super::super::concurrency::ConcurrencyLimiter::new(
+        let limiter = Arc::new(super::super::concurrency::ConcurrencyLimiter::new(Some(
             crate::config::HttpConcurrency {
                 host_concurrent: 1.try_into().unwrap(),
                 app_concurrent: 1.try_into().unwrap(),
             },
-        ));
+        )));
         let proxy = proxying_with_limit(
             metrics.clone(),
             upstream_client(),
