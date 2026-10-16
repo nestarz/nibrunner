@@ -107,8 +107,13 @@ pub(crate) struct MemoryReadings {
     pub reservation_generation: u64,
     pub available_bytes: u64,
     pub headroom_bytes: u64,
+    /// What the largest production app asleep or frozen would need to wake: an external lease
+    /// leaves this much room.
+    pub production_wake_bytes: u64,
     pub measured_at_ms: i64,
     pub apps: BTreeMap<AppId, ReportedMemory>,
+    /// What each external lease's work is resident at, when that can be read.
+    pub external_resident_bytes: BTreeMap<String, u64>,
     pub pool: Option<PoolMemory>,
 }
 
@@ -212,6 +217,18 @@ impl MemoryReadings {
         target_from_peak(ceiling, peak)
     }
 
+    /// What waking `record` would add: its whole ceiling under ceiling admission, or what its
+    /// measured target needs beyond what it holds now under adaptive admission.
+    pub(crate) fn wake_headroom_bytes(&self, record: &InstanceRecord, adaptive: bool) -> u64 {
+        match (record.state, adaptive) {
+            (InstanceState::Idle, false) => self.ceiling(&record.app_id, record.resources),
+            (InstanceState::Idle | InstanceState::Frozen, true) => self
+                .wake_target_bytes(record)
+                .saturating_sub(self.anonymous_resident_bytes(record)),
+            _ => 0,
+        }
+    }
+
     fn growth_bytes(&self, record: &InstanceRecord) -> u64 {
         let ceiling = self.ceiling(&record.app_id, record.resources);
         let Some(memory) = self.resident_memory(record) else {
@@ -298,6 +315,8 @@ mod tests {
             reservation_generation: 0,
             available_bytes: 2048 * BYTES_PER_MIB,
             headroom_bytes: 1024 * BYTES_PER_MIB,
+            production_wake_bytes: 0,
+            external_resident_bytes: BTreeMap::new(),
             measured_at_ms: 10_000,
             apps: BTreeMap::from([(
                 app_id(),
