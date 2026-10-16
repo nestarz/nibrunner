@@ -222,6 +222,8 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
     vms.expect_guest_verdict().returning(move |_| held(&verdict));
     vms.expect_working_dir()
         .returning(move |app_id: &AppId| directory.join(app_id.as_str()));
+    vms.expect_channel_transport()
+        .return_const(guest_contract::channels::ChannelTransport::Vsock);
 
     (Arc::new(vms), spy)
 }
@@ -374,6 +376,10 @@ impl Vmm for HeldSleeps {
 
     fn working_dir(&self, app_id: &AppId) -> PathBuf {
         self.vms.working_dir(app_id)
+    }
+
+    fn channel_transport(&self) -> guest_contract::channels::ChannelTransport {
+        self.vms.channel_transport()
     }
 }
 

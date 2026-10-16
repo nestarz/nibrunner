@@ -11,7 +11,9 @@ use guest_contract::filesystem::{
 use guest_contract::paths;
 use protocol::{FilesystemEntryKind, GuestPath};
 
-use crate::guest::{log, vsock};
+use guest_contract::channels::{Channel, ChannelTransport};
+
+use crate::guest::{log, transport};
 
 const STATUS_OK: u8 = 0;
 const STATUS_NOT_FOUND: u8 = 1;
@@ -21,15 +23,15 @@ const STATUS_NOT_EMPTY: u8 = 4;
 const STATUS_OUT_OF_VOLUME: u8 = 5;
 const STATUS_FAILED: u8 = 7;
 
-pub(crate) fn serve() -> ! {
-    let Ok(listener) = vsock::listener(guest_contract::vsock::GUEST_FILESYSTEM_VSOCK_PORT) else {
+pub(crate) fn serve(channel_transport: ChannelTransport) -> ! {
+    let Ok(listener) = transport::listener(channel_transport, Channel::Filesystem) else {
         log("the filesystem port could not be opened; this tenant's files cannot be browsed");
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
     };
     loop {
-        match vsock::accept_from_host(&listener) {
+        match transport::accept(channel_transport, &listener) {
             Ok(connection) => answer_all(connection),
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }

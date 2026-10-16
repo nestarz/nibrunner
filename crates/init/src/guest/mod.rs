@@ -6,6 +6,7 @@ mod logs;
 mod memory;
 mod mounts;
 mod supervisor;
+mod transport;
 mod vsock;
 
 use std::process::ExitCode;
@@ -33,7 +34,8 @@ pub(crate) fn run() -> ExitCode {
         }
     };
 
-    let channels = channels::start(&config, &ceiling);
+    let transport = guest_contract::channels::ChannelTransport::Vsock;
+    let channels = channels::start(&config, &ceiling, transport);
 
     log(&format!(
         "starting {} as uid {} in {}, with {} MiB to spend",
@@ -42,7 +44,7 @@ pub(crate) fn run() -> ExitCode {
         config.working_directory,
         crate::ceiling::mib(ceiling.limit_bytes)
     ));
-    match supervisor::supervise(&config, &ceiling) {
+    match supervisor::supervise(&config, &ceiling, transport) {
         supervisor::Ended::ShutdownRequested => log("the tenant has stopped; shutting the guest down"),
         supervisor::Ended::RestartBudgetExhausted => log(&format!(
             "the tenant used its {} restarts without staying up; shutting the guest down",

@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, clippy::expect_used))]
 
+pub mod channels;
 pub mod control;
 pub mod cron_execution;
 pub mod cron_registration;

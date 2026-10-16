@@ -104,8 +104,12 @@ async fn write_inner(
     staging_dir: &std::path::Path,
 ) -> Result<u64, String> {
     let crontab = registered_crontab(host, &desired.app_id).await?;
-    let vsock_path = crate::domain::filesystem::reader::guest_vsock_path(host, &desired.app_id);
-    let lease = frozen(&desired.app_id, &vsock_path)
+    let endpoint = crate::domain::filesystem::reader::guest_endpoint(
+        host,
+        &desired.app_id,
+        guest_contract::channels::Channel::Control,
+    );
+    let lease = frozen(&desired.app_id, &endpoint)
         .await
         .map_err(|error| error.message())?;
     // A checkpoint is of what the store holds, and what the store holds trails what the guest has

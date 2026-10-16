@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use guest_contract::paths;
 
-use crate::guest::{log, vsock};
+use guest_contract::channels::{Channel, ChannelTransport};
+
+use crate::guest::{log, transport};
 
 const FREEZE_REQUEST: &str = "FREEZE";
 const FREEZE_HELD: &str = "OK";
@@ -19,8 +21,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_millis(guest_contract::control:
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub(crate) fn serve() -> ! {
-    let Ok(listener) = vsock::listener(guest_contract::vsock::GUEST_CONTROL_VSOCK_PORT) else {
+pub(crate) fn serve(channel_transport: ChannelTransport) -> ! {
+    let Ok(listener) = transport::listener(channel_transport, Channel::Control) else {
         log("the control port could not be opened; no export can freeze this tenant");
         loop {
             std::thread::sleep(Duration::from_secs(3600));
@@ -45,7 +47,7 @@ pub(crate) fn serve() -> ! {
             frozen_until = None;
             log("the host abandoned the tenant freeze; the tenant has been released");
         }
-        match vsock::accept_from_host(&listener) {
+        match transport::accept(channel_transport, &listener) {
             Ok(connection) => answer(connection, &mut frozen_until),
             Err(_) => std::thread::sleep(POLL_INTERVAL),
         }

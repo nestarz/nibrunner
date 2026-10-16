@@ -10,17 +10,27 @@ pub fn guest_vsock_path(host: &Host, app_id: &AppId) -> std::path::PathBuf {
         .join(guest_contract::vsock::GUEST_VSOCK_FILENAME)
 }
 
+pub fn guest_endpoint(
+    host: &Host,
+    app_id: &AppId,
+    channel: guest_contract::channels::Channel,
+) -> guest_contract::channels::ChannelEndpoint {
+    host.vms
+        .channel_transport()
+        .endpoint(&host.vms.working_dir(app_id), channel)
+}
+
 pub async fn list(
     host: &Host,
     app_id: &AppId,
     path: &GuestPath,
 ) -> Result<protocol::DirectoryListing, GuestFilesystemError> {
-    let mut guest = GuestFilesystem::dial(app_id, &guest_vsock_path(host, app_id)).await?;
+    let mut guest = GuestFilesystem::dial(app_id, &filesystem_endpoint(host, app_id)).await?;
     guest.list(path).await
 }
 
 pub async fn measure(host: &Host, app_id: &AppId) -> GuestReading {
-    let Ok(mut guest) = GuestFilesystem::dial(app_id, &guest_vsock_path(host, app_id)).await else {
+    let Ok(mut guest) = GuestFilesystem::dial(app_id, &filesystem_endpoint(host, app_id)).await else {
         return GuestReading::default();
     };
     GuestReading {
@@ -29,10 +39,30 @@ pub async fn measure(host: &Host, app_id: &AppId) -> GuestReading {
     }
 }
 
+fn filesystem_endpoint(host: &Host, app_id: &AppId) -> guest_contract::channels::ChannelEndpoint {
+    guest_endpoint(host, app_id, guest_contract::channels::Channel::Filesystem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    #[tokio::test]
+    async fn the_vmm_selects_the_transport_without_changing_the_app_directory() {
+        let mut host = test_host().await;
+        let working_dir = host.host.vms.working_dir(&app_id());
+        let mut runtime = crate::ports::MockVmm::new();
+        runtime
+            .expect_channel_transport()
+            .return_const(guest_contract::channels::ChannelTransport::Unix);
+        let reported = working_dir.clone();
+        runtime.expect_working_dir().returning(move |_| reported.clone());
+        std::sync::Arc::get_mut(&mut host.host).unwrap().vms = std::sync::Arc::new(runtime);
+        let endpoint = filesystem_endpoint(host.arc(), &app_id());
+        assert_eq!(endpoint.path, working_dir.join("filesystem.sock"));
+        assert_eq!(endpoint.vsock_port, None);
+    }
 
     #[tokio::test]
     async fn each_guest_is_reached_in_the_directory_selected_by_its_vmm() {
@@ -48,6 +78,7 @@ mod tests {
         assert!(path.ends_with(guest_contract::vsock::GUEST_VSOCK_FILENAME));
         assert_eq!(path.parent().unwrap().file_name().unwrap(), app_id().as_str());
         assert_ne!(path, guest_vsock_path(host.arc(), &neighbour));
+        assert_eq!(filesystem_endpoint(host.arc(), &app_id()).path, path);
     }
 
     #[tokio::test]
@@ -62,7 +93,7 @@ mod tests {
         let Err(error) = list(host.arc(), &app_id(), &GuestPath::parse("/").unwrap()).await else {
             panic!("a guest that is not running listed something anyway");
         };
-        assert!(error.message().contains("no microVM is running"), "{error}");
+        assert!(error.message().contains("no runtime is running"), "{error}");
         assert!(error.message().contains(app_id().as_str()), "{error}");
     }
 }

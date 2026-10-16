@@ -192,6 +192,12 @@ pub trait Vmm: Send + Sync {
     /// down, or the kernel's panic. A guest killed from outside said nothing.
     async fn guest_verdict(&self, app_id: &AppId) -> Option<String>;
     fn working_dir(&self, app_id: &AppId) -> PathBuf;
+
+    /// How the host reaches the control, filesystem and log channels of the runtime this VMM
+    /// starts. A Firecracker guest multiplexes them over its vsock device.
+    fn channel_transport(&self) -> guest_contract::channels::ChannelTransport {
+        guest_contract::channels::ChannelTransport::Vsock
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
