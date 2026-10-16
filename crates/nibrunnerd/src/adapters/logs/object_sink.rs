@@ -1,4 +1,4 @@
-//! Tenant output and requests, shipped to a control plane's bucket in the objects microfleets reads
+//! Tenant output and requests, shipped to a control plane's bucket in the objects it reads
 //! (`logs/<app>/live-<host>.jsonl.gz`, `logs/<app>/<yyyymmddhh>/<mmss>-<host>.jsonl.gz`): gzipped
 //! JSON lines, sealed under its fleet key. An instance is shipped only once its document labels it
 //! with an `app`; every line carries that label, `rev` and `context`, and its unit (the app id).
@@ -58,7 +58,7 @@ impl SealKey {
         Ok(Self(key))
     }
 
-    /// microfleets' `FleetKey::seal`: the nonce is `HMAC-SHA256(key, "nonce" ‖ len(aad) ‖ aad ‖
+    /// The control plane's seal: the nonce is `HMAC-SHA256(key, "nonce" ‖ len(aad) ‖ aad ‖
     /// plaintext)`, so an object sealed again unchanged is the same bytes.
     pub fn seal(&self, aad: &str, plaintext: &[u8]) -> Vec<u8> {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.0).expect("HMAC takes a key of any length");
@@ -157,7 +157,7 @@ fn fleet_of(url: &str) -> Option<String> {
     (segments.next() == Some("fleets")).then(|| fleet.to_string())
 }
 
-/// microfleets' `LogLine`: field order and omissions are the wire.
+/// One line as the control plane reads it: field order and omissions are the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLine {
     pub t: String,
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_is_the_very_bytes_microfleets_seals_and_reads() {
+    fn a_chunk_is_the_very_bytes_the_control_plane_seals_and_reads() {
         let seal = SealKey([7; 32]);
         let key = "logs/site/2026101612/0500-ovh-1.jsonl.gz";
         let plain = include_bytes!("../../../tests/fixtures/telemetry/chunk.jsonl.gz");

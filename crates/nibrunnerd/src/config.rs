@@ -179,7 +179,7 @@ pub struct LogsConfig {
 }
 
 /// Where every labelled instance's output and requests are also shipped, sealed: a live tail every
-/// 5 s and a chunk every 300 s, in the objects a microfleets control plane reads.
+/// 5 s and a chunk every 300 s, in the objects a control plane reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogsSink {
     pub store_url: String,
@@ -924,7 +924,7 @@ impl HostConfig {
             metrics: Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([127, 0, 0, 1]),
-                sink: Some("s3://microfleets-eu-west-2-123456789012/fleets/apps-example-com".to_string()),
+                sink: Some("s3://telemetry-example/fleets/apps-example-com".to_string()),
             }),
             filesystem: Some(FilesystemConfig {
                 socket: PathBuf::from("/run/nibrunner/filesystem.sock"),
@@ -932,7 +932,7 @@ impl HostConfig {
             max_concurrent_vm_starts: std::num::NonZeroU16::new(2).expect("a positive start limit"),
             logs: LogsConfig {
                 sink: Some(LogsSink {
-                    store_url: "s3://microfleets-eu-west-2-123456789012/fleets/apps-example-com".to_string(),
+                    store_url: "s3://telemetry-example/fleets/apps-example-com".to_string(),
                     seal_key_file: PathBuf::from("/etc/nibrunner/seal.key"),
                 }),
                 ..LogsConfig::default()

@@ -1,5 +1,5 @@
 //! The per-unit hour and day a control plane charts, summed from this page's own `nibrunner_app_`
-//! counters. The shapes are microfleets' `metrics/<host>/<yyyymmddhh>.json` and `<yyyymmdd>.json`,
+//! counters. The shapes are the control plane's `metrics/<host>/<yyyymmddhh>.json` and `<yyyymmdd>.json`,
 //! which its readers parse: a field renamed here is a chart gone blank there.
 use std::collections::BTreeMap;
 
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn the_hour_file_is_written_in_the_shape_microfleets_reads() {
+    fn the_hour_file_is_written_in_the_shape_the_control_plane_reads() {
         let units = [(
             "site".to_string(),
             UnitMetrics {
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_and_times_are_spelled_as_microfleets_spells_them() {
+    fn keys_and_times_are_spelled_as_the_control_plane_spells_them() {
         assert_eq!(hour_key(HOUR + 305), "2026101612");
         assert_eq!(day_key(HOUR + 305), "20261016");
         assert_eq!(mmss(HOUR + 305), "0505");
