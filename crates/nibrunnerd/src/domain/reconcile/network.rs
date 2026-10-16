@@ -65,6 +65,7 @@ pub async fn apply_network(host: &Host) {
 pub fn port_bindings(records: &[InstanceRecord]) -> Vec<StreamBinding> {
     records
         .iter()
+        .filter(|record| record.expired_at_ms.is_none())
         .flat_map(|record| {
             record.ports.iter().map(|port| StreamBinding {
                 app_id: record.app_id.clone(),
@@ -77,10 +78,16 @@ pub fn port_bindings(records: &[InstanceRecord]) -> Vec<StreamBinding> {
 }
 
 pub async fn apply_activators(host: &Arc<Host>) {
+    let records = host.state.snapshot().await.records;
     let slots: Vec<_> = host
         .slots()
         .await
         .into_iter()
+        .filter(|slot| {
+            !records
+                .get(&slot.app_id)
+                .is_some_and(|r| r.expired_at_ms.is_some())
+        })
         .map(|slot| (slot.app_id, slot.host_port))
         .collect();
     host.activator.serve(&slots).await;

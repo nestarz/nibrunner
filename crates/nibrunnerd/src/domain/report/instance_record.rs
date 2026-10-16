@@ -50,6 +50,12 @@ pub struct InstanceRecord {
     pub desired_running: bool,
     pub on_request: bool,
     #[serde(default)]
+    pub expiry: Option<protocol::ExpiryPolicy>,
+    #[serde(default)]
+    pub expiry_since_ms: Option<i64>,
+    #[serde(default)]
+    pub expired_at_ms: Option<i64>,
+    #[serde(default)]
     pub start_attempts: AttemptWindow,
     /// Restarts of the tenant by the supervisor inside its guest, since the host last booted the
     /// app afresh: a cold boot starts the count over, a restore keeps it. The host's own boots
@@ -89,6 +95,7 @@ pub struct RecordFields {
     pub restart_policy: RestartPolicy,
     pub desired_running: bool,
     pub on_request: bool,
+    pub expiry: Option<protocol::ExpiryPolicy>,
 }
 
 impl InstanceRecord {
@@ -110,6 +117,9 @@ impl InstanceRecord {
             restart_policy: fields.restart_policy,
             desired_running: fields.desired_running,
             on_request: fields.on_request,
+            expiry_since_ms: fields.expiry.as_ref().map(|_| crate::clock::now_ms()),
+            expiry: fields.expiry,
+            expired_at_ms: None,
             start_attempts: NO_START_ATTEMPTS,
             restart_count: 0,
             last_restart: None,
@@ -122,6 +132,7 @@ impl InstanceRecord {
     }
 
     pub fn adopt(&mut self, fields: RecordFields) {
+        self.apply_expiry(fields.expiry, &fields.deployment_id, crate::clock::now_ms());
         self.deployment_id = fields.deployment_id;
         self.volume_id = fields.volume_id;
         self.hostnames = fields.hostnames;
@@ -135,6 +146,26 @@ impl InstanceRecord {
         self.restart_policy = fields.restart_policy;
         self.desired_running = fields.desired_running;
         self.on_request = fields.on_request;
+    }
+
+    pub fn apply_expiry(
+        &mut self,
+        policy: Option<protocol::ExpiryPolicy>,
+        deployment: &DeploymentId,
+        now: i64,
+    ) {
+        let changed = self.deployment_id != *deployment;
+        if changed || policy.is_none() {
+            self.expiry_since_ms = None;
+            self.expired_at_ms = None;
+            if self.state == InstanceState::Expired {
+                self.state = InstanceState::Idle;
+            }
+        }
+        if policy.is_some() && self.expiry_since_ms.is_none() {
+            self.expiry_since_ms = Some(now);
+        }
+        self.expiry = policy;
     }
 
     pub fn is_idle(&self) -> bool {

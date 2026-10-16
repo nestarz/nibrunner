@@ -215,6 +215,7 @@
             "stopping",
             "stopped",
             "idle",
+            "expired",
             "failed"
           ]
         },
@@ -358,6 +359,17 @@
         "deploymentId": {
           "$ref": "#/$defs/DeploymentId"
         },
+        "expiredAt": {
+          "description": "The durable terminal-expiry decision; absent until this deployment expires.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "guestIpv4": {
           "anyOf": [
             {
@@ -372,6 +384,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/HostPort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastActiveAt": {
+          "description": "The latest host activity, including request admission and activation; absent before activity is known.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
             },
             {
               "type": "null"

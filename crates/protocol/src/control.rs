@@ -394,6 +394,10 @@ pub struct DesiredInstance {
     /// than `never` is refused on anything but an `on-request` instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<ActivationPolicy>,
+    /// Optional terminal retention for on-request instances: expired hostnames answer HTTP 410.
+    /// Removing the policy or changing deploymentId revives the instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<ExpiryPolicy>,
     /// The root filesystem, bottom layer first. At least one; at most `MAX_LAYERS`.
     pub layers: Vec<DesiredLayer>,
     pub config: AppConfig,
@@ -434,6 +438,8 @@ struct DesiredInstanceFields {
     idle_timeout_ms: Option<IdleTimeoutMs>,
     #[serde(default)]
     activation: Option<ActivationPolicy>,
+    #[serde(default)]
+    expiry: Option<ExpiryPolicy>,
     layers: Vec<DesiredLayer>,
     config: AppConfig,
     hostnames: Vec<AppHostname>,
@@ -443,6 +449,11 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
     type Error = InvalidValue;
 
     fn try_from(fields: DesiredInstanceFields) -> Result<Self, Self::Error> {
+        if fields.expiry.is_some() && fields.desired_state != DesiredInstanceState::OnRequest {
+            return Err(InvalidValue::new_public(
+                "only an on-request instance may name expiry",
+            ));
+        }
         if fields.activation.is_some() && fields.idle_timeout_ms.is_some() {
             return Err(InvalidValue::new_public(
                 "activation and idleTimeoutMs both say when an instance sleeps; name one",
@@ -494,6 +505,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             desired_state: fields.desired_state,
             idle_timeout_ms: fields.idle_timeout_ms,
             activation: fields.activation,
+            expiry: fields.expiry,
             layers: fields.layers,
             config: fields.config,
             hostnames: fields.hostnames,
@@ -505,6 +517,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
 // passes is one this host takes.
 #[cfg(feature = "schema")]
 fn desired_instance_rules(schema: &mut schemars::Schema) {
+    schema.insert("allOf".into(), serde_json::json!([{ "if": { "required": ["expiry"], "properties": {"expiry": {"type":"object"}} }, "then": { "properties": {"desiredState": {"const":"on-request"}} } }]));
     schema.insert(
         "oneOf".into(),
         serde_json::json!([{ "required": ["volumeId"] }, { "required": ["scratch"] }]),
@@ -649,6 +662,12 @@ pub struct ReportedInstance {
     /// deployment this host was not there to see arrive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub converged_at: Option<Timestamp>,
+    /// The latest host activity, including request admission and activation; absent before activity is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<Timestamp>,
+    /// The durable terminal-expiry decision; absent until this deployment expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_at: Option<Timestamp>,
     /// For an `exited` instance, how its program ended: the code it exited with, or 128 plus the
     /// signal that killed it. Otherwise the microVM's own exit code, when it went down by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -393,6 +393,73 @@ impl JsonSchema for IdleTimeoutMs {
     }
 }
 
+/// Terminal retention permits no less than one hour of inactivity.
+pub const MIN_EXPIRY_IDLE_MS: u64 = 3_600_000;
+/// The longest terminal retention window is 36,500 days.
+pub const MAX_EXPIRY_IDLE_MS: u64 = 3_153_600_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ExpiryIdleMs(u64);
+
+impl ExpiryIdleMs {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for ExpiryIdleMs {
+    type Error = InvalidValue;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if (MIN_EXPIRY_IDLE_MS..=MAX_EXPIRY_IDLE_MS).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidValue::new_public("expiry.idleMs is out of range"))
+        }
+    }
+}
+
+impl From<ExpiryIdleMs> for u64 {
+    fn from(value: ExpiryIdleMs) -> u64 {
+        value.0
+    }
+}
+
+#[cfg(feature = "schema")]
+impl JsonSchema for ExpiryIdleMs {
+    fn schema_name() -> Cow<'static, str> {
+        "ExpiryIdleMs".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::ExpiryIdleMs").into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "minimum": MIN_EXPIRY_IDLE_MS,
+            "maximum": MAX_EXPIRY_IDLE_MS
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpiryPolicy {
+    pub idle_ms: ExpiryIdleMs,
+    /// Stop new requests at this instant, then expire after admitted requests finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<Timestamp>,
+}
+
+impl ExpiryPolicy {
+    pub fn deadline_reached(&self, now_ms: i64) -> bool {
+        self.deadline.as_ref().is_some_and(|at| now_ms >= at.epoch_ms())
+    }
+}
+
 pub const MIN_MAX_LIFETIME_MS: u64 = 60_000;
 pub const MAX_MAX_LIFETIME_MS: u64 = 604_800_000;
 
@@ -585,6 +652,7 @@ pub enum InstanceState {
     Stopping,
     Stopped,
     Idle,
+    Expired,
     Failed,
     /// A program run once (`maxRestarts: 0`) that ended on its own, whatever its exit status:
     /// `lastExitCode` carries that status, and the instance is not started again until it is
@@ -593,7 +661,7 @@ pub enum InstanceState {
     Exited,
 }
 
-pub const INSTANCE_STATES: [InstanceState; 9] = [
+pub const INSTANCE_STATES: [InstanceState; 10] = [
     InstanceState::Pending,
     InstanceState::Starting,
     InstanceState::Running,
@@ -601,6 +669,7 @@ pub const INSTANCE_STATES: [InstanceState; 9] = [
     InstanceState::Stopping,
     InstanceState::Stopped,
     InstanceState::Idle,
+    InstanceState::Expired,
     InstanceState::Failed,
     InstanceState::Exited,
 ];
@@ -615,6 +684,7 @@ impl InstanceState {
             InstanceState::Stopping => "stopping",
             InstanceState::Stopped => "stopped",
             InstanceState::Idle => "idle",
+            InstanceState::Expired => "expired",
             InstanceState::Failed => "failed",
             InstanceState::Exited => "exited",
         }

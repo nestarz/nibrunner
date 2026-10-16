@@ -151,6 +151,7 @@ pub fn desired_instance(edit: impl FnOnce(&mut DesiredInstance)) -> DesiredInsta
         scratch: None,
         desired_state: DesiredInstanceState::Running,
         idle_timeout_ms: None,
+        expiry: None,
         activation: None,
         layers: vec![layer(|_| {})],
         config: app_config(|_| {}),
@@ -219,6 +220,8 @@ pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedIn
         last_restart: None,
         started_at: None,
         converged_at: None,
+        last_active_at: None,
+        expired_at: None,
         last_exit_code: None,
         message: None,
     };
@@ -306,6 +309,7 @@ pub fn observed_instance(edit: impl FnOnce(&mut ObservedInstance)) -> ObservedIn
         exited: false,
         refused: false,
         ran_once: false,
+        expired: false,
     };
     edit(&mut value);
     value
@@ -348,6 +352,7 @@ pub fn record_fields() -> RecordFields {
         restart_policy: DEFAULT_RESTART_POLICY,
         desired_running: true,
         on_request: false,
+        expiry: None,
     }
 }
 
@@ -522,7 +527,7 @@ async fn test_host_over(
         nbd: crate::adapters::volumes::nbd::NbdDevices::new(commands.clone()),
         commands: commands.clone(),
         firewall: Arc::new(HostFirewall::new(commands.clone())),
-        router: Router::new(metrics.clone(), None),
+        router: Router::with_state(metrics.clone(), None, None, state.clone()),
         tls: None,
         waker: Arc::new(NeverWoken),
         activator: AppActivator::new(state.clone(), Arc::new(NeverWoken), metrics.clone()),
