@@ -482,6 +482,73 @@ async fn a_tap_is_created_addressed_and_given_the_guest_it_will_hold() {
         .expect("a tap that is already gone is the state being asked for, not a failure");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_interface_this_host_did_not_make_is_refused_rather_than_adopted_or_deleted() {
+    if !enabled() {
+        return;
+    }
+    require_root();
+    use nibrunnerd::adapters::net::tap::{HostNetwork, KernelNetwork, Neighbour, TapInterface};
+
+    let network = KernelNetwork::open().expect("a netlink socket");
+    let slot = nft_render::describe_slot(
+        nft_render::most_apps_the_ports_fit() - 2,
+        protocol::AppId::parse("foreign").unwrap(),
+    );
+    commands()
+        .stdout_of(nibrunnerd::ports::CommandRequest::new(&[
+            "ip",
+            "link",
+            "add",
+            &slot.tap_name,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "nbr-test-peer",
+        ]))
+        .await
+        .unwrap();
+    let index_path = format!("/sys/class/net/{}/ifindex", slot.tap_name);
+    let index = std::fs::read_to_string(&index_path).unwrap();
+
+    let tap = TapInterface {
+        tap_name: slot.tap_name.clone(),
+        host_ipv4: slot.host_ipv4.clone(),
+        subnet_prefix_length: slot.subnet_prefix_length,
+    };
+    let adopted = network.ensure_tap(&tap).await;
+    let neighboured = network
+        .refresh_neighbour(&Neighbour {
+            guest_ipv4: slot.guest_ipv4.clone(),
+            guest_mac: slot.guest_mac.clone(),
+            tap_name: slot.tap_name.clone(),
+        })
+        .await;
+    let deleted = network.delete_tap(&slot.tap_name).await;
+    let listed = network.tap_names().await;
+    let index_after = std::fs::read_to_string(&index_path).unwrap();
+    commands()
+        .stdout_of(nibrunnerd::ports::CommandRequest::new(&[
+            "ip",
+            "link",
+            "delete",
+            &slot.tap_name,
+        ]))
+        .await
+        .unwrap();
+
+    assert!(adopted.unwrap_err().reason.contains("a different interface"));
+    assert!(neighboured.is_err());
+    assert!(deleted.is_err());
+    assert!(!listed.contains(&slot.tap_name));
+    assert_eq!(index_after, index, "the foreign interface is left as it was");
+    for name in ["../outside", "nbr1234567890123456", "lo"] {
+        assert!(network.delete_tap(name).await.is_err(), "{name}");
+    }
+}
+
 #[tokio::test]
 async fn the_embedded_hypervisor_runs_on_this_host() {
     if !enabled() {
