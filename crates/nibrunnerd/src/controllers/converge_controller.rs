@@ -135,6 +135,7 @@ impl ConvergeController {
             let changes = cache.changes_in(desired);
             cache.accept(desired.clone()).then_some(changes)
         };
+        self.host.apply_instance_limits(desired).await;
         let enabled = desired
             .instances
             .iter()

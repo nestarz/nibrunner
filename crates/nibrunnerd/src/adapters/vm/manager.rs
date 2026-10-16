@@ -370,6 +370,21 @@ impl VmManager {
             .map_err(|error| VmError::Host(format!("snapshot memory could not be reserved: {error}")))
     }
 
+    fn lift_memory_high(&self, app_id: &AppId) -> Result<Option<super::limits::MemoryHighLift>, VmError> {
+        if !self
+            .processes
+            .read_record(app_id)
+            .is_some_and(|record| record.jail_root.is_some())
+        {
+            return Ok(None);
+        }
+        super::limits::lift_memory_high(&super::limits::cgroup_path(app_id)).map_err(|error| {
+            VmError::Host(format!(
+                "memory.high could not be lifted for the snapshot: {error}"
+            ))
+        })
+    }
+
     async fn snapshot_paused_vm(
         &self,
         request: &SuspendRequest,
@@ -377,6 +392,7 @@ impl VmManager {
         stamp: SnapshotStamp,
     ) -> Result<u64, VmError> {
         let mut memory = self.reserve_snapshot_memory(&request.app_id)?;
+        let _unthrottled = self.lift_memory_high(&request.app_id)?;
         let outcome = async {
             let staged = StagedSnapshot::create(&self.snapshot_dir)?;
             self.create_snapshot(
@@ -463,8 +479,19 @@ impl Vmm for VmManager {
         let started = self
             .processes
             .spawn(&app_id, &self.firecracker, &self.jailer, &prepared.jail, true)
-            .await;
+            .await
+            .and_then(|record| {
+                prepared.jail.apply_controls(
+                    &app_id,
+                    record.pid,
+                    &super::limits::RuntimeControls::for_instance(
+                        request.desired.config.resources,
+                        request.desired.limits.as_ref(),
+                    ),
+                )
+            });
         if let Err(error) = started {
+            self.processes.stop(&app_id).await;
             self.cron_registration.detach(&app_id).await;
             let _ = self.logs.detach(&app_id).await;
             return Err(VmError::Host(error.to_string()));
@@ -600,10 +627,17 @@ impl Vmm for VmManager {
         }
         let state_path = PathBuf::from("/snapshots/state");
         let memory_path = PathBuf::from("/snapshots/memory");
+        let controls = self.state.record(&request.app_id).await.map(|record| {
+            super::limits::RuntimeControls::for_instance(record.resources, record.limits.as_ref())
+        });
         let started = self
             .processes
             .spawn(&request.app_id, &self.firecracker, &self.jailer, &jail, false)
             .await
+            .and_then(|record| match &controls {
+                Some(controls) => jail.apply_controls(&request.app_id, record.pid, controls),
+                None => Ok(()),
+            })
             .map_err(|error| VmError::Host(error.to_string()));
         let outcome = match started {
             Err(error) => Err(error),
@@ -681,6 +715,28 @@ impl Vmm for VmManager {
             .iter()
             .filter_map(|id| self.processes.memory(id).map(|memory| (id.clone(), memory)))
             .collect()
+    }
+
+    async fn apply_limits(
+        &self,
+        app_id: &AppId,
+        resources: protocol::InstanceResources,
+        limits: Option<protocol::InstanceLimits>,
+    ) -> Result<(), VmError> {
+        let Some(record) = self
+            .processes
+            .read_record(app_id)
+            .filter(|record| record.jail_root.is_some() && self.processes.status(app_id).active)
+        else {
+            return Ok(());
+        };
+        let cgroup = super::limits::cgroup_path(app_id);
+        if !cgroup.exists() {
+            return Ok(());
+        }
+        super::limits::RuntimeControls::for_instance(resources, limits.as_ref())
+            .write(&cgroup, record.pid)
+            .map_err(|error| VmError::Host(format!("the instance's limits could not be applied: {error}")))
     }
 
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {

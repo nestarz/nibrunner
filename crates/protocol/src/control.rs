@@ -251,6 +251,9 @@ pub struct DesiredInstance {
     /// than `never` is refused on anything but an `on-request` instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<ActivationPolicy>,
+    /// What the host enforces beyond `config.resources`, applied without a new deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<InstanceLimits>,
     /// The root filesystem, bottom layer first. At least one; at most `MAX_LAYERS`.
     pub layers: Vec<DesiredLayer>,
     pub config: AppConfig,
@@ -288,6 +291,8 @@ struct DesiredInstanceFields {
     idle_timeout_ms: Option<IdleTimeoutMs>,
     #[serde(default)]
     activation: Option<ActivationPolicy>,
+    #[serde(default)]
+    limits: Option<InstanceLimits>,
     layers: Vec<DesiredLayer>,
     config: AppConfig,
     hostnames: Vec<AppHostname>,
@@ -328,6 +333,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             desired_state: fields.desired_state,
             idle_timeout_ms: fields.idle_timeout_ms,
             activation: fields.activation,
+            limits: fields.limits,
             layers: fields.layers,
             config: fields.config,
             hostnames: fields.hostnames,
