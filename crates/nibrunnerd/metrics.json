@@ -126,6 +126,15 @@
     "name": "nibrunner_app_request_duration_seconds"
   },
   {
+    "help": "How long requests to one app took this proxy to answer, by the class of the status it answered with — a 502 or 503 of the proxy's own included, a websocket's 101 not. Measured as the host-wide request duration is.",
+    "kind": "histogram",
+    "labels": [
+      "app",
+      "class"
+    ],
+    "name": "nibrunner_app_request_seconds"
+  },
+  {
     "help": "Requests routed to an app, by the class of the status that came back. A 502 for an app that could not be reached is the proxy's and counted apart below.",
     "kind": "counter",
     "labels": [
