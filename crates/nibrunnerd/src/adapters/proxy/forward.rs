@@ -182,12 +182,15 @@ fn upgrade_requested<B>(request: &Request<B>) -> bool {
 // so this leg dials a connection of its own and keeps it for as long as the two sides talk. The
 // headers that say what the upgrade is are the ones `strip_hop_by_hop` exists to remove, which is
 // why nothing is stripped on the way through here.
-async fn forward_upgrade(
-    request: Request<Incoming>,
+async fn forward_upgrade<B>(
+    request: Request<B>,
     host: &str,
     port: u16,
     open: Arc<ForwardedRequest>,
-) -> Response<ProxyBody> {
+) -> Response<ProxyBody>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Send + Sync + Unpin + 'static,
+{
     let (mut parts, body) = request.into_parts();
     parts.uri = rewritten(&parts.uri, host, port);
     let mut forwarded = Request::from_parts(
@@ -262,14 +265,17 @@ fn as_the_upstream_speaks(parts: &mut hyper::http::request::Parts) {
     }
 }
 
-pub(crate) async fn forward(
+pub(crate) async fn forward<B>(
     client: &Client<HttpConnector, ProxyBody>,
-    request: Request<Incoming>,
+    request: Request<B>,
     host: &str,
     port: u16,
     keep_alive: bool,
     open: impl Into<ForwardedRequest>,
-) -> Response<ProxyBody> {
+) -> Response<ProxyBody>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Send + Sync + Unpin + 'static,
+{
     let open = Arc::new(open.into());
     if upgrade_requested(&request) {
         return forward_upgrade(request, host, port, open).await;

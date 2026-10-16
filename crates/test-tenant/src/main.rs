@@ -135,12 +135,17 @@ fn serve(stream: TcpStream, data_dir: &Path) {
         }
 
         let target = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
-        let (status, body) = answer(&target, data_dir);
+        let (status, described, body) = if target_path(&target) == "/page" {
+            page(&target)
+        } else {
+            let (status, body) = answer(&target, data_dir);
+            (status, "content-type: text/plain\r\n".to_string(), body)
+        };
         // A caller that asked to be done is told the same and let go. Everyone else keeps the
         // connection, which is what makes the proxy's pooling of it worth testing.
         let sent = write!(
             writing,
-            "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: {}\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\n{described}content-length: {}\r\nconnection: {}\r\n\r\n{body}",
             body.len(),
             if closing { "close" } else { "keep-alive" }
         )
@@ -155,6 +160,22 @@ fn serve(stream: TcpStream, data_dir: &Path) {
             return;
         }
     }
+}
+
+/// `kib` KiB of HTML, with the `cache-control` the caller names, `public, max-age=60` otherwise,
+/// and an etag naming its size.
+fn page(target: &str) -> (&'static str, String, String) {
+    let kib: usize = query(target, "kib").and_then(|kib| kib.parse().ok()).unwrap_or(1);
+    let cache_control = query(target, "cache-control").unwrap_or_else(|| "public, max-age=60".to_string());
+    let line = "<p>a page worth keeping, and worth compressing</p>\n";
+    let body = line.repeat((kib * 1024).div_ceil(line.len()));
+    (
+        "200 OK",
+        format!(
+            "content-type: text/html; charset=utf-8\r\ncache-control: {cache_control}\r\netag: \"page-{kib}\"\r\n"
+        ),
+        body,
+    )
 }
 
 fn target_path(target: &str) -> &str {

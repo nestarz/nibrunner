@@ -217,7 +217,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         artifacts,
         payloads,
         firewall: Arc::new(HostFirewall::new(commands)),
-        router: Router::with_concurrency(
+        router: Router::with_http(
             metrics.clone(),
             Some(http_log),
             config
@@ -225,6 +225,8 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
                 .http
                 .as_ref()
                 .and_then(|http| http.concurrency.clone()),
+            config.proxy.http.as_ref().and_then(|http| http.cache.as_ref()),
+            config.proxy.http.as_ref().and_then(|http| http.encode.clone()),
         ),
         tls,
         metrics,

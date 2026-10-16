@@ -1,6 +1,8 @@
 pub mod activator;
+pub(crate) mod cache;
 pub(crate) mod concurrency;
 pub mod datagram_activator;
+pub(crate) mod encode;
 pub mod forward;
 pub mod http_log;
 pub mod pem;

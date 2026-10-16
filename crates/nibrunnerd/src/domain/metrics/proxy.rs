@@ -6,6 +6,7 @@ use std::time::Duration;
 use hyper::StatusCode;
 use protocol::AppId;
 
+use crate::config::Compression;
 use crate::domain::metrics::{Histogram, Kind, Metric, Page};
 use crate::state::HostSnapshot;
 
@@ -46,6 +47,43 @@ pub const OUTCOMES: [Outcome; 5] = [
     Outcome::WrongHost,
     Outcome::Refused,
 ];
+
+/// What the response cache did with a request: answered it from a fresh entry, from a stale one
+/// while it revalidates or because the app failed, asked the app, or was not the place for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOutcome {
+    Hit,
+    Stale,
+    Miss,
+    Bypass,
+}
+
+impl CacheOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheOutcome::Hit => "hit",
+            CacheOutcome::Stale => "stale",
+            CacheOutcome::Miss => "miss",
+            CacheOutcome::Bypass => "bypass",
+        }
+    }
+}
+
+const CACHE_OUTCOMES: [CacheOutcome; 4] = [
+    CacheOutcome::Hit,
+    CacheOutcome::Stale,
+    CacheOutcome::Miss,
+    CacheOutcome::Bypass,
+];
+
+const COMPRESSIONS: [Compression; 2] = [Compression::Br, Compression::Gzip];
+
+fn compression_label(compression: Compression) -> &'static str {
+    match compression {
+        Compression::Br => "br",
+        Compression::Gzip => "gzip",
+    }
+}
 
 /// How a TLS handshake ended, in the word the counter uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +170,9 @@ pub struct AppProxy {
     pub raw_sessions: [[u64; RAW_OUTCOMES.len()]; PROTOCOLS.len()],
     pub raw_bytes_in: [u64; PROTOCOLS.len()],
     pub raw_bytes_out: [u64; PROTOCOLS.len()],
+    pub cache: [u64; CACHE_OUTCOMES.len()],
+    pub encoded_in: [u64; COMPRESSIONS.len()],
+    pub encoded_out: [u64; COMPRESSIONS.len()],
 }
 
 fn position<T: PartialEq>(of: &[T], value: &T) -> usize {
@@ -164,6 +205,7 @@ pub struct ProxyMetrics {
     answered: Histogram,
     in_flight: AtomicU64,
     handshakes: [AtomicU64; HANDSHAKES.len()],
+    cache_bytes: AtomicU64,
     apps: Apps,
 }
 
@@ -174,6 +216,7 @@ impl Default for ProxyMetrics {
             answered: Histogram::over(&BUCKET_BOUNDS_SECONDS),
             in_flight: AtomicU64::new(0),
             handshakes: Default::default(),
+            cache_bytes: AtomicU64::new(0),
             apps: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -259,6 +302,26 @@ impl ProxyMetrics {
         self.app(app_id, |app| {
             app.raw_bytes_in[position(&PROTOCOLS, &protocol)] += from_client;
             app.raw_bytes_out[position(&PROTOCOLS, &protocol)] += from_guest;
+        });
+    }
+
+    pub fn cached(&self, app_id: &AppId, outcome: CacheOutcome) {
+        self.app(app_id, |app| app.cache[position(&CACHE_OUTCOMES, &outcome)] += 1);
+    }
+
+    pub fn cache_weighs(&self, bytes: u64) {
+        self.cache_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn encoded(&self, app_id: &AppId, compression: Compression, taken: u64, given: u64) {
+        self.app(app_id, |app| {
+            let index = position(&COMPRESSIONS, &compression);
+            app.encoded_in[index] += taken;
+            app.encoded_out[index] += given;
         });
     }
 
@@ -349,6 +412,27 @@ static RAW_PORT_BYTES_TOTAL: Metric = Metric {
     labels: &["app", "protocol", "direction"],
 };
 
+static PROXY_CACHE_REQUESTS_TOTAL: Metric = Metric {
+    name: "nibrunner_proxy_cache_requests_total",
+    help: "Requests for an app by what the response cache did: hit is answered from a fresh entry without the app, stale from an entry past its lifetime while it revalidates or because the app failed, miss asked the app, bypass is a request the cache does not hold answers to. Zero everywhere on a host with no [proxy.http.cache].",
+    kind: Kind::Counter,
+    labels: &["app", "outcome"],
+};
+
+static PROXY_CACHE_BYTES: Metric = Metric {
+    name: "nibrunner_proxy_cache_bytes",
+    help: "What the stored responses weigh together, headers and bodies as stored, against [proxy.http.cache] memory_mib.",
+    kind: Kind::Gauge,
+    labels: &[],
+};
+
+static PROXY_ENCODE_BYTES_TOTAL: Metric = Metric {
+    name: "nibrunner_proxy_encode_bytes_total",
+    help: "What the proxy compressed for an app, by coding: in is what the app sent, out is what left compressed. A hit compresses nothing and is not counted.",
+    kind: Kind::Counter,
+    labels: &["app", "encoding", "direction"],
+};
+
 pub(super) static DECLARED: &[&Metric] = &[
     &PROXY_REQUESTS_TOTAL,
     &PROXY_REQUEST_DURATION_SECONDS,
@@ -360,6 +444,9 @@ pub(super) static DECLARED: &[&Metric] = &[
     &APP_REQUESTS_OPEN,
     &RAW_PORT_SESSIONS_TOTAL,
     &RAW_PORT_BYTES_TOTAL,
+    &PROXY_CACHE_REQUESTS_TOTAL,
+    &PROXY_CACHE_BYTES,
+    &PROXY_ENCODE_BYTES_TOTAL,
 ];
 
 pub(super) fn render(page: &mut Page, metrics: &ProxyMetrics, snapshot: &HostSnapshot) {
@@ -434,6 +521,39 @@ pub(super) fn render(page: &mut Page, metrics: &ProxyMetrics, snapshot: &HostSna
             &[("app", app_id.as_str())],
             metrics.of(app_id).open,
         );
+    }
+
+    page.declare(&PROXY_CACHE_REQUESTS_TOTAL);
+    for app_id in &apps {
+        let app = metrics.of(app_id);
+        for (index, outcome) in CACHE_OUTCOMES.iter().enumerate() {
+            page.value(
+                &PROXY_CACHE_REQUESTS_TOTAL,
+                &[("app", app_id.as_str()), ("outcome", outcome.as_str())],
+                app.cache[index],
+            );
+        }
+    }
+
+    page.declare(&PROXY_CACHE_BYTES);
+    page.value(&PROXY_CACHE_BYTES, &[], metrics.cache_bytes());
+
+    page.declare(&PROXY_ENCODE_BYTES_TOTAL);
+    for app_id in &apps {
+        let app = metrics.of(app_id);
+        for (index, compression) in COMPRESSIONS.iter().enumerate() {
+            for (direction, bytes) in [("in", app.encoded_in[index]), ("out", app.encoded_out[index])] {
+                page.value(
+                    &PROXY_ENCODE_BYTES_TOTAL,
+                    &[
+                        ("app", app_id.as_str()),
+                        ("encoding", compression_label(*compression)),
+                        ("direction", direction),
+                    ],
+                    bytes,
+                );
+            }
+        }
     }
 
     let with_raw_ports: Vec<&AppId> = snapshot
@@ -585,6 +705,38 @@ mod tests {
         ));
         assert!(bytes
             .contains(&"nibrunner_raw_port_bytes_total{app=\"app-2\",protocol=\"udp\",direction=\"in\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn what_the_cache_answered_and_what_was_compressed_are_counted_for_each_app() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let metrics = &host.metrics.proxy;
+        metrics.cached(&app_id(), CacheOutcome::Miss);
+        metrics.cached(&app_id(), CacheOutcome::Hit);
+        metrics.cached(&app_id(), CacheOutcome::Hit);
+        metrics.cache_weighs(4_096);
+        metrics.encoded(&app_id(), Compression::Br, 30_000, 2_000);
+
+        let page = page(
+            &crate::domain::metrics::tests::report(),
+            &host.metrics,
+            &host.state.snapshot().await,
+            0,
+        );
+        assert!(page.contains("nibrunner_proxy_cache_requests_total{app=\"app-1\",outcome=\"hit\"} 2\n"));
+        assert!(page.contains("nibrunner_proxy_cache_requests_total{app=\"app-1\",outcome=\"miss\"} 1\n"));
+        assert!(page.contains("nibrunner_proxy_cache_requests_total{app=\"app-1\",outcome=\"bypass\"} 0\n"));
+        assert!(page.contains("nibrunner_proxy_cache_bytes 4096\n"));
+        assert!(page.contains(
+            "nibrunner_proxy_encode_bytes_total{app=\"app-1\",encoding=\"br\",direction=\"in\"} 30000\n"
+        ));
+        assert!(page.contains(
+            "nibrunner_proxy_encode_bytes_total{app=\"app-1\",encoding=\"br\",direction=\"out\"} 2000\n"
+        ));
+        assert!(page.contains(
+            "nibrunner_proxy_encode_bytes_total{app=\"app-1\",encoding=\"gzip\",direction=\"out\"} 0\n"
+        ));
     }
 
     #[test]

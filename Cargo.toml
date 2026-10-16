@@ -68,6 +68,12 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"]
 hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "http2", "server", "server-auto"] }
 http-body-util = "0.1"
+# RFC 9111 §4.1–4.3 for the proxy's response cache; BSD-2-Clause.
+http-cache-semantics = { version = "3", default-features = false }
+moka = { version = "0.12", features = ["future"] }
+async-compression = { version = "0.4", features = ["tokio", "brotli", "gzip"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+httpdate = "1"
 percent-encoding = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
