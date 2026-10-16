@@ -481,6 +481,8 @@ async fn test_host_over(
     config.proxy = crate::config::ProxyConfig {
         http: Some(crate::config::HttpListener {
             concurrency: None,
+            cache: None,
+            encode: None,
             listen_address: std::net::Ipv4Addr::LOCALHOST.into(),
             port: 8080,
             tls: None,

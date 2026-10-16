@@ -139,6 +139,8 @@ pub async fn started_with(edit: impl FnOnce(&mut crate::config::HostConfig)) -> 
     config.proxy = crate::config::ProxyConfig {
         http: Some(crate::config::HttpListener {
             concurrency: None,
+            cache: None,
+            encode: None,
             listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
             tls: None,
@@ -385,6 +387,11 @@ impl RunningHost {
 
     /// One request through the proxy on a connection of its own, which is what makes a refusal
     /// visible rather than absorbed by a pool.
+    /// Where the proxy listens, for a test that speaks to it in its own words.
+    pub fn proxy(&self) -> SocketAddr {
+        self.proxy
+    }
+
     pub async fn get(&self, tenant: &Tenant, path: &str) -> std::io::Result<Answer> {
         self.get_as(&tenant.hostname, path).await
     }
