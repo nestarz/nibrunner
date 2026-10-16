@@ -4,7 +4,7 @@ use nft_render::{describe_slot, AppSlot, FIRST_SLOT};
 use protocol::AppId;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("all {limit} apps this host is laid out for hold a slot; raise max_apps in config.toml")]
+#[error("all {limit} apps this host is laid out for hold a slot; raise max_apps in config.toml, or maxApps in the desired state")]
 pub struct SlotExhausted {
     pub limit: u32,
 }
@@ -323,6 +323,7 @@ mod tests {
         assert!(said.contains("all 63 apps"), "{said}");
         assert!(said.contains("max_apps"), "{said}");
         assert!(said.contains("config.toml"), "{said}");
+        assert!(said.contains("maxApps in the desired state"), "{said}");
     }
 
     #[test]

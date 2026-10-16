@@ -7,6 +7,10 @@ const RESERVATION_SIZE: u32 = 65_536;
 pub(crate) struct Identities {
     pub(crate) uid_base: u32,
     pub(crate) gid_base: u32,
+    /// How many slots the narrower of the two reservations covers. A desired document's `maxApps`
+    /// can widen the slot ring past the `max_apps` this was checked against at startup, and a slot
+    /// past the reservation would borrow an identity reserved for someone else.
+    pub(crate) slots: u32,
 }
 
 struct Reservation {
@@ -53,7 +57,12 @@ fn reservations(text: &str) -> Result<Vec<Reservation>, String> {
         .collect()
 }
 
+#[cfg(test)]
 fn reserved_base(text: &str, accounts: &str, uid: u32, max_apps: u32) -> Result<u32, String> {
+    reserved_range(text, accounts, uid, max_apps).map(|(start, _)| start)
+}
+
+fn reserved_range(text: &str, accounts: &str, uid: u32, max_apps: u32) -> Result<(u32, u32), String> {
     let ranges = reservations(text)?;
     let numeric_owner = uid.to_string();
     let mut own = ranges
@@ -93,7 +102,7 @@ fn reserved_base(text: &str, accounts: &str, uid: u32, max_apps: u32) -> Result<
             ));
         }
     }
-    Ok(selected.start)
+    Ok((selected.start, selected.end - selected.start))
 }
 
 fn account_uid(passwd: &str, shadow: &str) -> Result<u32, String> {
@@ -129,11 +138,14 @@ fn read_identities(max_apps: u32) -> Result<Identities, String> {
     let base = |file: &str, database: &str| {
         let text = std::fs::read_to_string(file)
             .map_err(|error| format!("{file} could not be read: {error}; run nibrunnerd install"))?;
-        reserved_base(&text, &ask(&[database])?, uid, max_apps).map_err(|error| format!("{file}: {error}"))
+        reserved_range(&text, &ask(&[database])?, uid, max_apps).map_err(|error| format!("{file}: {error}"))
     };
+    let (uid_base, uid_slots) = base("/etc/subuid", "passwd")?;
+    let (gid_base, gid_slots) = base("/etc/subgid", "group")?;
     Ok(Identities {
-        uid_base: base("/etc/subuid", "passwd")?,
-        gid_base: base("/etc/subgid", "group")?,
+        uid_base,
+        gid_base,
+        slots: uid_slots.min(gid_slots),
     })
 }
 
@@ -189,6 +201,12 @@ mod tests {
         assert_eq!(reserved_base(text, accounts, 999, 1000).unwrap(), 165536);
         assert_eq!(reserved_base(text, accounts, 999, 65536).unwrap(), 165536);
         assert!(reserved_base(text, accounts, 999, 65537).is_err());
+    }
+
+    #[test]
+    fn the_reservation_says_how_many_slots_it_covers() {
+        let text = "container:100000:65536\nnibrunner-jailer:165536:4096\n";
+        assert_eq!(reserved_range(text, "", 999, 1000).unwrap(), (165536, 4096));
     }
 
     #[test]
