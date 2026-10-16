@@ -260,6 +260,7 @@ impl RunningHost {
                 scratch: None,
                 desired_state: DesiredInstanceState::Running,
                 idle_timeout_ms: None,
+                expiry: None,
                 activation: None,
                 layers: vec![DesiredLayer::Executable {
                     object: StoredObject {
