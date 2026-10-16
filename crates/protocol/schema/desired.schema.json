@@ -424,6 +424,65 @@
             "objectKey",
             "destinationPath"
           ]
+        },
+        {
+          "description": "One program the host fetches for itself from `url`, so that nothing has to be put in the\nstore first. `digest` is the program's: of the response, or of `zipEntry` inside it when the\nURL serves a zip, or of `tarEntry` inside it when the URL serves a `.tar.xz`. Nothing is\nmade from the bytes before they match it. At most one of the two entries is named.",
+          "type": "object",
+          "properties": {
+            "destinationPath": {
+              "$ref": "#/$defs/ExecutablePath"
+            },
+            "digest": {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            "kind": {
+              "type": "string",
+              "const": "downloaded-executable"
+            },
+            "tarEntry": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TarEntry"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "url": {
+              "$ref": "#/$defs/DownloadUrl"
+            },
+            "zipEntry": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ZipEntry"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "not": {
+            "properties": {
+              "tarEntry": {
+                "type": "string"
+              },
+              "zipEntry": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "zipEntry",
+              "tarEntry"
+            ]
+          },
+          "required": [
+            "kind",
+            "url",
+            "digest",
+            "destinationPath"
+          ]
         }
       ]
     },
@@ -469,6 +528,12 @@
         "sizeBytes",
         "desiredState"
       ]
+    },
+    "DownloadUrl": {
+      "description": "an https URL of at most 2048 characters",
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^https://[\\x21-\\x7e]+$"
     },
     "ExecutablePath": {
       "description": "an absolute path to a file other than /sbin/init",
@@ -818,6 +883,13 @@
         "objectKey"
       ]
     },
+    "TarEntry": {
+      "description": "a relative path of between 1 and 512 characters",
+      "type": "string",
+      "maxLength": 512,
+      "minLength": 1,
+      "pattern": "^[^/]"
+    },
     "TenantArguments": {
       "description": "The arguments the binary is started with.",
       "type": "array",
@@ -848,6 +920,13 @@
       "description": "an identifier",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$"
+    },
+    "ZipEntry": {
+      "description": "a relative path of between 1 and 512 characters",
+      "type": "string",
+      "maxLength": 512,
+      "minLength": 1,
+      "pattern": "^[^/]"
     }
   }
 }

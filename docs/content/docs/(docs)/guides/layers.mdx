@@ -22,6 +22,7 @@ A layer names content by its digest, either in the artifact store or in a public
 | `executable` | One program. The host packs it into an image at `destinationPath`. |
 | `filesystem` | A squashfs or ext4 image. Attached as uploaded. |
 | `oci` | A Linux amd64 image from an artifact-store archive or public registry. |
+| `downloaded-executable` | One program the host fetches itself from an `https` URL. Nothing goes in the store. |
 
 ```json
 "layers": [
@@ -30,7 +31,38 @@ A layer names content by its digest, either in the artifact store or in a public
 ]
 ```
 
-Downloaded layers are cached by digest. Apps on the same host share cached layers.
+A `downloaded-executable` names a `url` instead of an `objectKey`. Its `digest` is the program's:
+of the response body; or, when the URL serves a zip and `zipEntry` names a file in it, of that file;
+or, when the URL serves a `.tar.xz` and `tarEntry` names a file in it, of that file. Name at most
+one of the two. The host packs the program only once the bytes match, so a URL that changes is
+refused, not run.
+
+```json
+{
+  "kind": "downloaded-executable",
+  "destinationPath": "/opt/tool/tool",
+  "url": "https://example.com/tool-linux-x64.zip",
+  "zipEntry": "tool",
+  "digest": "<sha256 of the tool file, lowercase hex>"
+}
+```
+
+```json
+{
+  "kind": "downloaded-executable",
+  "destinationPath": "/opt/zig/zig",
+  "url": "https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz",
+  "tarEntry": "zig-x86_64-linux-0.15.1/zig",
+  "digest": "<sha256 of the zig file, lowercase hex>"
+}
+```
+
+A `tarEntry` is matched with or without a leading `./`, and must be a regular file: a directory or a
+symlink of that name is refused. A download larger than 512 MiB is refused. The guest never needs network access for this: the host
+does the fetching.
+
+A layer is downloaded once per host and cached by digest. Ten apps on the same base image share
+one copy.
 
 ## The volume
 

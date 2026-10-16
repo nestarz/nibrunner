@@ -57,6 +57,9 @@ flate2 = "1"
 zstd = "0.13"
 # Stored and deflated entries, through the flate2 already here: what `zip -r` writes.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+# Pure Rust, so the host binary stays one static musl link; the decoder alone, because a host only
+# ever reads a `.tar.xz` someone else wrote.
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
