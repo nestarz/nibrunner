@@ -63,6 +63,10 @@ shows every section filled in.
 `/etc/nibrunner/host.env`. `install` creates that file with every variable named and empty.
 `nibrunnerd start` refuses to run while a variable the configuration needs is still empty.
 
+An S3-compatible store that is not AWS is named by the optional `AWS_ENDPOINT`,
+`AWS_ALLOW_HTTP` (`false` unless set) and `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` in the same file.
+The artifact store, the export store and ZeroFS all read them.
+
 ## Ports
 
 Each app slot reserves eight consecutive ports starting at 21000. Every listener in `config.toml`
