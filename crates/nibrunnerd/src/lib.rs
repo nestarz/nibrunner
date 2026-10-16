@@ -12,6 +12,7 @@ pub mod domain;
 pub mod host;
 pub mod install;
 pub mod json_store;
+pub mod memory_service;
 pub mod ports;
 pub mod reload;
 pub mod repositories;

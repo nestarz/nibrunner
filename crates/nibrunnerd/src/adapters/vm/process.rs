@@ -384,6 +384,17 @@ impl VmProcesses {
     }
 }
 
+/// When a process started, in clock ticks since boot: with its pid, what tells it from a later
+/// process given the same pid.
+pub(crate) fn process_start_ticks(pid: i32) -> Option<u64> {
+    start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn start_ticks(stat: &str) -> Option<u64> {
+    // The command name is parenthesised and may hold spaces; the fields after it are fixed.
+    stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
 fn process_uid(pid: i32) -> Option<u32> {
     std::fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()?

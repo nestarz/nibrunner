@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into memory_leases (lease_id, boot_id, unit, memory_mib, minimum_mib, preferred_mib,\n                     owner_pid, owner_start_ticks, owner_cgroup, owner_group_membership, owner_group_device,\n                     owner_group_inode, budget_group_membership, budget_group_device, budget_group_inode)\n                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 15
+    },
+    "nullable": []
+  },
+  "hash": "1659ab908d8c82bff4cfb4bf89be4d5003b5f47e0c9127c2cb481f0e949a38fe"
+}

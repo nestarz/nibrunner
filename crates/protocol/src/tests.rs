@@ -1238,3 +1238,38 @@ fn instance_limits_refuse_zero_unknown_and_removed_fields() {
         );
     }
 }
+
+#[test]
+fn memory_frames_are_tagged_and_refuse_what_they_do_not_name() {
+    use crate::memory::{Reply, Request};
+    let acquire: Request = serde_json::from_value(serde_json::json!({
+        "operation": "acquire",
+        "id": "03ae9139-c7fc-4ad4-a94b-6e3c81d3b406",
+        "unit": "build-1.service",
+        "memory_mib": 2048,
+        "minimum_mib": 512
+    }))
+    .unwrap();
+    assert!(matches!(
+        acquire,
+        Request::Acquire {
+            minimum_mib: Some(_),
+            ..
+        }
+    ));
+    assert!(serde_json::from_value::<Request>(serde_json::json!({
+        "operation": "acquire", "id": "x", "unit": "u.service", "memory_mib": 0
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<Request>(serde_json::json!({
+        "operation": "release", "id": "x", "extra": 1
+    }))
+    .is_err());
+    assert_eq!(
+        serde_json::to_value(Reply::Granted {
+            memory_mib: 1536.try_into().unwrap()
+        })
+        .unwrap(),
+        serde_json::json!({"status": "granted", "memory_mib": 1536})
+    );
+}
