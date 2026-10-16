@@ -17,6 +17,8 @@ pub struct HostSnapshot {
     pub records: BTreeMap<AppId, InstanceRecord>,
     pub(crate) memory_profiles: crate::domain::memory_admission::MemoryProfiles,
     pub(crate) memory_pressure: crate::domain::reconcile::pressure::PressureState,
+    // When each app was last asked to freeze, so a refusal is not retried every pass.
+    pub(crate) freeze_attempted_at_ms: BTreeMap<AppId, i64>,
     // Only ever this daemon's own account of what it set out on: a restart starts each over,
     // and so is measured as one.
     pub deploys: BTreeMap<AppId, Deploy>,

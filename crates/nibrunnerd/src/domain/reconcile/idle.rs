@@ -358,6 +358,7 @@ fn waited_out(snapshot: &HostSnapshot, app_id: &AppId, now: i64) -> bool {
 /// the same apps against the same full disk.
 pub async fn apply_sleep(host: &std::sync::Arc<Host>) -> usize {
     super::pressure::apply(host).await;
+    super::frozen::apply(host).await;
     let policies: BTreeMap<AppId, ActivationPolicy> = {
         let cache = host.cache.lock().await;
         cache

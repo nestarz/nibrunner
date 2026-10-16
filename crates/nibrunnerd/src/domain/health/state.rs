@@ -230,6 +230,7 @@ mod tests {
 
     fn active() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: true,
             failed: false,
@@ -240,6 +241,7 @@ mod tests {
 
     fn exited() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: false,
@@ -250,6 +252,7 @@ mod tests {
 
     fn crashed() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: true,

@@ -23,6 +23,9 @@ use guest_contract::firecracker::{render_firecracker_config, VmNetwork, VmPaths,
 use guest_contract::instance_env::{render_instance_env, InstanceEnvContent};
 
 pub const FIRECRACKER_CONFIG_FILENAME: &str = "firecracker.json";
+/// What the kernel is asked to reclaim from a VMM just paused: its idle file cache, and with a
+/// swap allowance the guest pages it can spare.
+const FROZEN_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
 pub const GUEST_KERNEL_FILENAME: &str = "vmlinux";
 pub const GUEST_ROOTFS_FILENAME: &str = "rootfs.ext4";
 pub const GUEST_MANIFEST_FILENAME: &str = "manifest.json";
@@ -529,7 +532,60 @@ impl Vmm for VmManager {
         Ok(())
     }
 
+    async fn freeze(&self, app_id: &AppId) -> Result<(), VmError> {
+        if !self
+            .processes
+            .read_record(app_id)
+            .is_some_and(|record| record.jail_root.is_some())
+            || !self.processes.status(app_id).active
+        {
+            return Err(VmError::Host(
+                "only a running jailed microVM can be frozen".into(),
+            ));
+        }
+        let control = self
+            .working_dir_for(app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        // Recorded first, so a daemon that dies half way readopts a guest it must not route to.
+        self.processes
+            .remember_frozen(app_id, true)
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        let paused = async {
+            time_sync::freeze_tenant(&control).await?;
+            self.api(app_id).pause().await
+        }
+        .await;
+        if let Err(error) = paused {
+            self.resume_frozen_tenant(app_id, &control).await;
+            let _ = self.processes.remember_frozen(app_id, false);
+            return Err(error);
+        }
+        if let Some(cgroup) = self.processes.cgroup(app_id) {
+            if let Err(error) = super::limits::reclaim(&cgroup, FROZEN_RECLAIM_BYTES).await {
+                tracing::debug!(%app_id, %error, "a frozen microVM's memory reclaim was incomplete");
+            }
+        }
+        Ok(())
+    }
+
+    async fn thaw(&self, app_id: &AppId) -> Result<(), VmError> {
+        let control = self
+            .working_dir_for(app_id)
+            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+        self.api(app_id).resume().await?;
+        if let Err(error) = time_sync::wake(&control).await {
+            let _ = self.api(app_id).pause().await;
+            return Err(error);
+        }
+        self.processes
+            .remember_frozen(app_id, false)
+            .map_err(|error| VmError::Host(error.to_string()))
+    }
+
     async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError> {
+        if self.processes.status(&request.app_id).frozen {
+            self.thaw(&request.app_id).await?;
+        }
         // Held to the end, whichever way the snapshot goes: only once it is on the disk does
         // the next measurement count it, and only once it has failed is the room free again.
         let _share_of_the_disk = self
@@ -1697,6 +1753,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         let legacy_directory = fixture.manager.vm_dir.join(app_id().as_str());
@@ -1736,6 +1793,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: Some(root.clone()),
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         fixture.manager.readopt(&app_id()).await.unwrap();
@@ -1972,6 +2030,7 @@ mod tests {
                 stop_requested: true,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         let refused = fixture.manager.wake(request).await.unwrap_err();

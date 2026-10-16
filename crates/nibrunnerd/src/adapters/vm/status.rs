@@ -26,6 +26,8 @@ pub struct VmStatus {
     pub failed: bool,
     pub started_this_boot: bool,
     pub exit: Option<VmExit>,
+    /// Paused by the host to save the cost of running it, its memory kept.
+    pub frozen: bool,
 }
 
 pub const UNKNOWN_VM: VmStatus = VmStatus {
@@ -34,6 +36,7 @@ pub const UNKNOWN_VM: VmStatus = VmStatus {
     failed: false,
     started_this_boot: false,
     exit: None,
+    frozen: false,
 };
 
 #[cfg(test)]
@@ -73,6 +76,7 @@ mod tests {
                 ..UNKNOWN_VM
             },
             VmStatus {
+                frozen: false,
                 loaded: true,
                 active: false,
                 failed: false,

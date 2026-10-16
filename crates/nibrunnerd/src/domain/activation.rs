@@ -2,9 +2,9 @@ use protocol::{ActivationPolicy, InstanceState, SleepPolicy};
 
 use crate::domain::report::InstanceRecord;
 
-/// The only state with a running microVM to put down. Everything else is either on its way
-/// somewhere already or has nothing to suspend.
-const SLEEPABLE_STATES: [InstanceState; 1] = [InstanceState::Running];
+/// The states with a microVM to put down: running, or frozen and still due its snapshot. Everything
+/// else is either on its way somewhere already or has nothing to suspend.
+const SLEEPABLE_STATES: [InstanceState; 2] = [InstanceState::Running, InstanceState::Frozen];
 
 /// How long past its lifetime an app with a request still open is left to finish answering it.
 /// Bounded, because a policy that recycles an app on a clock must not be held off it for ever by
@@ -71,8 +71,9 @@ pub fn should_sleep(
         SleepPolicy::Never => None,
         SleepPolicy::TrafficIdle { timeout_ms } => {
             // A stretch nobody read the counters over is not a stretch of quiet: an app taking
-            // hundreds of requests a second reads exactly like one taking none.
-            if answering || !signals.measured_lately(now_ms) {
+            // hundreds of requests a second reads exactly like one taking none. A frozen app
+            // takes none: any request would have thawed it first.
+            if answering || (record.state != InstanceState::Frozen && !signals.measured_lately(now_ms)) {
                 return None;
             }
             let quiet_since = signals.last_active_at_ms?;
@@ -317,7 +318,8 @@ mod tests {
     fn only_a_running_on_request_app_this_host_still_wants_up_is_ever_let_go() {
         let long_ago = quiet_since(0);
         for state in INSTANCE_STATES {
-            let expected = (state == InstanceState::Running).then_some(SleepReason::Quiet);
+            let expected =
+                matches!(state, InstanceState::Running | InstanceState::Frozen).then_some(SleepReason::Quiet);
             assert_eq!(
                 should_sleep(&traffic_idle(), &serving(state), &long_ago, NOW_MS),
                 expected,

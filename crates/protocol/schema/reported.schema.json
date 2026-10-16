@@ -204,16 +204,25 @@
       ]
     },
     "InstanceState": {
-      "type": "string",
-      "enum": [
-        "pending",
-        "starting",
-        "running",
-        "unhealthy",
-        "stopping",
-        "stopped",
-        "idle",
-        "failed"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "pending",
+            "starting",
+            "running",
+            "unhealthy",
+            "stopping",
+            "stopped",
+            "idle",
+            "failed"
+          ]
+        },
+        {
+          "description": "Paused in place, its memory kept: a quiet app the host stopped scheduling before its sleep\ndeadline. A request resumes it without a restore.",
+          "type": "string",
+          "const": "frozen"
+        }
       ]
     },
     "Ipv4Address": {

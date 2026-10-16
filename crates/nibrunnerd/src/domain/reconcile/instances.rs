@@ -567,6 +567,32 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     }
 }
 
+/// Resumes a frozen microVM in place: no restore, its memory was never written out. It is
+/// `starting` again until its health check says otherwise, as a restored one is.
+async fn thaw_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
+    host.state.mark_active(&desired.app_id, now_ms()).await;
+    if let Err(error) = host.vms.thaw(&desired.app_id).await {
+        // Left frozen: its memory is intact, and the next request or pass tries again rather than
+        // booting a second guest over it.
+        let reason = error.message();
+        tracing::warn!(app_id = %desired.app_id, reason, "a frozen microVM would not thaw");
+        return Err(WakeRefusal::Failed {
+            kind: WakeFailure::WouldNotStart,
+            reason,
+        });
+    }
+    host.state
+        .update_record(&desired.app_id, |record| {
+            record.state = InstanceState::Starting;
+            record.stop_requested = false;
+            record.message = None;
+        })
+        .await;
+    host.state.probe_at_once(&desired.app_id).await;
+    crate::domain::reconcile::network::apply_network(host).await;
+    Ok(WakeOutcome::Thawed)
+}
+
 pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
     let would_not_start = |reason: String| WakeRefusal::Failed {
         kind: WakeFailure::WouldNotStart,
@@ -576,8 +602,17 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         return Err(would_not_start("this host has no slot left".to_string()));
     };
 
-    let status = host.vms.statuses(std::slice::from_ref(&desired.app_id)).await;
-    if status.get(&desired.app_id).copied().unwrap_or(UNKNOWN_VM).active {
+    let status = host
+        .vms
+        .statuses(std::slice::from_ref(&desired.app_id))
+        .await
+        .get(&desired.app_id)
+        .copied()
+        .unwrap_or(UNKNOWN_VM);
+    if status.frozen {
+        return thaw_instance(host, desired).await;
+    }
+    if status.active {
         return Ok(WakeOutcome::AlreadyRunning);
     }
 
@@ -716,6 +751,10 @@ async fn settle(
     snapshotting: bool,
     now_ms: i64,
 ) {
+    // A frozen guest answers nothing until it is thawed; what it was is what it still is.
+    if status.frozen {
+        return;
+    }
     let health = if status.active && due {
         let probed = std::time::Instant::now();
         let outcome = if !asks_the_port(&record.health, &record.health_check) {
@@ -1038,6 +1077,7 @@ mod tests {
         host.vms.boot_error(Some(VmError::StartBusy));
         for exit in [VmExit::Code(0), VmExit::Code(1), VmExit::Signal(9)] {
             host.vms.set_status(VmStatus {
+                frozen: false,
                 loaded: true,
                 active: false,
                 failed: exit != VmExit::Code(0),
@@ -1687,6 +1727,7 @@ mod tests {
     async fn a_microvm_that_went_away_leaves_the_code_it_exited_with_on_the_record() {
         let host = test_host().await;
         host.vms.set_status(VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: false,
@@ -1720,6 +1761,7 @@ mod tests {
     async fn a_microvm_killed_from_outside_says_which_signal_and_leaves_no_code_behind() {
         let host = test_host().await;
         host.vms.set_status(VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: true,
@@ -1751,6 +1793,7 @@ mod tests {
         let exited_after = |uptime_ms: i64| async move {
             let host = test_host().await;
             host.vms.set_status(VmStatus {
+                frozen: false,
                 loaded: true,
                 active: false,
                 failed: false,
@@ -1854,6 +1897,7 @@ mod tests {
 
     fn up() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: true,
             failed: false,

@@ -97,6 +97,30 @@ async fn write(host: &Host, desired: &DesiredExport) -> ReportedExport {
     }
 }
 
+/// A paused guest cannot settle its filesystem for the cut, so a frozen app is resumed first; the
+/// next pass may freeze it again once it is quiet.
+async fn thaw_for_export(host: &Host, app_id: &protocol::AppId) -> Result<(), String> {
+    let frozen = host
+        .vms
+        .statuses(std::slice::from_ref(app_id))
+        .await
+        .get(app_id)
+        .is_some_and(|status| status.frozen);
+    if !frozen {
+        return Ok(());
+    }
+    host.vms.thaw(app_id).await.map_err(|error| error.message())?;
+    host.state
+        .update_record(app_id, |record| {
+            if record.state == protocol::InstanceState::Frozen {
+                record.state = protocol::InstanceState::Starting;
+            }
+        })
+        .await;
+    host.state.probe_at_once(app_id).await;
+    Ok(())
+}
+
 async fn write_inner(
     host: &Host,
     desired: &DesiredExport,
@@ -105,6 +129,7 @@ async fn write_inner(
 ) -> Result<u64, String> {
     let crontab = registered_crontab(host, &desired.app_id).await?;
     let vsock_path = crate::domain::filesystem::reader::guest_vsock_path(host, &desired.app_id);
+    thaw_for_export(host, &desired.app_id).await?;
     let lease = frozen(&desired.app_id, &vsock_path)
         .await
         .map_err(|error| error.message())?;
