@@ -287,6 +287,7 @@ impl RunningHost {
                     hostname: Hostname::parse(&hostname).expect("a hostname"),
                     kind: AppHostnameKind::Platform,
                 }],
+                labels: protocol::InstanceLabels::default(),
             },
             app_id,
             volume_id,

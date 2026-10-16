@@ -1,7 +1,7 @@
 use protocol::{
-    AppHostname, AppId, DeploymentId, GuestPort, HealthCheck, HostPort, HttpPort, InstanceResources,
-    InstanceState, Ipv4Address, PortName, ReportedRestart, RestartPolicy, Sha256Digest, StateMessage,
-    Timestamp, VolumeId, DEFAULT_RESTART_POLICY,
+    AppHostname, AppId, DeploymentId, GuestPort, HealthCheck, HostPort, HttpPort, InstanceLabels,
+    InstanceResources, InstanceState, Ipv4Address, PortName, ReportedRestart, RestartPolicy, Sha256Digest,
+    StateMessage, Timestamp, VolumeId, DEFAULT_RESTART_POLICY,
 };
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +80,8 @@ pub struct InstanceRecord {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+    #[serde(default, skip_serializing_if = "InstanceLabels::is_empty")]
+    pub labels: InstanceLabels,
     /// The app whose new deployment this record boots beside the one still serving. Such a record
     /// is never routed and never reported: it is that app's, to take over its hostnames once it is
     /// healthy or to be stopped if it never is.
@@ -130,6 +132,7 @@ pub struct RecordFields {
     pub desired_running: bool,
     pub on_request: bool,
     pub expiry: Option<protocol::ExpiryPolicy>,
+    pub labels: InstanceLabels,
 }
 
 impl InstanceRecord {
@@ -168,6 +171,7 @@ impl InstanceRecord {
             cutover: None,
             cutover_note: None,
             cutover_outcome: None,
+            labels: fields.labels,
         }
     }
 
@@ -190,6 +194,7 @@ impl InstanceRecord {
         self.restart_policy = fields.restart_policy;
         self.desired_running = fields.desired_running;
         self.on_request = fields.on_request;
+        self.labels = fields.labels;
     }
 
     pub fn apply_expiry(
