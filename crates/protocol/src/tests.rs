@@ -771,6 +771,36 @@ fn only_an_on_request_instance_may_name_a_sleep_policy_that_fires() {
 }
 
 #[test]
+fn a_document_that_gives_one_hostname_to_two_instances_is_refused_whole() {
+    let named = |app: &str| {
+        let mut instance = instance_json();
+        instance["appId"] = serde_json::json!(app);
+        instance["hostnames"] = serde_json::json!([{ "hostname": "shop.example.com", "kind": "custom" }]);
+        instance
+    };
+    let document = |instances: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "hostId": "host-1",
+            "revision": "r1",
+            "volumes": [],
+            "instances": instances,
+            "checkpoints": [],
+            "exports": []
+        })
+    };
+    let refused = serde_json::from_value::<HostDesiredState>(document(vec![named("app-1"), named("app-2")]))
+        .expect_err("a hostname routes to one app");
+    let refused = refused.to_string();
+    assert!(refused.contains("shop.example.com"), "{refused}");
+    assert!(
+        refused.contains("app-1") && refused.contains("app-2"),
+        "{refused}"
+    );
+
+    serde_json::from_value::<HostDesiredState>(document(vec![named("app-1")])).expect("one owner is fine");
+}
+
+#[test]
 fn a_policy_this_host_does_not_offer_is_refused_by_name_rather_than_ignored() {
     assert!(read(instance_with(|document| {
         document["activation"] = serde_json::json!({ "sleepWhen": { "kind": "no-sessions" } });
