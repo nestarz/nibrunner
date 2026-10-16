@@ -15,6 +15,10 @@
 max_apps = 1000
 max_concurrent_vm_starts = 2
 
+[memory_admission]
+mode = "observe"
+headroom_mib = 1024
+
 [cron]
 max_jobs_per_app = 10
 time_zone = "UTC"

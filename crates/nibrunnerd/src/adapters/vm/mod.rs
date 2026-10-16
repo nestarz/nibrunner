@@ -3,6 +3,7 @@ pub(crate) mod jailer_inputs;
 pub mod layers;
 pub(crate) mod limits;
 pub mod manager;
+mod memory;
 pub mod process;
 pub mod snapshot;
 mod startup;

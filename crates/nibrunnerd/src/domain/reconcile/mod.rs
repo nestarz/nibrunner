@@ -161,9 +161,10 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
     let (mut waiting, mut waiting_mib) = (0, 0u64);
     for desired in starts {
         let wanted = &desired.config.resources;
-        if let Some(shortfall_mib) =
-            memory_shortfall_for(host.guest_memory_mib, &records, &desired.app_id, wanted)
-        {
+        let shortfall = memory_shortfall_for(host.guest_memory_mib, &records, &desired.app_id, wanted);
+        host.observe_memory_admission(&desired.app_id, wanted, &records, shortfall.unwrap_or(0))
+            .await;
+        if let Some(shortfall_mib) = shortfall {
             instances::wait_for_room(host, desired, shortfall_mib).await;
             waiting += 1;
             waiting_mib += u64::from(wanted.memory_mib);

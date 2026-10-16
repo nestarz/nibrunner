@@ -394,6 +394,16 @@
             "$ref": "#/$defs/Sha256Digest"
           }
         },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportedMemory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "message": {
           "anyOf": [
             {
@@ -429,6 +439,135 @@
         "deploymentId",
         "state",
         "restartCount"
+      ]
+    },
+    "ReportedMemory": {
+      "type": "object",
+      "properties": {
+        "anonymousSetBytes": {
+          "description": "Resident anonymous mappings, excluding file cache and swapped pages.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cgroup": {
+          "description": "The cgroup measured, relative to the unified hierarchy's root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currentBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "highEvents": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportedMemoryLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "measuredAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "oomKills": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "peakBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pressureFullUs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pressureSomeUs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "proportionalSetBytes": {
+          "description": "Resident mappings, with shared pages divided among their users. Snapshot pages may be\ncharged to the process that wrote them rather than this VM's cgroup.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "swapBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "measuredAt",
+        "currentBytes",
+        "swapBytes",
+        "highEvents",
+        "oomKills",
+        "pressureSomeUs",
+        "pressureFullUs"
+      ]
+    },
+    "ReportedMemoryLimits": {
+      "description": "The cgroup's own memory controls, as the kernel enforces them when the sample was taken.",
+      "type": "object",
+      "properties": {
+        "highBytes": {
+          "description": "Null means the kernel imposes no limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lowBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "maxBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "swapMaxBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "lowBytes"
       ]
     },
     "ReportedRestart": {

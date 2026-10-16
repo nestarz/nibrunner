@@ -181,6 +181,7 @@ mod tests {
                     packets: 1,
                     bytes: sent,
                 },
+                activity: Counted::default(),
             },
         )])
     }

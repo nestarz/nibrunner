@@ -5,6 +5,7 @@ pub mod exports;
 pub mod filesystem;
 pub mod guest_line;
 pub mod health;
+pub mod memory_admission;
 pub mod meters;
 pub mod metrics;
 pub mod reconcile;

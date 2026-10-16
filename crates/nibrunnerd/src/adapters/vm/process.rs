@@ -185,6 +185,22 @@ impl VmProcesses {
         }
     }
 
+    pub fn memory(&self, app_id: &AppId) -> Option<protocol::ReportedMemory> {
+        let record = self.read_record(app_id)?;
+        if record.host_boot_id != self.boot_id || record.exit().is_some() || !is_alive(record.pid) {
+            return None;
+        }
+        // A pid can be reused once its VMM is gone; a jailed VMM still runs as its jail's uid.
+        if record.jail_uid.is_some() && process_uid(record.pid) != record.jail_uid {
+            return None;
+        }
+        let cgroup = record
+            .jail_root
+            .is_some()
+            .then(|| super::limits::cgroup_path(app_id));
+        super::memory::read_process(record.pid, cgroup)
+    }
+
     pub(crate) async fn spawn(
         &self,
         app_id: &AppId,
@@ -341,6 +357,17 @@ impl VmProcesses {
         }
         signal(record.pid, libc::SIGKILL);
     }
+}
+
+fn process_uid(pid: i32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn is_alive(pid: i32) -> bool {
