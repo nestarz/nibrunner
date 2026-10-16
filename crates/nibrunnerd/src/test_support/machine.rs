@@ -258,6 +258,7 @@ impl RunningHost {
                 volume_id: volume_id.clone(),
                 desired_state: DesiredInstanceState::Running,
                 idle_timeout_ms: None,
+                expiry: None,
                 activation: None,
                 layers: vec![DesiredLayer::Executable {
                     object: StoredObject {
