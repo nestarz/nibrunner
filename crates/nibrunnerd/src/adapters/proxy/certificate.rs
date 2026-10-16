@@ -208,7 +208,7 @@ mod tests {
         let (first, second) = (pair(), pair());
         let both = |p: &Pair, seq: u32| {
             format!(
-                "# mf force_cert_seq={seq}\n{}\n{}",
+                "# force_cert_seq={seq}\n{}\n{}",
                 p.certificate.trim_end(),
                 p.key
             )
