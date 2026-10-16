@@ -99,7 +99,7 @@ slice = "workloads.slice"
 memory_mib = 4096
 ```
 
-The orchestrator creates the root-level slice and bounds it; its `memory.max` must be positive and
+The operator creates the root-level slice and bounds it; its `memory.max` must be positive and
 no larger than `memory_mib`, or the daemon does not start. Every VMM's cgroup is then placed under
 `<slice>/nibrunner-jailer`, and admission also respects what is left of the slice below its
 `memory.high` (clean inactive file cache counted as free). Until every VM that holds memory has

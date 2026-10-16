@@ -114,7 +114,7 @@ pub enum MemoryAdmissionMode {
 #[schemars(rename = "memory_admission")]
 pub struct MemoryAdmission {
     pub mode: MemoryAdmissionMode,
-    /// A root-level systemd slice the orchestrator has already bounded. Every VMM's cgroup is
+    /// A root-level systemd slice the operator has already bounded. Every VMM's cgroup is
     /// placed under it, and admission respects what is left of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<WorkloadPool>,

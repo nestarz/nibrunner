@@ -193,7 +193,7 @@
           "$ref": "#/$defs/MemoryAdmissionMode"
         },
         "pool": {
-          "description": "A root-level systemd slice the orchestrator has already bounded. Every VMM's cgroup is\nplaced under it, and admission respects what is left of it.",
+          "description": "A root-level systemd slice the operator has already bounded. Every VMM's cgroup is\nplaced under it, and admission respects what is left of it.",
           "$ref": "#/$defs/memory_admission.pool"
         },
         "reclaim": {
