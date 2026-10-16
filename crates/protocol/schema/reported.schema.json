@@ -220,6 +220,11 @@
           ]
         },
         {
+          "description": "Paused in place, its memory kept: a quiet app the host stopped scheduling before its sleep\ndeadline. A request resumes it without a restore.",
+          "type": "string",
+          "const": "frozen"
+        },
+        {
           "description": "A program run once (`maxRestarts: 0`) that ended on its own, whatever its exit status:\n`lastExitCode` carries that status, and the instance is not started again until it is\ndeployed afresh. `failed` stays for a guest that never ran it, or went down without saying\nhow it ended.",
           "type": "string",
           "const": "exited"

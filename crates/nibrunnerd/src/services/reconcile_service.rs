@@ -52,6 +52,7 @@ mod tests {
     }
     fn stopped_vm() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: false,

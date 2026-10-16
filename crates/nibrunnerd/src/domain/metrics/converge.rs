@@ -768,6 +768,7 @@ mod tests {
         assert!(after_pass.booted_at_ms >= after_pass.volume_ready_at_ms);
 
         host.vms.set_status(VmStatus {
+            frozen: false,
             loaded: true,
             active: true,
             failed: false,

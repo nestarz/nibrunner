@@ -1,6 +1,7 @@
 pub mod checkpoints;
 pub(crate) mod expiry;
 pub mod exports;
+pub(crate) mod frozen;
 pub mod idle;
 pub mod ingress;
 pub mod instances;
@@ -65,8 +66,9 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
     }
 }
 
-async fn sync_desired(host: &Host, desired: &HostDesiredState) {
+async fn sync_desired(host: &Arc<Host>, desired: &HostDesiredState) {
     for wanted in &desired.instances {
+        thaw_what_must_run(host, wanted).await;
         let _transition = host.state.transition(&wanted.app_id).await;
         host.state
             .update_record(&wanted.app_id, |record| {
@@ -84,6 +86,44 @@ async fn sync_desired(host: &Host, desired: &HostDesiredState) {
                 record.http_port = wanted.config.http_port;
             })
             .await;
+    }
+}
+
+/// A frozen guest whose document now says it must keep running (or no longer sleeps on traffic)
+/// is thawed rather than left paused until a request happens to come.
+async fn thaw_what_must_run(host: &Arc<Host>, wanted: &protocol::DesiredInstance) {
+    let must_run = wanted.desired_state == DesiredInstanceState::Running
+        || (wanted.desired_state == DesiredInstanceState::OnRequest
+            && !matches!(
+                wanted.activation().sleep_when,
+                protocol::SleepPolicy::TrafficIdle { .. }
+            ));
+    if !must_run {
+        return;
+    }
+    let _transition = host.state.transition(&wanted.app_id).await;
+    let frozen = host
+        .vms
+        .statuses(std::slice::from_ref(&wanted.app_id))
+        .await
+        .get(&wanted.app_id)
+        .is_some_and(|status| status.frozen);
+    if !frozen {
+        return;
+    }
+    let Ok(_reservation) = host
+        .reserve_memory(
+            &wanted.app_id,
+            wanted.config.resources,
+            pressure::ReclaimPurpose::Wake,
+        )
+        .await
+    else {
+        tracing::warn!(app_id = %wanted.app_id, "thaw waits for host memory");
+        return;
+    };
+    if let Err(error) = instances::resume_instance(host, wanted).await {
+        tracing::warn!(app_id = %wanted.app_id, ?error, "a frozen app that must keep running could not thaw");
     }
 }
 
@@ -336,6 +376,7 @@ mod tests {
 
     fn running_vm() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: true,
             failed: false,
@@ -346,6 +387,7 @@ mod tests {
 
     fn stopped_vm() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: false,
@@ -356,6 +398,7 @@ mod tests {
 
     fn failed_vm() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: true,
@@ -1192,7 +1235,7 @@ mod tests {
             })]
         });
 
-        sync_desired(&host, &desired).await;
+        sync_desired(host.arc(), &desired).await;
 
         let record = host.state.record(&app_id()).await.unwrap();
         assert!(record.on_request);
@@ -1210,7 +1253,7 @@ mod tests {
             })]
         });
 
-        sync_desired(&host, &desired).await;
+        sync_desired(host.arc(), &desired).await;
 
         let record = host.state.record(&app_id()).await.unwrap();
         assert!(!record.desired_running);
@@ -1221,7 +1264,7 @@ mod tests {
     #[tokio::test]
     async fn a_document_naming_an_app_this_host_has_no_record_for_writes_nothing_down() {
         let host = test_host().await;
-        sync_desired(&host, &running_app()).await;
+        sync_desired(host.arc(), &running_app()).await;
         assert!(host.state.record(&app_id()).await.is_none());
     }
 
