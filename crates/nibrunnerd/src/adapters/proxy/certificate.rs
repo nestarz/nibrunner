@@ -206,13 +206,8 @@ mod tests {
     fn one_file_holding_a_comment_the_chain_and_the_key_serves_as_both_paths() {
         let directory = tempfile::tempdir().unwrap();
         let (first, second) = (pair(), pair());
-        let both = |p: &Pair, seq: u32| {
-            format!(
-                "# force_cert_seq={seq}\n{}\n{}",
-                p.certificate.trim_end(),
-                p.key
-            )
-        };
+        let both =
+            |p: &Pair, seq: u32| format!("# force_cert_seq={seq}\n{}\n{}", p.certificate.trim_end(), p.key);
         let file = install(directory.path(), "pair.pem", &both(&first, 1));
         let resolver = ReloadingCertificate::open(&file, &file).unwrap();
         let before = leaf(&resolver.current());
