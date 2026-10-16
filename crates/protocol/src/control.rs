@@ -478,6 +478,10 @@ pub struct ReportedInstance {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+    /// The cron jobs this deployment registered, in its crontab's order. Empty for a deployment
+    /// that registered none, or one that is not the deployment the registry holds for the app.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cron: Vec<crate::ReportedCronJob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

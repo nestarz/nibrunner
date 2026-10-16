@@ -1,6 +1,13 @@
+#[cfg(feature = "schema")]
+use std::borrow::Cow;
+
+#[cfg(feature = "schema")]
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-use crate::{AppId, DeploymentId, InvalidValue, SecretString, TenantEnvironment, REDACTED};
+use crate::{
+    AppId, DeploymentId, InvalidValue, SecretString, Sha256Digest, TenantEnvironment, Timestamp, REDACTED,
+};
 
 pub const MAX_CRONTAB_BYTES: usize = 65_536;
 pub const MAX_CRON_ENVIRONMENT_VARIABLES: usize = 256;
@@ -43,6 +50,39 @@ impl From<CronSchedule> for String {
     fn from(value: CronSchedule) -> Self {
         value.0
     }
+}
+
+#[cfg(feature = "schema")]
+impl JsonSchema for CronSchedule {
+    fn schema_name() -> Cow<'static, str> {
+        "CronSchedule".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "a five-field cron expression or an alias such as @daily, as the crontab line gave it",
+            "minLength": 1,
+            "maxLength": MAX_CRON_SCHEDULE_LENGTH,
+        })
+    }
+}
+
+/// A job a deployment registered from inside its guest with `crontab`, as this host schedules it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedCronJob {
+    /// The `cronJobId` every line its runs write to the app's log carries.
+    pub job_id: String,
+    pub schedule: CronSchedule,
+    /// SHA-256 of the command line, in hex: the command itself may carry secrets, and a control
+    /// plane that wrote the crontab can match it without reading it back.
+    pub command_digest: Sha256Digest,
+    /// When the host next runs it, in the host's `[cron] time_zone`. Absent when the schedule has
+    /// no occurrence this host can find.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run: Option<Timestamp>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

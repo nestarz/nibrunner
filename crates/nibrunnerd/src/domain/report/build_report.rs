@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use protocol::{
-    HostCapacity, HostId, HostReportedState, HostState, HostVersions, ReportedCheckpoint, ReportedExport,
-    ReportedInstance, ReportedVolume, Revision, Sha256Digest, StateMessage, Timestamp,
+    AppId, DeploymentId, HostCapacity, HostId, HostReportedState, HostState, HostVersions,
+    ReportedCheckpoint, ReportedCronJob, ReportedExport, ReportedInstance, ReportedVolume, Revision,
+    Sha256Digest, StateMessage, Timestamp,
 };
 
 use crate::domain::report::InstanceRecord;
@@ -19,6 +22,7 @@ pub fn to_reported_instance(record: &InstanceRecord) -> ReportedInstance {
         converged_at: record.converged_at.clone(),
         last_exit_code: record.last_exit_code,
         message: record.message.clone(),
+        cron: Vec::new(),
     }
 }
 
@@ -30,6 +34,8 @@ pub struct ReportInputs<'a> {
     pub allocatable: HostCapacity,
     pub versions: HostVersions,
     pub records: &'a [InstanceRecord],
+    /// What each app's registered cron jobs are, under the deployment that registered them.
+    pub cron: BTreeMap<AppId, (DeploymentId, Vec<ReportedCronJob>)>,
     pub volumes: Vec<ReportedVolume>,
     pub checkpoints: Vec<ReportedCheckpoint>,
     pub exports: Vec<ReportedExport>,
@@ -47,7 +53,19 @@ pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
         allocatable: inputs.allocatable,
         versions: inputs.versions,
         volumes: inputs.volumes,
-        instances: inputs.records.iter().map(to_reported_instance).collect(),
+        instances: inputs
+            .records
+            .iter()
+            .map(|record| ReportedInstance {
+                cron: inputs
+                    .cron
+                    .get(&record.app_id)
+                    .filter(|(deployment_id, _)| *deployment_id == record.deployment_id)
+                    .map(|(_, jobs)| jobs.clone())
+                    .unwrap_or_default(),
+                ..to_reported_instance(record)
+            })
+            .collect(),
         checkpoints: inputs.checkpoints,
         exports: inputs.exports,
         accepted_digest: inputs.accepted_digest,
@@ -67,6 +85,15 @@ mod tests {
         checkpoints: Vec<ReportedCheckpoint>,
         exports: Vec<ReportedExport>,
     ) -> HostReportedState {
+        with_cron(records, checkpoints, exports, BTreeMap::new())
+    }
+
+    fn with_cron(
+        records: &[InstanceRecord],
+        checkpoints: Vec<ReportedCheckpoint>,
+        exports: Vec<ReportedExport>,
+        cron: BTreeMap<AppId, (DeploymentId, Vec<ReportedCronJob>)>,
+    ) -> HostReportedState {
         let capacity = HostCapacity {
             vcpu_count: 4,
             memory_mib: 8192,
@@ -85,6 +112,7 @@ mod tests {
                 firecracker: "v1.16.1".into(),
             },
             records,
+            cron,
             volumes: vec![],
             checkpoints,
             exports,
@@ -92,6 +120,35 @@ mod tests {
             accepted_revision: None,
             message: None,
         })
+    }
+
+    #[test]
+    fn an_instance_reports_the_cron_jobs_its_own_deployment_registered_and_no_other() {
+        let job = ReportedCronJob {
+            job_id: "cron-1".into(),
+            schedule: protocol::CronSchedule::parse("@hourly").unwrap(),
+            command_digest: Sha256Digest::parse("d".repeat(64)).unwrap(),
+            next_run: Some(observed_at()),
+        };
+        let neighbour = AppId::parse("app-2").unwrap();
+        let records = [
+            instance_record(|_| {}),
+            instance_record(|record| record.app_id = neighbour.clone()),
+        ];
+        let cron = BTreeMap::from([
+            (app_id(), (deployment_id(), vec![job.clone()])),
+            (
+                neighbour,
+                (DeploymentId::parse("dep-previous").unwrap(), vec![job.clone()]),
+            ),
+        ]);
+        let report = with_cron(&records, vec![], vec![], cron);
+        assert_eq!(report.instances[0].cron, vec![job]);
+        assert!(report.instances[1].cron.is_empty());
+        assert!(serde_json::to_value(&report.instances[1])
+            .unwrap()
+            .get("cron")
+            .is_none());
     }
 
     #[test]

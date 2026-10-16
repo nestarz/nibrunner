@@ -220,6 +220,7 @@ pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedIn
         converged_at: None,
         last_exit_code: None,
         message: None,
+        cron: Vec::new(),
     };
     edit(&mut value);
     value

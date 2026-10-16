@@ -100,6 +100,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_crontab_the_guest_installed_is_in_the_next_report_without_asking_the_guest() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        host.cron
+            .synchronize(&[(app_id(), deployment_id())])
+            .await
+            .unwrap();
+        host.cron
+            .replace(
+                &app_id(),
+                &deployment_id(),
+                "*/5 * * * * echo tenant-secret\n",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        let report = reporter(&host).build().await;
+        let jobs = &report.instances[0].cron;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].schedule.as_str(), "*/5 * * * *");
+        assert!(jobs[0].next_run.is_some());
+        assert!(!serde_json::to_string(&report).unwrap().contains("tenant-secret"));
+    }
+
+    #[tokio::test]
     async fn a_host_that_has_not_converged_yet_reports_itself_as_registering() {
         let host = test_host().await;
         assert_eq!(reporter(&host).build().await.state, HostState::Registering);

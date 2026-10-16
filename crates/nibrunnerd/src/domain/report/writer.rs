@@ -25,6 +25,14 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
         cache_bytes: space.total_bytes,
     };
     let allocatable = allocatable_capacity(&capacity, &committed_resources(&records), space.available_bytes);
+    let cron = host
+        .cron
+        .reported(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "the report leaves out cron jobs this host could not read");
+            Default::default()
+        });
 
     build_reported_state(ReportInputs {
         host_id: host_id_of(host).await,
@@ -38,6 +46,7 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
         allocatable,
         versions,
         records: &records,
+        cron,
         volumes: snapshot.volume_reports.clone(),
         checkpoints: snapshot.checkpoint_reports.clone(),
         exports: snapshot.export_reports.clone(),

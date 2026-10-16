@@ -73,6 +73,11 @@ app's environment.
 Standard output and standard error go to the app's [logs](/docs/guides/logs-and-metrics).
 Each line includes a job ID and a run ID.
 
+`reported.json` lists each instance's registered jobs as `instances[].cron`, in crontab order:
+`jobId` (the job ID its log lines carry), `schedule`, `commandDigest` (the SHA-256 of the command
+in hex, never the command itself) and `nextRun`. Only the deployment that installed the crontab
+lists it.
+
 Stopping an app cancels running commands and pauses scheduling. Replacing or removing a
 deployment also removes its crontab. The host waits for cancelled runs before stopping the guest.
 New deployments must install their own crontabs.
