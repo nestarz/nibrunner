@@ -40,6 +40,9 @@ stage-release dist:
     install -m 0755 target/x86_64-unknown-linux-musl/release/nibrunnerd "{{dist}}/nibrunnerd-linux-x64"
     install -m 0755 docs/dist/app "{{dist}}/nibrunner-docs-linux-x64"
     install -m 0644 guest/vmlinux guest/rootfs.ext4 guest/manifest.json "{{dist}}"
+    # The schemas a control plane validates its config, desired and reported documents against,
+    # taken from this tag. Not in checksums.txt, which lists only what a host installs.
+    install -m 0644 deploy/config.schema.json crates/protocol/schema/desired.schema.json crates/protocol/schema/reported.schema.json "{{dist}}"
     # Written from inside the directory, so it names what `sha256sum -c` will be run next to. The
     # docs site is not in it: the installer fetches only what a host runs, and `sha256sum -c` fails
     # on a listed file that is not there.
