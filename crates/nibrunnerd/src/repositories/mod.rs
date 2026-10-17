@@ -5,6 +5,7 @@ pub mod deleted_volumes_repository;
 pub mod host_identity_repository;
 pub mod instances_repository;
 mod last_written;
+pub mod memory_profiles_repository;
 pub mod meters_repository;
 pub mod slots_repository;
 
@@ -17,6 +18,7 @@ use crate::repositories::activity_repository::{ActivityRepository, SqliteActivit
 use crate::repositories::deleted_volumes_repository::{DeletedVolumeRepository, SqliteDeletedVolumes};
 use crate::repositories::host_identity_repository::{HostIdentityRepository, SqliteHostIdentity};
 use crate::repositories::instances_repository::{InstanceRepository, SqliteInstances};
+use crate::repositories::memory_profiles_repository::{MemoryProfileRepository, SqliteMemoryProfiles};
 use crate::repositories::meters_repository::{MeterRepository, SqliteMeters};
 use crate::repositories::slots_repository::{SlotRepository, SqliteSlots};
 
@@ -28,6 +30,7 @@ pub struct Repositories {
     pub slots: Arc<dyn SlotRepository>,
     pub activity: Arc<dyn ActivityRepository>,
     pub meters: Arc<dyn MeterRepository>,
+    pub memory_profiles: Arc<dyn MemoryProfileRepository>,
     pub deleted_volumes: Arc<dyn DeletedVolumeRepository>,
     pub identity: Arc<dyn HostIdentityRepository>,
     pub accepted_document: Arc<dyn AcceptedDocumentRepository>,
@@ -41,6 +44,7 @@ impl Repositories {
             slots: Arc::new(SqliteSlots::new(pool.clone())),
             activity: Arc::new(SqliteActivity::new(pool.clone())),
             meters: Arc::new(SqliteMeters::new(pool.clone())),
+            memory_profiles: Arc::new(SqliteMemoryProfiles::new(pool.clone())),
             deleted_volumes: Arc::new(SqliteDeletedVolumes::new(pool.clone())),
             identity: Arc::new(SqliteHostIdentity::new(pool.clone())),
             accepted_document: Arc::new(SqliteAcceptedDocument::new(pool)),
@@ -86,6 +90,7 @@ mod tests {
             "deleted_volumes",
             "host_identity",
             "instances",
+            "memory_profiles",
             "meters",
             "slot_cursor",
             "slots",
@@ -181,7 +186,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, [1, 2]);
+        assert_eq!(applied, [1, 2, 3]);
         assert!(after.cron.all().await.unwrap().is_empty());
         let registered = vec![protocol::CronTable {
             app_id: app_id(),

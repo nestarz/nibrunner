@@ -15,6 +15,7 @@ use crate::domain::report::InstanceRecord;
 #[derive(Debug, Default, Clone)]
 pub struct HostSnapshot {
     pub records: BTreeMap<AppId, InstanceRecord>,
+    pub(crate) memory_profiles: crate::domain::memory_admission::MemoryProfiles,
     pub(crate) memory_pressure: crate::domain::reconcile::pressure::PressureState,
     // Only ever this daemon's own account of what it set out on: a restart starts each over,
     // and so is measured as one.
@@ -162,8 +163,8 @@ impl HostState {
 
     /// Called under the app's transition lock. Admits `wanted` beside every record that holds memory
     /// and every reservation not yet accounted for by one, strictly against ceilings and, when
-    /// `measured` is given, against what is measured too: `observe` only logs it, and a pool bounds
-    /// it.
+    /// `measured` is given, against what is measured too: `adaptive` decides by the measurement,
+    /// `observe` only logs it, and a pool bounds both.
     pub(crate) async fn reserve_memory(
         &self,
         capacity_mib: u64,
@@ -175,6 +176,7 @@ impl HostState {
             crate::domain::memory_admission::MemoryReadings,
         )>,
     ) -> Result<MemoryReservation, u64> {
+        use crate::config::MemoryAdmissionMode;
         use crate::domain::memory_admission::MemoryOperation;
         let snapshot = self.snapshot.read().await;
         let mut reservations = self
@@ -198,8 +200,9 @@ impl HostState {
         };
         let mut shortfall = strict_shortfall;
         let mut bytes = crate::adapters::vm::limits::memory_max_bytes(wanted.memory_mib);
-        if measured.as_ref().is_some_and(|(_, readings)| {
-            readings.pool.is_some() && !readings.is_fresh(crate::clock::now_ms())
+        if measured.as_ref().is_some_and(|(mode, readings)| {
+            (*mode == MemoryAdmissionMode::Adaptive || readings.pool.is_some())
+                && !readings.is_fresh(crate::clock::now_ms())
         }) {
             // A reading that waited this long for the lock may no longer describe the host.
             return Err(bytes.div_ceil(1_048_576));
@@ -209,8 +212,50 @@ impl HostState {
                 // A reservation taken or given back since the reading: its working sets no longer
                 // stand for what is held.
                 readings.apps.clear();
+                if let Some(pool) = &mut readings.pool {
+                    pool.all_workloads_contained = false;
+                }
             }
             bytes = readings.ceiling(app_id, wanted);
+            let adaptive = mode == MemoryAdmissionMode::Adaptive
+                && readings
+                    .pool
+                    .as_ref()
+                    .is_none_or(|pool| pool.all_workloads_contained);
+            if adaptive
+                && readings.reservation_generation == reservations.generation
+                && operation == MemoryOperation::Start
+            {
+                let current = snapshot
+                    .records
+                    .get(app_id)
+                    .filter(|record| {
+                        record.resources == wanted
+                            && readings.startup.as_ref().is_none_or(|startup| {
+                                startup.deployment_id == record.deployment_id && startup.resources == wanted
+                            })
+                            && matches!(
+                                record.state,
+                                protocol::InstanceState::Pending
+                                    | protocol::InstanceState::Starting
+                                    | protocol::InstanceState::Idle
+                                    | protocol::InstanceState::Running
+                            )
+                    })
+                    .map(|record| readings.wake_target_bytes(record));
+                let historical = readings
+                    .startup
+                    .as_ref()
+                    .filter(|startup| startup.resources == wanted)
+                    .and_then(|startup| startup.peak_bytes)
+                    .map(|peak| {
+                        crate::domain::memory_admission::target_from_peak(
+                            readings.ceiling(app_id, wanted),
+                            peak,
+                        )
+                    });
+                bytes = current.into_iter().chain(historical).max().unwrap_or(bytes);
+            }
             let reserved_bytes = reservations
                 .held
                 .values()
@@ -238,12 +283,15 @@ impl HostState {
             tracing::info!(
                 %app_id,
                 ?mode,
+                adaptive,
                 reservation_mib = bytes.div_ceil(1_048_576),
                 strict_shortfall_mib = strict_shortfall,
                 measured_shortfall_mib = measured_shortfall,
                 "memory admission evaluated"
             );
-            if readings.pool.is_some() {
+            if adaptive {
+                shortfall = measured_shortfall;
+            } else if readings.pool.is_some() {
                 shortfall = strict_shortfall
                     .max(measured_shortfall)
                     .max(readings.strict_pool_shortfall_mib(&records, reserved_bytes, bytes));
@@ -264,6 +312,24 @@ impl HostState {
             app_id: app_id.clone(),
             reservations: self.memory_reservations.clone(),
         })
+    }
+
+    /// What the last runs of this deployment were measured to need, for a start that has nothing
+    /// running to measure yet.
+    pub(crate) async fn startup_memory(
+        &self,
+        desired: &protocol::DesiredInstance,
+    ) -> crate::domain::memory_admission::StartupMemory {
+        let snapshot = self.snapshot.read().await;
+        let peak_bytes = snapshot
+            .memory_profiles
+            .get(&(desired.app_id.clone(), desired.deployment_id.clone()))
+            .and_then(|profile| profile.peak_for(desired.config.resources, crate::clock::now_ms()));
+        crate::domain::memory_admission::StartupMemory {
+            deployment_id: desired.deployment_id.clone(),
+            resources: desired.config.resources,
+            peak_bytes,
+        }
     }
 
     pub(crate) fn try_transition(&self, app_id: &AppId) -> Option<OwnedMutexGuard<()>> {
@@ -336,23 +402,40 @@ impl HostState {
         change(&mut *self.snapshot.write().await)
     }
 
-    pub async fn put_record(&self, record: InstanceRecord) {
-        self.snapshot
-            .write()
-            .await
-            .records
-            .insert(record.app_id.clone(), record);
+    pub async fn put_record(&self, mut record: InstanceRecord) {
+        let mut snapshot = self.snapshot.write().await;
+        let now = crate::clock::now_ms();
+        crate::domain::memory_admission::restore_profile(&snapshot.memory_profiles, &mut record, now);
+        crate::domain::memory_admission::remember_profile(&mut snapshot.memory_profiles, &record, now);
+        snapshot.records.insert(record.app_id.clone(), record);
     }
 
     pub async fn update_record(&self, app_id: &AppId, change: impl FnOnce(&mut InstanceRecord)) {
         let mut snapshot = self.snapshot.write().await;
-        if let Some(record) = snapshot.records.get_mut(app_id) {
+        let HostSnapshot {
+            records,
+            memory_profiles,
+            ..
+        } = &mut *snapshot;
+        if let Some(record) = records.get_mut(app_id) {
             change(record);
+            crate::domain::memory_admission::remember_profile(
+                memory_profiles,
+                record,
+                crate::clock::now_ms(),
+            );
         }
     }
 
     pub async fn drop_record(&self, app_id: &AppId) {
-        self.snapshot.write().await.records.remove(app_id);
+        let mut snapshot = self.snapshot.write().await;
+        if let Some(record) = snapshot.records.remove(app_id) {
+            crate::domain::memory_admission::remember_profile(
+                &mut snapshot.memory_profiles,
+                &record,
+                crate::clock::now_ms(),
+            );
+        }
     }
 
     pub async fn mark_active(&self, app_id: &AppId, now_ms: i64) {
@@ -433,7 +516,7 @@ mod tests {
     use crate::test_support::{app_id, instance_record, volume_id};
     use protocol::{InstanceState, VolumeState};
 
-    use crate::config::MemoryAdmissionMode::Observe;
+    use crate::config::MemoryAdmissionMode::{Adaptive, Observe};
     use crate::domain::memory_admission::{MemoryOperation, MemoryReadings, PoolMemory};
 
     type Measured = Option<(crate::config::MemoryAdmissionMode, MemoryReadings)>;
@@ -442,6 +525,7 @@ mod tests {
         Some((
             mode,
             MemoryReadings {
+                startup: None,
                 pool: None,
                 reservation_generation: 0,
                 available_bytes: available_mib * 1_048_576,
@@ -469,31 +553,283 @@ mod tests {
             .await
     }
 
+    /// A running VM measured at 64 MiB of a 2 GiB ceiling, with a 2 GiB peak behind it.
+    fn running_readings(state: &HostState) -> MemoryReadings {
+        use protocol::{ReportedMemory, ReportedMemoryLimits};
+        MemoryReadings {
+            startup: None,
+            pool: None,
+            reservation_generation: state.memory_generation(),
+            available_bytes: 1500 * 1_048_576,
+            headroom_bytes: 1024 * 1_048_576,
+            measured_at_ms: crate::clock::now_ms(),
+            apps: BTreeMap::from([(
+                app_id(),
+                ReportedMemory {
+                    measured_at: crate::clock::now_timestamp(),
+                    cgroup: Some("/nibrunner-jailer/test".into()),
+                    proportional_set_bytes: Some(64 * 1_048_576),
+                    anonymous_set_bytes: None,
+                    current_bytes: 64 * 1_048_576,
+                    peak_bytes: Some(2048 * 1_048_576),
+                    swap_bytes: 0,
+                    high_events: 0,
+                    oom_kills: 0,
+                    pressure_some_us: 0,
+                    pressure_full_us: 0,
+                    limits: Some(ReportedMemoryLimits {
+                        low_bytes: 0,
+                        high_bytes: None,
+                        max_bytes: Some(2048 * 1_048_576),
+                        swap_max_bytes: None,
+                    }),
+                },
+            )]),
+        }
+    }
+
+    /// The same VM, its peak no higher than what it holds now: a working set that leaves room.
+    fn settled_readings(state: &HostState) -> MemoryReadings {
+        let mut readings = running_readings(state);
+        readings.apps.get_mut(&app_id()).unwrap().peak_bytes = Some(64 * 1_048_576);
+        readings
+    }
+
+    async fn running_app(state: &HostState) {
+        state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Running;
+                record.started_at = Some(protocol::Timestamp::from_epoch_ms(1));
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn measured_starts_reserve_headroom_atomically_and_release_cancelled_capacity() {
+        let state = HostState::shared();
+        let ceiling_mib =
+            crate::adapters::vm::limits::memory_max_bytes(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib)
+                .div_ceil(1_048_576);
+        let available = 1024 + ceiling_mib;
+        let second = AppId::parse("app-2").unwrap();
+        let first = app_id();
+        let (one, two) = tokio::join!(
+            reserve(&state, 8192, &first, measured(Adaptive, available)),
+            reserve(&state, 8192, &second, measured(Adaptive, available))
+        );
+        assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+        drop(one);
+        drop(two);
+        assert!(reserve(&state, 8192, &second, measured(Adaptive, available))
+            .await
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn observation_preserves_strict_admission_even_when_the_host_measurement_disagrees() {
         let state = HostState::shared();
         assert!(reserve(&state, 8192, &app_id(), measured(Observe, 0))
             .await
             .is_ok());
+        assert!(reserve(&state, 8192, &app_id(), measured(Adaptive, 0))
+            .await
+            .is_err());
         assert!(reserve(&state, 0, &app_id(), measured(Observe, 8192))
             .await
             .is_err());
     }
 
     #[tokio::test]
-    async fn a_pool_admission_refuses_a_stale_reading() {
+    async fn adaptive_pool_admission_waits_for_every_workload_to_be_inside_the_pool() {
         let state = HostState::shared();
-        let (mode, mut readings) = measured(Observe, 8192).unwrap();
-        readings.measured_at_ms -= 5001;
-        readings.pool = Some(PoolMemory {
-            current_bytes: 0,
-            reclaimable_file_bytes: 0,
-            high_bytes: 1800 * 1_048_576,
-            max_bytes: 2048 * 1_048_576,
-        });
-        assert!(reserve(&state, 8192, &app_id(), Some((mode, readings)))
+        running_app(&state).await;
+        let next = AppId::parse("next-app").unwrap();
+        for (contained, allowed) in [(false, false), (true, true)] {
+            let mut readings = settled_readings(&state);
+            readings.available_bytes = 8192 * 1_048_576;
+            readings.pool = Some(PoolMemory {
+                membership: "/workloads.slice".into(),
+                current_bytes: 64 * 1_048_576,
+                reclaimable_file_bytes: 0,
+                // The running VM's ceiling and the next one's do not fit; their working sets do.
+                high_bytes: 2048 * 1_048_576,
+                max_bytes: 2048 * 1_048_576,
+                all_workloads_contained: contained,
+            });
+            let result = reserve(&state, 8192, &next, Some((Adaptive, readings))).await;
+            assert_eq!(result.is_ok(), allowed, "contained: {contained}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pool_or_adaptive_admission_refuses_a_stale_reading() {
+        let state = HostState::shared();
+        for (mode, pooled) in [(Observe, true), (Adaptive, false)] {
+            let (mode, mut readings) = measured(mode, 8192).unwrap();
+            readings.measured_at_ms -= 5001;
+            readings.pool = pooled.then(|| PoolMemory {
+                membership: "/workloads.slice".into(),
+                current_bytes: 0,
+                reclaimable_file_bytes: 0,
+                high_bytes: 1800 * 1_048_576,
+                max_bytes: 2048 * 1_048_576,
+                all_workloads_contained: true,
+            });
+            assert!(reserve(&state, 8192, &app_id(), Some((mode, readings)))
+                .await
+                .is_err());
+            for operation in [MemoryOperation::Start, MemoryOperation::Snapshot] {
+                let (mode, mut old) = measured(Adaptive, 8192).unwrap();
+                old.measured_at_ms -= 5001;
+                assert!(state
+                    .reserve_memory(
+                        8192,
+                        &app_id(),
+                        protocol::DEFAULT_INSTANCE_RESOURCES,
+                        operation,
+                        Some((mode, old))
+                    )
+                    .await
+                    .is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_revision_starts_from_its_persisted_peak_and_another_deployment_does_not() {
+        let host = crate::test_support::test_host().await;
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Idle;
+                record.memory_peak_bytes = Some(128 * 1_048_576);
+            }))
+            .await;
+        host.persist().await;
+        host.state
+            .modify(|snapshot| snapshot.memory_profiles.clear())
+            .await;
+        host.load().await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().memory_peak_bytes,
+            Some(128 * 1_048_576)
+        );
+        let tight = |state: &HostState| {
+            let (mode, mut readings) = measured(Adaptive, 1024 + 200).unwrap();
+            readings.reservation_generation = state.memory_generation();
+            Some((mode, readings))
+        };
+        assert!(reserve(&host.state, 8192, &app_id(), tight(&host.state))
+            .await
+            .is_ok());
+        host.state
+            .update_record(&app_id(), |record| {
+                let mut fields = crate::test_support::record_fields();
+                fields.deployment_id = protocol::DeploymentId::parse("different-deployment").unwrap();
+                record.adopt(fields);
+            })
+            .await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().memory_peak_bytes,
+            None
+        );
+        assert!(reserve(&host.state, 8192, &app_id(), tight(&host.state))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_cold_start_uses_its_deployments_history_before_a_record_exists() {
+        let state = HostState::shared();
+        let desired = crate::test_support::desired_instance(|_| {});
+        state
+            .put_record(instance_record(|record| {
+                record.memory_peak_bytes = Some(128 * 1_048_576)
+            }))
+            .await;
+        state.drop_record(&app_id()).await;
+        let tight = |startup| {
+            let (mode, mut readings) = measured(Adaptive, 1024 + 200).unwrap();
+            readings.reservation_generation = state.memory_generation();
+            readings.startup = Some(startup);
+            Some((mode, readings))
+        };
+        assert!(reserve(
+            &state,
+            8192,
+            &app_id(),
+            tight(state.startup_memory(&desired).await)
+        )
+        .await
+        .is_ok());
+        let mut replacement = desired;
+        replacement.deployment_id = protocol::DeploymentId::parse("new-deployment").unwrap();
+        assert!(reserve(
+            &state,
+            8192,
+            &app_id(),
+            tight(state.startup_memory(&replacement).await)
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reservation_taken_after_a_reading_voids_the_working_sets_it_measured() {
+        let state = HostState::shared();
+        running_app(&state).await;
+        let ceiling =
+            crate::adapters::vm::limits::memory_max_bytes(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib);
+        let reading = |state: &HostState| {
+            let mut readings = settled_readings(state);
+            readings.available_bytes = 8192 * 1_048_576;
+            readings
+                .apps
+                .get_mut(&app_id())
+                .unwrap()
+                .limits
+                .as_mut()
+                .unwrap()
+                .max_bytes = Some(ceiling);
+            readings
+        };
+        let old = reading(&state);
+        let other = AppId::parse("app-2").unwrap();
+        drop(reserve(&state, 8192, &other, None).await.unwrap());
+        // Two ceilings do not fit; one ceiling and the running VM's settled working set do.
+        let capacity_mib = ceiling.div_ceil(1_048_576) + 200;
+        assert!(reserve(&state, capacity_mib, &other, Some((Adaptive, old)))
+            .await
+            .is_err());
+        assert!(
+            reserve(&state, capacity_mib, &other, Some((Adaptive, reading(&state))))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_holds_its_vms_whole_ceiling_until_it_is_done() {
+        let state = HostState::shared();
+        running_app(&state).await;
+        let other = AppId::parse("app-2").unwrap();
+        let readings = |state: &HostState| {
+            let mut readings = settled_readings(state);
+            readings.available_bytes = 3072 * 1_048_576;
+            Some((Adaptive, readings))
+        };
+        let snapshot = state
+            .reserve_memory(
+                8192,
+                &app_id(),
+                protocol::DEFAULT_INSTANCE_RESOURCES,
+                MemoryOperation::Snapshot,
+                readings(&state),
+            )
+            .await
+            .unwrap();
+        assert!(reserve(&state, 8192, &other, readings(&state)).await.is_err());
+        drop(snapshot);
+        assert!(reserve(&state, 8192, &other, readings(&state)).await.is_ok());
     }
 
     #[tokio::test]

@@ -104,6 +104,8 @@ pub enum MemoryAdmissionMode {
     /// Measure and log what a measured decision would have been; refuse exactly what the ceilings
     /// refuse.
     Observe,
+    /// Admit against measured working sets instead of ceilings.
+    Adaptive,
 }
 
 /// Optional. Absent, admission sums ceilings and takes no samples.
@@ -1538,12 +1540,12 @@ denied_egress_addresses_v6 = []
     fn workload_pool_names_are_root_level_slices_and_its_limit_is_nonzero() {
         let section = |slice: &str, memory_mib: u32| {
             format!(
-                "{WHOLE}\n[memory_admission]\nmode = \"observe\"\nheadroom_mib = 1024\nreclaim = true\n\n[memory_admission.pool]\nslice = {slice:?}\nmemory_mib = {memory_mib}\n"
+                "{WHOLE}\n[memory_admission]\nmode = \"adaptive\"\nheadroom_mib = 1024\nreclaim = true\n\n[memory_admission.pool]\nslice = {slice:?}\nmemory_mib = {memory_mib}\n"
             )
         };
         let config = parsed(&section("workloads.slice", 4096));
         let policy = config.memory_admission.as_ref().unwrap();
-        assert_eq!(policy.mode, MemoryAdmissionMode::Observe);
+        assert_eq!(policy.mode, MemoryAdmissionMode::Adaptive);
         assert!(policy.reclaim);
         assert_eq!(policy.pool.as_ref().unwrap().membership(), "/workloads.slice");
         assert_eq!(parsed(&config.to_toml()), config);

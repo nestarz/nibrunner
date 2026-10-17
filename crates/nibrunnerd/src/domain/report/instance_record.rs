@@ -41,6 +41,10 @@ pub struct InstanceRecord {
     pub health: HealthTracker,
     pub health_check: HealthCheck,
     pub resources: InstanceResources,
+    /// The highest working set this deployment has been measured at, under these resources: what a
+    /// later start or wake of it is admitted against before it can be measured again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_peak_bytes: Option<u64>,
     /// The document's `limits`, which the host applies to a running microVM as they change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<protocol::InstanceLimits>,
@@ -109,6 +113,7 @@ impl InstanceRecord {
             health,
             health_check: fields.health_check,
             resources: fields.resources,
+            memory_peak_bytes: None,
             limits: fields.limits,
             restart_policy: fields.restart_policy,
             desired_running: fields.desired_running,
@@ -125,6 +130,9 @@ impl InstanceRecord {
     }
 
     pub fn adopt(&mut self, fields: RecordFields) {
+        if self.deployment_id != fields.deployment_id || self.resources != fields.resources {
+            self.memory_peak_bytes = None;
+        }
         self.deployment_id = fields.deployment_id;
         self.volume_id = fields.volume_id;
         self.hostnames = fields.hostnames;

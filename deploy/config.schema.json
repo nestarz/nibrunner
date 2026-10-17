@@ -83,6 +83,11 @@
           "description": "Measure and log what a measured decision would have been; refuse exactly what the ceilings\nrefuse.",
           "type": "string",
           "const": "observe"
+        },
+        {
+          "description": "Admit against measured working sets instead of ceilings.",
+          "type": "string",
+          "const": "adaptive"
         }
       ]
     },

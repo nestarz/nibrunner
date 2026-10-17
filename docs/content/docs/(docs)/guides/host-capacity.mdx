@@ -67,8 +67,8 @@ is logged once per pass and counted in
 
 ### Measured admission
 
-By default a start or a wake must fit beside the ceiling of every VM that is up. To see what
-admission would decide from measurements rather than ceilings, before relying on it:
+By default a start or a wake must fit beside the ceiling of every VM that is up. To admit against
+what VMs actually use, start by observing:
 
 ```toml
 [memory_admission]
@@ -77,12 +77,15 @@ headroom_mib = 1024
 ```
 
 Every start, wake and snapshot then logs `memory admission evaluated` with the strict shortfall
-it was decided on and the measured one beside it, and nothing it decides changes. Restart the
+it was decided on and the measured one beside it, and nothing it decides changes. Set
+`mode = "adaptive"` to decide by the measurement once it agrees with what you expect. Restart the
 daemon after changing the section.
 
 A running VM is counted at its observed peak, swapped pages and proportional set included, plus
 the greater of 25 percent or 64 MiB, up to its cgroup ceiling. A VM that is starting, or whose
-sample is missing, old or from an earlier process, counts at its full ceiling.
+sample is missing, old or from an earlier process, counts at its full ceiling, unless its
+deployment was measured before: each deployment's peak is kept for 30 days, across restarts and
+after it is gone, so a cold start or a wake of a known revision is admitted at what it ran at.
 Targets must fit the guest-memory budget, and expected growth must fit `MemAvailable` less
 `headroom_mib`. Every start and wake holds what it was admitted at until its VM is measured
 running, so two of them never fit into the same room, and a snapshot holds its VM's whole
@@ -99,8 +102,9 @@ memory_mib = 4096
 The operator creates the root-level slice and bounds it; its `memory.max` must be positive and
 no larger than `memory_mib`, or the daemon does not start. Every VMM's cgroup is then placed under
 `<slice>/nibrunner-jailer`, and admission also respects what is left of the slice below its
-`memory.high` (clean inactive file cache counted as free), beside the ceilings. Set `memory.high`
-below `memory.max` to start reclaim before the hard limit.
+`memory.high` (clean inactive file cache counted as free). Until every VM that holds memory has
+been restarted inside the pool, adaptive admission falls back to ceilings. Set `memory.high` below
+`memory.max` to start reclaim before the hard limit.
 
 ### Reclaiming quiet apps
 
