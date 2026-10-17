@@ -64,6 +64,12 @@ const OCTET_SIZE: u32 = 256;
 const HOST_ADDRESS_OFFSET: u32 = 1;
 const GUEST_ADDRESS_OFFSET: u32 = 2;
 
+/// Whether `address` is in [`GUEST_NETWORK_CIDR`], the /16 every slot's /30 is cut from.
+pub fn in_guest_network(address: std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = address.octets();
+    u32::from(first) == GUEST_NETWORK_FIRST_OCTET && u32::from(second) == GUEST_NETWORK_SECOND_OCTET
+}
+
 pub const TAP_NAME_PREFIX: &str = "nbr";
 
 const MAC_PREFIX: &str = "02:00";
@@ -211,6 +217,17 @@ mod tests {
         let last = describe_slot(most_apps_the_ports_fit() - 1, app("last"));
         assert_eq!(last.host_port_at(PORTS_PER_SLOT - 1).unwrap().get(), u16::MAX);
         assert_eq!(last.guest_ipv4.as_str(), "10.201.86.250");
+    }
+
+    #[test]
+    fn the_guest_network_holds_every_slot_and_nothing_beside_it() {
+        assert_eq!(GUEST_NETWORK_CIDR, "10.201.0.0/16");
+        for index in [0, 1, GUEST_NETWORK_ADDRESSES - 1] {
+            assert!(in_guest_network(address_at(index).as_str().parse().unwrap()));
+        }
+        for outside in ["10.200.255.255", "10.202.0.0", "127.0.0.1", "201.10.0.1"] {
+            assert!(!in_guest_network(outside.parse().unwrap()), "{outside}");
+        }
     }
 
     #[test]
