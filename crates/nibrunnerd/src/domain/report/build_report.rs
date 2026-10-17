@@ -1,6 +1,6 @@
 use protocol::{
     HostCapacity, HostId, HostReportedState, HostState, HostVersions, ReportedCheckpoint, ReportedExport,
-    ReportedInstance, ReportedVolume, Revision, Sha256Digest, StateMessage, Timestamp,
+    ReportedInstance, ReportedProxy, ReportedVolume, Revision, Sha256Digest, StateMessage, Timestamp,
 };
 
 use crate::domain::report::InstanceRecord;
@@ -36,6 +36,7 @@ pub struct ReportInputs<'a> {
     pub accepted_digest: Option<Sha256Digest>,
     pub accepted_revision: Option<Revision>,
     pub message: Option<StateMessage>,
+    pub proxy: Option<ReportedProxy>,
 }
 
 pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
@@ -53,6 +54,7 @@ pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
         accepted_digest: inputs.accepted_digest,
         accepted_revision: inputs.accepted_revision,
         message: inputs.message,
+        proxy: inputs.proxy,
     }
 }
 
@@ -91,6 +93,7 @@ mod tests {
             accepted_digest: None,
             accepted_revision: None,
             message: None,
+            proxy: None,
         })
     }
 

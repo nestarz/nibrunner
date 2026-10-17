@@ -203,6 +203,14 @@ mod tests {
             ..report.clone()
         };
         assert!(writer::says_the_same(&report, &roomier));
+        let heavier = HostReportedState {
+            proxy: Some(protocol::ReportedProxy { cache_bytes: 1 << 20 }),
+            ..report.clone()
+        };
+        assert!(
+            writer::says_the_same(&report, &heavier),
+            "the cache's weight rides the heartbeat"
+        );
 
         let converged = HostReportedState {
             state: HostState::Ready,
