@@ -13,9 +13,11 @@ use hyper_util::server::conn::auto;
 use protocol::{AppId, DeploymentId, HostPort};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::config::{Compression, HttpEncode};
 use crate::domain::metrics::{HostMetrics, Outcome};
 use tokio::sync::RwLock;
 
+use crate::adapters::proxy::encode::{self, Encoding, Metered};
 use crate::adapters::proxy::forward::{
     forward, hostname_of, note_the_hop, say, ProxyBody, Unreachable, Upstreams,
 };
@@ -108,6 +110,27 @@ pub struct Router {
     metrics: Arc<HostMetrics>,
     http_log: Option<Arc<HttpRequestLog>>,
     concurrency: Option<super::concurrency::ConcurrencyLimiter>,
+    encode: Option<HttpEncode>,
+}
+
+/// On the 503 the proxy writes itself when the host or the app has no capacity left.
+#[derive(Debug, Clone, Copy)]
+struct Busy;
+
+/// On a response the activator held for a wake, how long it held it.
+#[derive(Debug, Clone, Copy)]
+struct Woken(u64);
+
+fn busy() -> Response<ProxyBody> {
+    let mut response = say(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "This host or app is busy. Please retry.\n",
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+    response.extensions_mut().insert(Busy);
+    response
 }
 
 impl Router {
@@ -120,12 +143,24 @@ impl Router {
         http_log: Option<Arc<HttpRequestLog>>,
         limits: Option<crate::config::HttpConcurrency>,
     ) -> Arc<Self> {
+        Self::with_http(metrics, http_log, limits, None)
+    }
+
+    /// The router `[proxy.http]` describes: admission and compression, each absent when its
+    /// section is.
+    pub fn with_http(
+        metrics: Arc<HostMetrics>,
+        http_log: Option<Arc<HttpRequestLog>>,
+        limits: Option<crate::config::HttpConcurrency>,
+        encode: Option<HttpEncode>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             concurrency: limits.map(super::concurrency::ConcurrencyLimiter::new),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
             metrics,
             http_log,
+            encode,
         })
     }
 
@@ -229,41 +264,22 @@ impl Router {
             (route, logging)
         };
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
-        let permit = self
-            .concurrency
-            .as_ref()
-            .map(|limits| limits.acquire(&route.app_id))
-            .transpose();
-        let (mut response, outcome) = match permit {
-            Err(()) => {
-                let mut response = say(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "This host or app is busy. Please retry.\n",
-                );
-                response
-                    .headers_mut()
-                    .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
-                self.metrics.proxy.app_refused(&route.app_id);
-                (response, Outcome::Refused)
-            }
-            Ok(permit) => {
-                let open =
-                    super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit);
-                let upstream = self.upstreams.to(&route.app_id).await;
-                let response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
-                let reached = response.extensions().get::<Unreachable>().is_none();
-                self.metrics
-                    .proxy
-                    .app_answered(&route.app_id, response.status(), reached);
-                let outcome = if reached {
-                    Outcome::Served
-                } else {
-                    Outcome::Unreachable
-                };
-                (response, outcome)
+        let (response, encoding) = self.exchange(request, &route).await;
+        let outcome = if response.extensions().get::<Busy>().is_some() {
+            self.metrics.proxy.app_refused(&route.app_id);
+            Outcome::Refused
+        } else {
+            let reached = response.extensions().get::<Unreachable>().is_none();
+            self.metrics
+                .proxy
+                .app_answered(&route.app_id, response.status(), reached);
+            if reached {
+                Outcome::Served
+            } else {
+                Outcome::Unreachable
             }
         };
-        let wake_micros = super::http_log::take_wake_micros(response.headers_mut());
+        let wake_micros = response.extensions().get::<Woken>().map(|woken| woken.0);
         if let (Some(log), Some((scope, method, uri))) = (&self.http_log, logging) {
             log.record(
                 scope,
@@ -274,10 +290,64 @@ impl Router {
                     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     route.deployment_id.clone(),
                 )
-                .woken_for(wake_micros),
+                .woken_for(wake_micros)
+                .served_as(encoding),
             );
         }
         (response, outcome, Some(route))
+    }
+
+    /// The request answered by the app, compressed on the way out on a host that compresses. A
+    /// host without `[proxy.http.encode]` relays the app's answer as it came.
+    async fn exchange(
+        &self,
+        mut request: Request<Incoming>,
+        route: &Route,
+    ) -> (Response<ProxyBody>, Option<Encoding>) {
+        let Some(settings) = &self.encode else {
+            return (self.ask_the_app(route, request).await, None);
+        };
+        let encoding = encode::negotiate(request.headers(), &settings.encodings);
+        encode::as_negotiated(request.headers_mut(), encoding);
+        let response = self.recode(route, self.ask_the_app(route, request).await, encoding);
+        let sent = Encoding::of(response.headers());
+        (response, sent)
+    }
+
+    fn recode(
+        &self,
+        route: &Route,
+        response: Response<ProxyBody>,
+        encoding: Encoding,
+    ) -> Response<ProxyBody> {
+        let (metrics, app_id) = (self.metrics.clone(), route.app_id.clone());
+        let meter = Metered::reporting(move |taken, given| {
+            let compression = match encoding {
+                Encoding::Br => Compression::Br,
+                Encoding::Gzip => Compression::Gzip,
+                Encoding::Identity => return,
+            };
+            metrics.proxy.encoded(&app_id, compression, taken, given);
+        });
+        encode::recoded(response, encoding, self.encode.as_ref(), meter)
+    }
+
+    async fn ask_the_app(&self, route: &Route, request: Request<Incoming>) -> Response<ProxyBody> {
+        let Ok(permit) = self
+            .concurrency
+            .as_ref()
+            .map(|limits| limits.acquire(&route.app_id))
+            .transpose()
+        else {
+            return busy();
+        };
+        let open = super::forward::ForwardedRequest::new(self.metrics.proxy.open(&route.app_id), permit);
+        let upstream = self.upstreams.to(&route.app_id).await;
+        let mut response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
+        if let Some(micros) = super::http_log::take_wake_micros(response.headers_mut()) {
+            response.extensions_mut().insert(Woken(micros));
+        }
+        response
     }
 }
 

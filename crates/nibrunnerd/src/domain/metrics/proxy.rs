@@ -6,6 +6,7 @@ use std::time::Duration;
 use hyper::StatusCode;
 use protocol::AppId;
 
+use crate::config::Compression;
 use crate::domain::metrics::{Histogram, Kind, Metric, Page};
 use crate::state::HostSnapshot;
 
@@ -46,6 +47,15 @@ pub const OUTCOMES: [Outcome; 5] = [
     Outcome::WrongHost,
     Outcome::Refused,
 ];
+
+const COMPRESSIONS: [Compression; 2] = [Compression::Br, Compression::Gzip];
+
+fn compression_label(compression: Compression) -> &'static str {
+    match compression {
+        Compression::Br => "br",
+        Compression::Gzip => "gzip",
+    }
+}
 
 /// How a TLS handshake ended, in the word the counter uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +142,8 @@ pub struct AppProxy {
     pub raw_sessions: [[u64; RAW_OUTCOMES.len()]; PROTOCOLS.len()],
     pub raw_bytes_in: [u64; PROTOCOLS.len()],
     pub raw_bytes_out: [u64; PROTOCOLS.len()],
+    pub encoded_in: [u64; COMPRESSIONS.len()],
+    pub encoded_out: [u64; COMPRESSIONS.len()],
 }
 
 fn position<T: PartialEq>(of: &[T], value: &T) -> usize {
@@ -262,6 +274,14 @@ impl ProxyMetrics {
         });
     }
 
+    pub fn encoded(&self, app_id: &AppId, compression: Compression, taken: u64, given: u64) {
+        self.app(app_id, |app| {
+            let index = position(&COMPRESSIONS, &compression);
+            app.encoded_in[index] += taken;
+            app.encoded_out[index] += given;
+        });
+    }
+
     pub fn forget(&self, app_id: &AppId) {
         self.apps
             .lock()
@@ -349,6 +369,13 @@ static RAW_PORT_BYTES_TOTAL: Metric = Metric {
     labels: &["app", "protocol", "direction"],
 };
 
+static PROXY_ENCODE_BYTES_TOTAL: Metric = Metric {
+    name: "nibrunner_proxy_encode_bytes_total",
+    help: "What the proxy compressed for an app, by coding: in is what the app sent, out is what left compressed. A hit compresses nothing and is not counted.",
+    kind: Kind::Counter,
+    labels: &["app", "encoding", "direction"],
+};
+
 pub(super) static DECLARED: &[&Metric] = &[
     &PROXY_REQUESTS_TOTAL,
     &PROXY_REQUEST_DURATION_SECONDS,
@@ -360,6 +387,7 @@ pub(super) static DECLARED: &[&Metric] = &[
     &APP_REQUESTS_OPEN,
     &RAW_PORT_SESSIONS_TOTAL,
     &RAW_PORT_BYTES_TOTAL,
+    &PROXY_ENCODE_BYTES_TOTAL,
 ];
 
 pub(super) fn render(page: &mut Page, metrics: &ProxyMetrics, snapshot: &HostSnapshot) {
@@ -434,6 +462,24 @@ pub(super) fn render(page: &mut Page, metrics: &ProxyMetrics, snapshot: &HostSna
             &[("app", app_id.as_str())],
             metrics.of(app_id).open,
         );
+    }
+
+    page.declare(&PROXY_ENCODE_BYTES_TOTAL);
+    for app_id in &apps {
+        let app = metrics.of(app_id);
+        for (index, compression) in COMPRESSIONS.iter().enumerate() {
+            for (direction, bytes) in [("in", app.encoded_in[index]), ("out", app.encoded_out[index])] {
+                page.value(
+                    &PROXY_ENCODE_BYTES_TOTAL,
+                    &[
+                        ("app", app_id.as_str()),
+                        ("encoding", compression_label(*compression)),
+                        ("direction", direction),
+                    ],
+                    bytes,
+                );
+            }
+        }
     }
 
     let with_raw_ports: Vec<&AppId> = snapshot
@@ -585,6 +631,30 @@ mod tests {
         ));
         assert!(bytes
             .contains(&"nibrunner_raw_port_bytes_total{app=\"app-2\",protocol=\"udp\",direction=\"in\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn what_was_compressed_is_counted_for_each_app() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let metrics = &host.metrics.proxy;
+        metrics.encoded(&app_id(), Compression::Br, 30_000, 2_000);
+
+        let page = page(
+            &crate::domain::metrics::tests::report(),
+            &host.metrics,
+            &host.state.snapshot().await,
+            0,
+        );
+        assert!(page.contains(
+            "nibrunner_proxy_encode_bytes_total{app=\"app-1\",encoding=\"br\",direction=\"in\"} 30000\n"
+        ));
+        assert!(page.contains(
+            "nibrunner_proxy_encode_bytes_total{app=\"app-1\",encoding=\"br\",direction=\"out\"} 2000\n"
+        ));
+        assert!(page.contains(
+            "nibrunner_proxy_encode_bytes_total{app=\"app-1\",encoding=\"gzip\",direction=\"out\"} 0\n"
+        ));
     }
 
     #[test]

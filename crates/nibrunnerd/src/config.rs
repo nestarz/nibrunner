@@ -96,6 +96,30 @@ pub struct HttpConcurrency {
     pub app_concurrent: std::num::NonZeroU16,
 }
 
+/// A content coding the proxy may compress a response into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename = "proxy.http.encode.encoding")]
+pub enum Compression {
+    Br,
+    Gzip,
+}
+
+/// Compression of responses on their way out, negotiated from the visitor's `Accept-Encoding`,
+/// once per response. Absent passes every body on as the app sent it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "proxy.http.encode")]
+pub struct HttpEncode {
+    /// The codings offered, in this host's order of preference when a visitor accepts several
+    /// equally. Empty offers none.
+    #[schemars(extend("uniqueItems" = true))]
+    pub encodings: Vec<Compression>,
+    /// A body whose `Content-Length` says it is smaller than this, in KiB, is not worth compressing
+    /// and is passed on as it is.
+    pub min_kib: u32,
+}
+
 /// Where the world reaches an app on this host.
 ///
 /// Every way in is a section under here, and each is absent or complete: there is no
@@ -118,6 +142,7 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpListener {
     pub concurrency: Option<HttpConcurrency>,
+    pub encode: Option<HttpEncode>,
     pub listen_address: IpAddr,
     pub port: u16,
     /// Absent serves plain HTTP, which is what a host behind an edge that terminates TLS wants.
@@ -510,6 +535,9 @@ mod file {
         /// Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) concurrency: Option<super::HttpConcurrency>,
+        /// Absent compresses nothing. Changes require `nibrunnerd start`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) encode: Option<super::HttpEncode>,
     }
 
     /// One certificate for the whole host — there is no SNI selection, so a wildcard in practice —
@@ -784,6 +812,7 @@ impl HostConfig {
         starter.max_apps = max_apps;
         starter.proxy.http = Some(HttpListener {
             concurrency: None,
+            encode: None,
             listen_address: IpAddr::from([0, 0, 0, 0]),
             port: 80,
             tls: None,
@@ -877,6 +906,10 @@ impl HostConfig {
                     concurrency: Some(HttpConcurrency {
                         host_concurrent: std::num::NonZeroU16::new(128).expect("positive limit"),
                         app_concurrent: std::num::NonZeroU16::new(16).expect("positive limit"),
+                    }),
+                    encode: Some(HttpEncode {
+                        encodings: vec![Compression::Br, Compression::Gzip],
+                        min_kib: 1,
                     }),
                     listen_address: IpAddr::from([0, 0, 0, 0]),
                     port: 443,
@@ -980,6 +1013,7 @@ impl HostConfig {
             proxy: (self.proxy != ProxyConfig::default()).then(|| file::Proxy {
                 http: self.proxy.http.as_ref().map(|http| file::Http {
                     concurrency: http.concurrency.clone(),
+                    encode: http.encode.clone(),
                     listen_address: Some(http.listen_address.to_string()),
                     port: Some(http.port),
                     tls: http.tls.as_ref().map(|tls| file::Tls {
@@ -1064,6 +1098,7 @@ fn proxy(document: Option<&file::Proxy>, max_apps: u32) -> Result<ProxyConfig, C
         .map(|http| {
             Ok::<_, ConfigError>(HttpListener {
                 concurrency: http.concurrency.clone(),
+                encode: http.encode.as_ref().map(encode).transpose()?,
                 listen_address: bind_address("proxy.http.listen_address", &http.listen_address)?,
                 port: listener(
                     "proxy.http.port",
@@ -1110,6 +1145,18 @@ fn proxy(document: Option<&file::Proxy>, max_apps: u32) -> Result<ProxyConfig, C
         })
         .transpose()?;
     Ok(ProxyConfig { http, raw })
+}
+
+fn encode(document: &HttpEncode) -> Result<HttpEncode, ConfigError> {
+    let offered: std::collections::BTreeSet<_> =
+        document.encodings.iter().map(|coding| *coding as u8).collect();
+    if offered.len() != document.encodings.len() {
+        return Err(ConfigError::invalid(
+            "proxy.http.encode.encodings",
+            "a list naming each coding at most once",
+        ));
+    }
+    Ok(document.clone())
 }
 
 /// What a slot has left over for an app once its HTTP port is taken.
@@ -1504,6 +1551,34 @@ denied_egress_addresses_v6 = []
             valid.replace("proxy.http.concurrency", "http_concurrency"),
         ] {
             assert!(HostConfig::from_toml(&invalid).is_err());
+            assert!(!validator.is_valid(&json(&invalid)), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn compression_is_opt_in_and_complete_when_present() {
+        let original = HostConfig::starter(10).to_toml();
+        let http = |text: &str| HostConfig::from_toml(text).unwrap().proxy.http.unwrap();
+        assert_eq!(http(&original).encode, None);
+        let valid = format!("{original}\n[proxy.http.encode]\nencodings = [\"br\", \"gzip\"]\nmin_kib = 1\n");
+        let enabled = HostConfig::from_toml(&valid).unwrap();
+        assert_eq!(
+            enabled.proxy.http.as_ref().unwrap().encode,
+            Some(HttpEncode {
+                encodings: vec![Compression::Br, Compression::Gzip],
+                min_kib: 1,
+            })
+        );
+        assert_eq!(HostConfig::from_toml(&enabled.to_toml()).unwrap(), enabled);
+        let validator = jsonschema::validator_for(&HostConfig::schema().to_value()).unwrap();
+        let json = |text: &str| serde_json::to_value(toml::from_str::<toml::Value>(text).unwrap()).unwrap();
+        assert!(validator.is_valid(&json(&valid)));
+        for invalid in [
+            valid.replace("[\"br\", \"gzip\"]", "[\"zstd\"]"),
+            valid.replace("[\"br\", \"gzip\"]", "[\"gzip\", \"gzip\"]"),
+            valid.replace("min_kib = 1\n", ""),
+        ] {
+            assert!(HostConfig::from_toml(&invalid).is_err(), "{invalid}");
             assert!(!validator.is_valid(&json(&invalid)), "{invalid}");
         }
     }
@@ -2235,6 +2310,7 @@ keep_mib_per_app = 64
             config.proxy.http,
             Some(HttpListener {
                 concurrency: None,
+                encode: None,
                 listen_address: IpAddr::from([0, 0, 0, 0]),
                 port: 443,
                 tls: Some(TlsMaterial {

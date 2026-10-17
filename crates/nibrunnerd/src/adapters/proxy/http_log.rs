@@ -19,6 +19,7 @@ use hyper::Uri;
 use protocol::{AppId, DeploymentId, Timestamp};
 use serde::Serialize;
 
+use crate::adapters::proxy::encode::Encoding;
 use crate::json_store::make_directory;
 
 const QUEUED_RECORDS: usize = 1024;
@@ -36,6 +37,8 @@ pub struct HttpRequestRecord {
     deployment_id: DeploymentId,
     #[serde(skip_serializing_if = "Option::is_none")]
     wake_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
 }
 
 /// The header on which the activator hands back how long it held a request for its app to wake,
@@ -73,7 +76,14 @@ impl HttpRequestRecord {
             duration_micros,
             deployment_id,
             wake_micros: None,
+            encoding: None,
         }
+    }
+
+    /// The coding the response's body left in: `None` on a host without `[proxy.http.encode]`.
+    pub(crate) fn served_as(mut self, encoding: Option<Encoding>) -> Self {
+        self.encoding = encoding.map(Encoding::token);
+        self
     }
 
     /// The part of `duration_micros` the request spent held for a restore or a cold boot.
@@ -306,6 +316,20 @@ mod tests {
         };
         assert_eq!(record(Some(240_000))["wakeMicros"], 240_000);
         assert!(record(None).get("wakeMicros").is_none());
+    }
+
+    #[test]
+    fn a_record_says_the_coding_sent_only_where_the_host_compresses() {
+        let uri: Uri = "/".parse().expect("a request URI");
+        let record = |encoding| {
+            serde_json::to_value(
+                HttpRequestRecord::new("GET", &uri, 200, 90, crate::test_support::deployment_id())
+                    .served_as(encoding),
+            )
+            .expect("a record")
+        };
+        assert_eq!(record(Some(Encoding::Br))["encoding"], "br");
+        assert!(record(None).get("encoding").is_none());
     }
 
     #[test]
