@@ -153,6 +153,15 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 1
+        },
+        "seal_key_file": {
+          "description": "The fleet key the objects are sealed under: a file of exactly 32 raw bytes.",
+          "type": "string",
+          "pattern": "^/"
+        },
+        "sink": {
+          "description": "Optional, with `seal_key_file`. A control plane's `s3://<bucket>/fleets/<fleet>` (or a\ndirectory ending in `fleets/<fleet>`): the output and requests of every instance whose\ndocument labels it with an `app` are shipped there, sealed, as\n`logs/<app>/live-<hostId>.jsonl.gz` every 5 s and `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz`\nevery 300 s and when the instance is forgotten.",
+          "type": "string"
         }
       },
       "additionalProperties": false,
@@ -174,6 +183,10 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 1
+        },
+        "sink": {
+          "description": "Optional. A control plane's `s3://<bucket>/fleets/<fleet>` (or a directory ending in\n`fleets/<fleet>`): every 300 s that a counter moved, each labelled unit's counters are\nadded to `metrics/<hostId>/<yyyymmddhh>.json` and `<yyyymmdd>.json` there.",
+          "type": "string"
         }
       },
       "additionalProperties": false,

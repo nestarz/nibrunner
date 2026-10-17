@@ -16,9 +16,10 @@ use tokio::sync::{
 };
 
 use hyper::Uri;
-use protocol::{AppId, DeploymentId, Timestamp};
+use protocol::{AppId, DeploymentId, InstanceLabels, Timestamp};
 use serde::Serialize;
 
+use crate::adapters::logs::ObjectSink;
 use crate::json_store::make_directory;
 
 const QUEUED_RECORDS: usize = 1024;
@@ -28,12 +29,14 @@ const KEPT_BYTES_PER_APP: u64 = 1024 * 1024;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpRequestRecord {
-    at: Timestamp,
-    method: String,
-    path: String,
-    status: u16,
-    duration_micros: u64,
+    pub(crate) at: Timestamp,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) status: u16,
+    pub(crate) duration_micros: u64,
     deployment_id: DeploymentId,
+    #[serde(skip_serializing_if = "InstanceLabels::is_empty")]
+    pub(crate) labels: InstanceLabels,
 }
 
 impl HttpRequestRecord {
@@ -51,7 +54,13 @@ impl HttpRequestRecord {
             status,
             duration_micros,
             deployment_id,
+            labels: InstanceLabels::default(),
         }
+    }
+
+    pub fn labelled(mut self, labels: InstanceLabels) -> Self {
+        self.labels = labels;
+        self
     }
 }
 
@@ -60,6 +69,7 @@ pub struct HttpRequestLog {
     apps: Mutex<BTreeMap<AppId, Arc<AtomicBool>>>,
     worker: Option<JoinHandle<()>>,
     dropped: AtomicU64,
+    objects: Option<Arc<ObjectSink>>,
 }
 
 pub(super) struct HttpRequestScope {
@@ -84,7 +94,14 @@ impl HttpRequestLog {
             apps: Mutex::new(BTreeMap::new()),
             worker: Some(worker),
             dropped: AtomicU64::new(0),
+            objects: None,
         })
+    }
+
+    /// Every request is also shipped to a control plane's bucket.
+    pub fn with_objects(mut self, objects: Arc<ObjectSink>) -> Self {
+        self.objects = Some(objects);
+        self
     }
 
     pub(super) async fn begin(&self, app_id: &AppId) -> HttpRequestScope {
@@ -102,6 +119,9 @@ impl HttpRequestLog {
     }
 
     pub(super) fn record(&self, scope: HttpRequestScope, record: HttpRequestRecord) {
+        if let Some(objects) = &self.objects {
+            objects.request(&scope.app_id, &record);
+        }
         let Some(sender) = &self.sender else {
             return;
         };
@@ -266,6 +286,25 @@ fn write_records(mut receiver: Receiver<HttpLogCommand>, directory: PathBuf) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_record_carries_its_instances_labels_only_when_the_document_gave_some() {
+        let uri: Uri = "/".parse().expect("a request URI");
+        let record = |labels| {
+            serde_json::to_value(
+                HttpRequestRecord::new("GET", &uri, 200, 1, crate::test_support::deployment_id())
+                    .labelled(labels),
+            )
+            .expect("a record")
+        };
+        let labels: InstanceLabels =
+            serde_json::from_value(serde_json::json!({ "app": "shop", "rev": "r-12" })).expect("labels");
+        assert_eq!(
+            record(labels)["labels"],
+            serde_json::json!({ "app": "shop", "rev": "r-12" })
+        );
+        assert!(record(InstanceLabels::default()).get("labels").is_none());
+    }
+
     #[tokio::test]
     async fn http_records_leave_query_strings_out_of_per_app_files() {
         let directory = tempfile::tempdir().expect("a test directory");
@@ -389,6 +428,7 @@ mod tests {
             apps: Mutex::new(BTreeMap::new()),
             worker: None,
             dropped: AtomicU64::new(0),
+            objects: None,
         };
         let app = crate::test_support::app_id();
         let scope = logs.begin(&app).await;

@@ -4,6 +4,7 @@ pub mod health;
 pub mod passes;
 pub mod proxy;
 pub mod resources;
+pub mod rollup;
 pub mod sleep_wake;
 
 pub use conntrack::{Conntrack, ConntrackWatch};

@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use guest_contract::control::GUEST_LOG_PREFIX;
-use protocol::AppId;
+use protocol::{AppId, DeploymentId, InstanceLabels, TenantLogStream};
+use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::json_store::make_directory;
 use crate::ports::{LogSink, TenantLogBody, TenantLogEvent};
@@ -14,6 +16,10 @@ use crate::ports::{LogSink, TenantLogBody, TenantLogEvent};
 const LOG_DIR_MODE: u32 = 0o700;
 
 const GAP_MESSAGE: &str = "tenant output dropped by host buffering";
+
+/// A deployment being replaced may still be writing while its successor starts: its lines keep the
+/// labels it ran under.
+const LABELLED_DEPLOYMENTS_PER_APP: usize = 2;
 
 pub struct FileLogSink {
     directory: PathBuf,
@@ -26,6 +32,9 @@ pub struct FileLogSink {
     // flushed once the batch the receiver handed us has drained, so a daemon crash loses nothing
     // that a publish returned for.
     writers: Mutex<BTreeMap<AppId, AppLog>>,
+    /// Each deployment's labels, newest first, as the tokens every one of its lines carries.
+    labels: Mutex<BTreeMap<AppId, Vec<(DeploymentId, String)>>>,
+    objects: Option<Arc<super::ObjectSink>>,
 }
 
 struct AppLog {
@@ -64,7 +73,29 @@ impl FileLogSink {
             directory,
             keep_bytes_per_app,
             writers: Mutex::new(BTreeMap::new()),
+            labels: Mutex::new(BTreeMap::new()),
+            objects: None,
         }
+    }
+
+    /// Every event is also shipped to a control plane's bucket.
+    pub fn with_objects(mut self, objects: Arc<super::ObjectSink>) -> Self {
+        self.objects = Some(objects);
+        self
+    }
+
+    /// What every line `deployment_id` writes from now on carries, as `label.<key>=<value>` after
+    /// its sequence number.
+    pub fn label(&self, app_id: &AppId, deployment_id: &DeploymentId, labels: InstanceLabels) {
+        let tokens: String = labels
+            .iter()
+            .map(|(key, value)| format!("label.{key}={value} "))
+            .collect();
+        let mut kept = self.labels.lock().expect("no panic holds the log label lock");
+        let deployments = kept.entry(app_id.clone()).or_default();
+        deployments.retain(|(labelled, _)| labelled != deployment_id);
+        deployments.insert(0, (deployment_id.clone(), tokens));
+        deployments.truncate(LABELLED_DEPLOYMENTS_PER_APP);
     }
 
     pub fn path_for(&self, app_id: &AppId) -> PathBuf {
@@ -84,6 +115,10 @@ impl FileLogSink {
     pub fn discard(&self, app_id: &AppId) {
         let mut writers = self.writers.lock().expect("no panic holds the log writer lock");
         drop(writers.remove(app_id));
+        self.labels
+            .lock()
+            .expect("no panic holds the log label lock")
+            .remove(app_id);
         for path in [self.path_for(app_id), self.previous_path_for(app_id)] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -112,48 +147,46 @@ impl FileLogSink {
         }
     }
 
-    /// One record per event: a header, then the line the tenant wrote or the gap in its place,
-    /// ended by the newline the receiver took off it.
-    fn render(event: &TenantLogEvent, out: &mut impl Write) -> std::io::Result<()> {
-        match &event.body {
-            TenantLogBody::Data { stream, text } => writeln!(
-                out,
-                "{} {} {}/{} {}",
-                event.observed_at,
-                stream.as_str(),
-                event.source_id,
-                event.sequence,
-                text
-            ),
+    /// The stream and the text of an event: the line the tenant wrote (a cron run's under its job
+    /// and run ids), or what stands in its place where a failure would be read.
+    pub(crate) fn text(body: &TenantLogBody) -> (TenantLogStream, Cow<'_, str>) {
+        match body {
+            TenantLogBody::Data { stream, text } => (*stream, Cow::Borrowed(text)),
             TenantLogBody::CronData {
                 stream,
                 text,
                 job_id,
                 run_id,
-            } => writeln!(
-                out,
-                "{} {} {}/{} cronJobId={} cronRunId={} {}",
-                event.observed_at,
-                stream.as_str(),
-                event.source_id,
-                event.sequence,
-                job_id,
-                run_id,
-                text,
+            } => (
+                *stream,
+                Cow::Owned(format!("cronJobId={job_id} cronRunId={run_id} {text}")),
             ),
-            TenantLogBody::Gap { dropped_bytes } => writeln!(
-                out,
-                "{} stderr {}/{} {GAP_MESSAGE}: {dropped_bytes} bytes",
-                event.observed_at, event.source_id, event.sequence
+            TenantLogBody::Gap { dropped_bytes } => (
+                TenantLogStream::Stderr,
+                Cow::Owned(format!("{GAP_MESSAGE}: {dropped_bytes} bytes")),
             ),
             // The line the guest printed on its console, where the tenant's own stderr would have
             // put it had the tenant been alive to write one.
-            TenantLogBody::Restart(restart) => writeln!(
-                out,
-                "{} stderr {}/{} {GUEST_LOG_PREFIX}{}",
-                event.observed_at, event.source_id, event.sequence, restart.reason
+            TenantLogBody::Restart(restart) => (
+                TenantLogStream::Stderr,
+                Cow::Owned(format!("{GUEST_LOG_PREFIX}{}", restart.reason)),
             ),
         }
+    }
+
+    /// One record per event: a header, the labels of its deployment, then its text, ended by the
+    /// newline the receiver took off it.
+    fn render(event: &TenantLogEvent, labels: &str, out: &mut impl Write) -> std::io::Result<()> {
+        let (stream, text) = Self::text(&event.body);
+        writeln!(
+            out,
+            "{} {} {}/{} {labels}{}",
+            event.observed_at,
+            stream.as_str(),
+            event.source_id,
+            event.sequence,
+            text
+        )
     }
 }
 
@@ -164,8 +197,12 @@ impl LogSink for FileLogSink {
             return;
         }
         let mut writers = self.writers.lock().expect("no panic holds the log writer lock");
+        let labels = self.labels.lock().expect("no panic holds the log label lock");
         let mut touched: BTreeSet<AppId> = BTreeSet::new();
         for event in events {
+            if let Some(objects) = &self.objects {
+                objects.output(&event);
+            }
             if !writers.contains_key(&event.app_id) {
                 if let Err(error) = make_directory(&self.directory, LOG_DIR_MODE) {
                     tracing::warn!(%error, "tenant logs have nowhere to go");
@@ -184,7 +221,15 @@ impl LogSink for FileLogSink {
             let Some(log) = writers.get_mut(&event.app_id) else {
                 continue;
             };
-            if let Err(error) = Self::render(&event, log) {
+            let tokens = labels
+                .get(&event.app_id)
+                .and_then(|deployments| {
+                    deployments
+                        .iter()
+                        .find(|(labelled, _)| *labelled == event.deployment_id)
+                })
+                .map_or("", |(_, tokens)| tokens.as_str());
+            if let Err(error) = Self::render(&event, tokens, log) {
                 tracing::warn!(app_id = %event.app_id, %error, "tenant output could not be written");
                 continue;
             }
@@ -223,7 +268,6 @@ impl Drop for FileLogSink {
 mod tests {
     use super::*;
     use crate::test_support::{app_id, deployment_id, observed_at, tenant_restart};
-    use protocol::TenantLogStream;
 
     fn event(body: TenantLogBody, sequence: u64) -> TenantLogEvent {
         TenantLogEvent {
@@ -269,6 +313,71 @@ mod tests {
         assert!(lines[0].ends_with("stderr source-1/0 cronJobId=cron-job cronRunId=run-1 cron output"));
         assert!(lines[1].ends_with("stdout source-1/1 ordinary output"));
         assert!(!lines[1].contains("cronJobId="));
+    }
+
+    #[tokio::test]
+    async fn every_line_carries_the_labels_of_the_deployment_that_wrote_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let sink = unbounded(directory.path().join("logs"));
+        let labels = |rev: &str| -> InstanceLabels {
+            serde_json::from_value(serde_json::json!({ "rev": rev, "app": "shop" })).unwrap()
+        };
+        let successor = DeploymentId::parse("dep-2").unwrap();
+        sink.label(&app_id(), &deployment_id(), labels("r-1"));
+        sink.label(&app_id(), &successor, labels("r-2"));
+        let line = |text: &str, sequence| {
+            event(
+                TenantLogBody::Data {
+                    stream: TenantLogStream::Stdout,
+                    text: text.into(),
+                },
+                sequence,
+            )
+        };
+        sink.publish(vec![
+            line("draining", 0),
+            TenantLogEvent {
+                deployment_id: successor.clone(),
+                ..line("serving", 1)
+            },
+            TenantLogEvent {
+                deployment_id: DeploymentId::parse("dep-unlabelled").unwrap(),
+                ..line("unknown", 2)
+            },
+            event(
+                TenantLogBody::CronData {
+                    stream: TenantLogStream::Stdout,
+                    text: "tick".into(),
+                    job_id: "job".into(),
+                    run_id: "run".into(),
+                },
+                3,
+            ),
+        ])
+        .await;
+        let written = std::fs::read_to_string(sink.path_for(&app_id())).unwrap();
+        let lines: Vec<_> = written.lines().collect();
+        assert!(
+            lines[0].ends_with("source-1/0 label.app=shop label.rev=r-1 draining"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with("source-1/1 label.app=shop label.rev=r-2 serving"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].ends_with("source-1/2 unknown"), "{}", lines[2]);
+        assert!(
+            lines[3].ends_with("label.app=shop label.rev=r-1 cronJobId=job cronRunId=run tick"),
+            "{}",
+            lines[3]
+        );
+        sink.discard(&app_id());
+        sink.publish(vec![line("after", 4)]).await;
+        assert!(std::fs::read_to_string(sink.path_for(&app_id()))
+            .unwrap()
+            .ends_with("source-1/4 after\n"));
     }
 
     #[tokio::test]
@@ -359,7 +468,7 @@ mod tests {
 
     fn rendered(event: &TenantLogEvent) -> String {
         let mut out = Vec::new();
-        FileLogSink::render(event, &mut out).unwrap();
+        FileLogSink::render(event, "", &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 

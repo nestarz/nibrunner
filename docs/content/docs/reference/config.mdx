@@ -9,6 +9,10 @@ The file `nibrunnerd install` writes and every `nibrunnerd start` reads. It is a
 No key has a default: every key a section declares is required unless the table says otherwise,
 and unknown keys are rejected.
 
+`[logs] sink` with `seal_key_file`, and `[metrics] sink`, are optional: they ship what an app
+printed and counted to a bucket, as
+[Logs and metrics](/docs/guides/logs-and-metrics#ship-logs-and-metrics-to-a-bucket) explains.
+
 An editor with TOML schema support (Even Better TOML for VS Code, taplo) validates and
 autocompletes the file when its first line is:
 

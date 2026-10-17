@@ -19,6 +19,7 @@ pub fn to_reported_instance(record: &InstanceRecord) -> ReportedInstance {
         converged_at: record.converged_at.clone(),
         last_exit_code: record.last_exit_code,
         message: record.message.clone(),
+        labels: record.labels.clone(),
     }
 }
 
@@ -104,6 +105,16 @@ mod tests {
         }
         let exited = to_reported_instance(&instance_record(|record| record.last_exit_code = Some(0)));
         assert_eq!(serde_json::to_value(&exited).unwrap()["lastExitCode"], 0);
+    }
+
+    #[test]
+    fn the_report_echoes_the_labels_the_record_was_given() {
+        let labels: protocol::InstanceLabels =
+            serde_json::from_value(serde_json::json!({ "app": "shop", "context": "production" })).unwrap();
+        let labelled = to_reported_instance(&instance_record(|record| record.labels = labels.clone()));
+        assert_eq!(labelled.labels, labels);
+        let unlabelled = serde_json::to_value(to_reported_instance(&instance_record(|_| {}))).unwrap();
+        assert!(unlabelled.get("labels").is_none());
     }
 
     #[test]
