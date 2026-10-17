@@ -8,6 +8,9 @@ which apps run on the host, on which volumes, and how they are reached.
 [Deploy an app](/docs/getting-started/deploy-an-app) is the guide; this page lists every field.
 A file the host cannot parse is rejected as a whole, and `reported.json` says why.
 
+An instance's `labels.app`, `labels.rev` and `labels.context` also label what the
+[telemetry sink](/docs/guides/logs-and-metrics#ship-logs-to-a-bucket) ships of it.
+
 An editor validates and autocompletes the file when it names the schema:
 
 ```json

@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use guest_contract::control::GUEST_LOG_PREFIX;
-use protocol::{AppId, DeploymentId, InstanceLabels};
+use protocol::{AppId, DeploymentId, InstanceLabels, TenantLogStream};
+use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::json_store::make_directory;
 use crate::ports::{LogSink, TenantLogBody, TenantLogEvent};
@@ -32,6 +34,7 @@ pub struct FileLogSink {
     writers: Mutex<BTreeMap<AppId, AppLog>>,
     /// Each deployment's labels, newest first, as the tokens every one of its lines carries.
     labels: Mutex<BTreeMap<AppId, Vec<(DeploymentId, String)>>>,
+    objects: Option<Arc<super::ObjectSink>>,
 }
 
 struct AppLog {
@@ -71,7 +74,14 @@ impl FileLogSink {
             keep_bytes_per_app,
             writers: Mutex::new(BTreeMap::new()),
             labels: Mutex::new(BTreeMap::new()),
+            objects: None,
         }
+    }
+
+    /// Every event is also shipped to a control plane's bucket.
+    pub fn with_objects(mut self, objects: Arc<super::ObjectSink>) -> Self {
+        self.objects = Some(objects);
+        self
     }
 
     /// What every line `deployment_id` writes from now on carries, as `label.<key>=<value>` after
@@ -137,48 +147,46 @@ impl FileLogSink {
         }
     }
 
-    /// One record per event: a header, then the line the tenant wrote or the gap in its place,
-    /// ended by the newline the receiver took off it.
-    fn render(event: &TenantLogEvent, labels: &str, out: &mut impl Write) -> std::io::Result<()> {
-        match &event.body {
-            TenantLogBody::Data { stream, text } => writeln!(
-                out,
-                "{} {} {}/{} {labels}{}",
-                event.observed_at,
-                stream.as_str(),
-                event.source_id,
-                event.sequence,
-                text
-            ),
+    /// The stream and the text of an event: the line the tenant wrote (a cron run's under its job
+    /// and run ids), or what stands in its place where a failure would be read.
+    pub(crate) fn text(body: &TenantLogBody) -> (TenantLogStream, Cow<'_, str>) {
+        match body {
+            TenantLogBody::Data { stream, text } => (*stream, Cow::Borrowed(text)),
             TenantLogBody::CronData {
                 stream,
                 text,
                 job_id,
                 run_id,
-            } => writeln!(
-                out,
-                "{} {} {}/{} {labels}cronJobId={} cronRunId={} {}",
-                event.observed_at,
-                stream.as_str(),
-                event.source_id,
-                event.sequence,
-                job_id,
-                run_id,
-                text,
+            } => (
+                *stream,
+                Cow::Owned(format!("cronJobId={job_id} cronRunId={run_id} {text}")),
             ),
-            TenantLogBody::Gap { dropped_bytes } => writeln!(
-                out,
-                "{} stderr {}/{} {labels}{GAP_MESSAGE}: {dropped_bytes} bytes",
-                event.observed_at, event.source_id, event.sequence
+            TenantLogBody::Gap { dropped_bytes } => (
+                TenantLogStream::Stderr,
+                Cow::Owned(format!("{GAP_MESSAGE}: {dropped_bytes} bytes")),
             ),
             // The line the guest printed on its console, where the tenant's own stderr would have
             // put it had the tenant been alive to write one.
-            TenantLogBody::Restart(restart) => writeln!(
-                out,
-                "{} stderr {}/{} {labels}{GUEST_LOG_PREFIX}{}",
-                event.observed_at, event.source_id, event.sequence, restart.reason
+            TenantLogBody::Restart(restart) => (
+                TenantLogStream::Stderr,
+                Cow::Owned(format!("{GUEST_LOG_PREFIX}{}", restart.reason)),
             ),
         }
+    }
+
+    /// One record per event: a header, the labels of its deployment, then its text, ended by the
+    /// newline the receiver took off it.
+    fn render(event: &TenantLogEvent, labels: &str, out: &mut impl Write) -> std::io::Result<()> {
+        let (stream, text) = Self::text(&event.body);
+        writeln!(
+            out,
+            "{} {} {}/{} {labels}{}",
+            event.observed_at,
+            stream.as_str(),
+            event.source_id,
+            event.sequence,
+            text
+        )
     }
 }
 
@@ -192,6 +200,9 @@ impl LogSink for FileLogSink {
         let labels = self.labels.lock().expect("no panic holds the log label lock");
         let mut touched: BTreeSet<AppId> = BTreeSet::new();
         for event in events {
+            if let Some(objects) = &self.objects {
+                objects.output(&event);
+            }
             if !writers.contains_key(&event.app_id) {
                 if let Err(error) = make_directory(&self.directory, LOG_DIR_MODE) {
                     tracing::warn!(%error, "tenant logs have nowhere to go");
@@ -257,7 +268,6 @@ impl Drop for FileLogSink {
 mod tests {
     use super::*;
     use crate::test_support::{app_id, deployment_id, observed_at, tenant_restart};
-    use protocol::TenantLogStream;
 
     fn event(body: TenantLogBody, sequence: u64) -> TenantLogEvent {
         TenantLogEvent {

@@ -521,6 +521,7 @@ async fn test_host_over(
         nbd: crate::adapters::volumes::nbd::NbdDevices::new(commands.clone()),
         commands: commands.clone(),
         firewall: Arc::new(HostFirewall::new(commands.clone())),
+        telemetry: None,
         router: Router::new(metrics.clone(), None),
         tls: None,
         waker: Arc::new(NeverWoken),

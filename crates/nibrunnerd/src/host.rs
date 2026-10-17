@@ -33,6 +33,9 @@ pub struct Host {
     /// What every tenant's output is written to, held here as well as behind the receiver so that
     /// a pass can let an app's output go once the app itself is no longer on this host.
     pub logs: Arc<FileLogSink>,
+    /// What a control plane's bucket is sent of every labelled instance, when `[logs] sink` names
+    /// one.
+    pub telemetry: Option<Arc<crate::adapters::logs::ObjectSink>>,
     pub volumes: Arc<dyn VolumeBackend>,
     pub artifacts: Arc<dyn ArtifactStore>,
     pub payloads: Arc<dyn PayloadBuilder>,
