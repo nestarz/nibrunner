@@ -101,9 +101,10 @@ allowed_egress_endpoints = ["10.0.0.5:9000", "[fd00::5]:9000"]
 ```
 
 This allows TCP only to these exact endpoints, each an IP literal and a port; ranges and
-hostnames are refused. Named egress denies, the instance metadata endpoint and other guests
-still take precedence, and every other private destination stays denied. Run `nibrunnerd start`
-to apply the change.
+hostnames are refused, and so are loopback (`127.0.0.0/8`, `::1`) and the guest network
+(`10.201.0.0/16`), which a guest never reaches through the host. Named egress denies, the
+instance metadata endpoint and other guests still take precedence, and every other private
+destination stays denied. Run `nibrunnerd start` to apply the change.
 
 ## Environment variables
 

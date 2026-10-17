@@ -366,6 +366,7 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(v6.contains("ip6 daddr 2001:db8::10 tcp dport 443 accept"));
     assert!(v6.contains("fe80::/10"));
     assert!(v6.contains("2600:1f18:abcd::/56"));
+    assert!(v6.contains("ip6 daddr fd00::5 tcp dport 9000 accept comment \"allowed egress endpoint\""));
 
     let traffic = firewall.traffic().await.expect("the kernel lists its counters");
     assert!(traffic.contains_key(&protocol::AppId::parse("app-1").unwrap()));
