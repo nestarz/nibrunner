@@ -242,21 +242,32 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     Ok(host)
 }
 
-/// Absent when `[logs] sink` names no bucket.
+/// Absent when neither `[logs] sink` nor `[metrics] sink` names a bucket.
 fn open_telemetry(config: &HostConfig) -> Result<Option<Arc<ObjectSink>>, StartupError> {
     let refused = |error: TelemetryError| StartupError::Config(error.to_string());
-    config
+    let logs = config
         .logs
         .sink
         .as_ref()
         .map(|sink| {
-            Ok(ObjectSink::new((
+            Ok((
                 Bucket::open(&sink.store_url)?,
                 SealKey::read(&sink.seal_key_file)?,
-            )))
+            ))
         })
         .transpose()
-        .map_err(refused)
+        .map_err(refused)?;
+    let metrics = config
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.sink.as_deref())
+        .map(Bucket::open)
+        .transpose()
+        .map_err(refused)?;
+    if logs.is_none() && metrics.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ObjectSink::new(logs, metrics)))
 }
 
 struct DeferredWaker {
@@ -381,13 +392,22 @@ async fn answer_scrape(host: &Arc<Host>, path: &str) -> hyper::Response<http_bod
             )))
             .expect("a constant response is always buildable");
     }
+    let page = scrape_page(host).await;
+    hyper::Response::builder()
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Full::new(bytes::Bytes::from(page)))
+        .expect("a rendered page is always buildable")
+}
+
+/// The Prometheus page, rendered from what the report is built from at this moment.
+pub async fn scrape_page(host: &Arc<Host>) -> String {
     let report = crate::domain::report::writer::build(host, host_versions(host)).await;
     let snapshot = host.state.snapshot().await;
     let conntrack = crate::domain::metrics::Conntrack::read();
     if let Some(conntrack) = conntrack {
         host.metrics.conntrack.say(conntrack);
     }
-    let page = crate::domain::metrics::render(
+    crate::domain::metrics::render(
         &host.metrics,
         &crate::domain::metrics::Scrape {
             report: &report,
@@ -398,11 +418,7 @@ async fn answer_scrape(host: &Arc<Host>, path: &str) -> hyper::Response<http_bod
             memory_available_bytes: crate::domain::report::capacity::read_memory_available_bytes(),
             conntrack,
         },
-    );
-    hyper::Response::builder()
-        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .body(Full::new(bytes::Bytes::from(page)))
-        .expect("a rendered page is always buildable")
+    )
 }
 
 #[cfg(test)]

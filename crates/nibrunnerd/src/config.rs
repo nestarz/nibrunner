@@ -153,6 +153,9 @@ pub struct RawPorts {
 pub struct MetricsConfig {
     pub port: u16,
     pub listen_address: IpAddr,
+    /// Where the per-unit hour and day rollups of this page are written, every 300 s that a
+    /// counter moved: a control plane's `s3://<bucket>/fleets/<fleet>`.
+    pub sink: Option<String>,
 }
 
 /// Where something on this host asks what a guest holds.
@@ -575,6 +578,11 @@ mod file {
         pub(super) port: Option<u16>,
         /// An IP address to bind.
         pub(super) listen_address: Option<String>,
+        /// Optional. A control plane's `s3://<bucket>/fleets/<fleet>` (or a directory ending in
+        /// `fleets/<fleet>`): every 300 s that a counter moved, each labelled unit's counters are
+        /// added to `metrics/<hostId>/<yyyymmddhh>.json` and `<yyyymmdd>.json` there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) sink: Option<String>,
     }
 
     /// What a guest holds, listed on request over a socket on this machine. Nothing here is an
@@ -814,6 +822,7 @@ impl HostConfig {
         starter.metrics = Some(MetricsConfig {
             port: 9100,
             listen_address: IpAddr::from([127, 0, 0, 1]),
+            sink: None,
         });
         starter
     }
@@ -915,6 +924,7 @@ impl HostConfig {
             metrics: Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([127, 0, 0, 1]),
+                sink: Some("s3://telemetry-example/fleets/apps-example-com".to_string()),
             }),
             filesystem: Some(FilesystemConfig {
                 socket: PathBuf::from("/run/nibrunner/filesystem.sock"),
@@ -1025,6 +1035,7 @@ impl HostConfig {
             metrics: self.metrics.as_ref().map(|metrics| file::Metrics {
                 port: Some(metrics.port),
                 listen_address: Some(metrics.listen_address.to_string()),
+                sink: metrics.sink.clone(),
             }),
             filesystem: self.filesystem.as_ref().map(|filesystem| file::Filesystem {
                 socket: text(&filesystem.socket),
@@ -1196,6 +1207,11 @@ fn metrics(
     Ok(Some(MetricsConfig {
         port,
         listen_address: bind_address("metrics.listen_address", &document.listen_address)?,
+        sink: document
+            .sink
+            .as_deref()
+            .map(|sink| telemetry_sink("metrics.sink", sink))
+            .transpose()?,
     }))
 }
 
@@ -1893,6 +1909,7 @@ denied_egress_addresses_v6 = []
             Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([0, 0, 0, 0]),
+                sink: None,
             })
         );
 
@@ -1957,11 +1974,10 @@ denied_egress_addresses_v6 = []
             &format!("[logs]\nkeep_mib_per_app = 8\nsink = \"{sink}\"\n"),
         ));
         assert!(unsealed.contains("logs.seal_key_file"), "{unsealed}");
-        let fleetless = format!(
-            "[logs]\nkeep_mib_per_app = 8\nsink = \"{}\"\nseal_key_file = \"/etc/nibrunner/seal.key\"\n",
-            sink.replace("fleets/acme", "acme")
-        );
-        assert!(refused(&document(&[], &fleetless)).contains("logs.sink"));
+        let metrics = format!("[metrics]\nport = 9100\nlisten_address = \"127.0.0.1\"\nsink = \"{sink}\"\n");
+        assert_eq!(with(&metrics).metrics.unwrap().sink.as_deref(), Some(sink));
+        let fleetless = metrics.replace("fleets/acme", "acme");
+        assert!(refused(&document(&[], &fleetless)).contains("metrics.sink"));
     }
 
     #[test]
@@ -2344,6 +2360,7 @@ keep_mib_per_app = 64
             Some(MetricsConfig {
                 port: 9100,
                 listen_address: IpAddr::from([127, 0, 0, 1]),
+                sink: None,
             })
         );
         assert_eq!(config.logs.keep_bytes_per_app, 64 * 1024 * 1024);

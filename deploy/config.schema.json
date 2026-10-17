@@ -183,6 +183,10 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 1
+        },
+        "sink": {
+          "description": "Optional. A control plane's `s3://<bucket>/fleets/<fleet>` (or a directory ending in\n`fleets/<fleet>`): every 300 s that a counter moved, each labelled unit's counters are\nadded to `metrics/<hostId>/<yyyymmddhh>.json` and `<yyyymmdd>.json` there.",
+          "type": "string"
         }
       },
       "additionalProperties": false,

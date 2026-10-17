@@ -1,6 +1,6 @@
 ---
 title: Logs and metrics
-description: reported.json, per-app logs, the Prometheus endpoint, and shipping logs to a bucket.
+description: reported.json, per-app logs, the Prometheus endpoint, and shipping both to a bucket.
 ---
 
 ## reported.json
@@ -129,24 +129,30 @@ a warning once when usage reaches 80%, and once more when it drops back below.
   on a `zerofs` host, which ZeroFS uses.
 </Callout>
 
-## Ship logs to a bucket
+## Ship logs and metrics to a bucket
 
-A host can also send each app's output and its requests to an object store, in the objects a
-control plane reads. Only an instance whose `desired.json` entry carries `labels.app` is shipped; its
-`labels.rev` and `labels.context` and its `appId` (as `unit`) go on every line, and a cron run's
-output carries its `job` and `run` ids.
+A host can also send each app's output, its requests and an hourly rollup of its counters to an
+object store, in the objects a control plane reads. Only an instance whose `desired.json` entry carries `labels.app` is shipped; its
+`labels.rev` and `labels.context` and its `appId` (as `unit`) go on every line and counter, and a
+cron run's output carries its `job` and `run` ids.
 
 ```toml
 [logs]
 keep_mib_per_app = 256
 sink = "s3://my-bucket/fleets/my-fleet"
 seal_key_file = "/etc/nibrunner/seal.key"
+
+[metrics]
+listen_address = "127.0.0.1"
+port = 9100
+sink = "s3://my-bucket/fleets/my-fleet"
 ```
 
 | Object, under the sink | Written |
 |---|---|
 | `logs/<app>/live-<hostId>.jsonl.gz` | every 5 s that the app printed: its last 2 minutes, at most 256 KiB |
 | `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | every 5 minutes that it printed, and when `desired.json` stops naming it; named after its first line, never overwritten |
+| `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, per unit |
 
 Log objects are gzipped JSON lines sealed with XChaCha20-Poly1305 under the 32 raw bytes in
 `seal_key_file`, authenticated with `<fleet>/<key>`. A sink URL ends in `fleets/<fleet>`. A
