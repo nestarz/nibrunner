@@ -47,7 +47,15 @@ impl AppWaker {
         let deadline = tokio::time::Instant::now() + MEMORY_SETTLE_TIMEOUT;
         loop {
             let generation = self.host.state.memory_generation();
-            let shortfall_mib = match self.host.reserve_memory(app_id, *wanted).await {
+            let shortfall_mib = match self
+                .host
+                .reserve_memory(
+                    app_id,
+                    *wanted,
+                    crate::domain::reconcile::pressure::ReclaimPurpose::Wake,
+                )
+                .await
+            {
                 Ok(reservation) => return Ok(reservation),
                 Err(shortfall) => shortfall,
             };

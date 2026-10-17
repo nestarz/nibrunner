@@ -212,7 +212,11 @@ struct Due {
     late_ms: i64,
 }
 
-fn signals(snapshot: &HostSnapshot, record: &InstanceRecord, requests_open: u64) -> ActivitySignals {
+pub(crate) fn signals(
+    snapshot: &HostSnapshot,
+    record: &InstanceRecord,
+    requests_open: u64,
+) -> ActivitySignals {
     ActivitySignals {
         last_active_at_ms: snapshot.last_active_at_ms.get(&record.app_id).copied(),
         measured_at_ms: snapshot.last_measured_at_ms.get(&record.app_id).copied(),
@@ -231,6 +235,7 @@ fn due(
     let since = match reason {
         SleepReason::Quiet => signals.last_active_at_ms,
         SleepReason::LivedLongEnough => signals.started_at_ms,
+        SleepReason::MemoryPressure => signals.last_active_at_ms,
     };
     let for_ms = now - since.unwrap_or(now);
     let late_ms = allowance_ms(policy.sleep_when)
@@ -352,6 +357,7 @@ fn waited_out(snapshot: &HostSnapshot, app_id: &AppId, now: i64) -> bool {
 /// that put nothing to sleep returns none whatever was due, since run again at once it would try
 /// the same apps against the same full disk.
 pub async fn apply_sleep(host: &std::sync::Arc<Host>) -> usize {
+    super::pressure::apply(host).await;
     let policies: BTreeMap<AppId, ActivationPolicy> = {
         let cache = host.cache.lock().await;
         cache

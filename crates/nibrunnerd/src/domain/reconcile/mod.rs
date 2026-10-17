@@ -5,6 +5,7 @@ pub mod ingress;
 pub mod instances;
 pub mod network;
 pub mod plan;
+pub(crate) mod pressure;
 pub mod volumes;
 
 pub use plan::*;
@@ -129,7 +130,7 @@ async fn apply_holds(host: &Host, plan: &ReconcilePlan) {
     }
 }
 
-async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
+async fn apply_starts(host: &Arc<Host>, plan: &ReconcilePlan) {
     let starts: Vec<_> = plan
         .instances
         .iter()
@@ -161,7 +162,10 @@ async fn apply_starts(host: &Host, plan: &ReconcilePlan) {
     for desired in starts {
         let _transition = host.state.transition(&desired.app_id).await;
         let wanted = &desired.config.resources;
-        let _reservation = match host.reserve_memory(&desired.app_id, *wanted).await {
+        let _reservation = match host
+            .reserve_memory(&desired.app_id, *wanted, pressure::ReclaimPurpose::Deployment)
+            .await
+        {
             Ok(reservation) => reservation,
             Err(shortfall_mib) => {
                 instances::wait_for_room(host, desired, shortfall_mib).await;
@@ -1200,7 +1204,7 @@ mod tests {
         let host = test_host().await;
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
 
-        apply_starts(&host, &starting(desired_instance(|_| {}))).await;
+        apply_starts(host.arc(), &starting(desired_instance(|_| {}))).await;
 
         assert!(host.vms.calls().is_empty());
         assert!(host.state.record(&app_id()).await.is_none());
@@ -1212,7 +1216,7 @@ mod tests {
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
         host.state.modify(|snapshot| snapshot.isolated = true).await;
 
-        apply_starts(&host, &starting(desired_instance(|_| {}))).await;
+        apply_starts(host.arc(), &starting(desired_instance(|_| {}))).await;
 
         assert_eq!(host.vms.calls(), vec![VmCall::Boot]);
     }
@@ -1220,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn a_plan_with_nothing_to_start_asks_nothing_of_the_ruleset() {
         let host = test_host().await;
-        apply_starts(&host, &ReconcilePlan::default()).await;
+        apply_starts(host.arc(), &ReconcilePlan::default()).await;
         assert!(host.vms.calls().is_empty());
     }
 
@@ -1575,7 +1579,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_starts(&host, &plan).await;
+        apply_starts(host.arc(), &plan).await;
 
         assert_eq!(host.vms.calls(), vec![VmCall::Boot]);
     }

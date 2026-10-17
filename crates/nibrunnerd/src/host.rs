@@ -58,19 +58,50 @@ pub struct Host {
     pub datagram_activator: Option<Arc<DatagramActivator>>,
 }
 
+/// Quiet apps put to sleep for one start or wake before it is refused anyway.
+const MAX_RECLAIMED_FOR_ONE_START: usize = 4;
+
 impl Host {
-    /// A start's or a wake's memory, held until its record accounts for it.
+    /// A start's or a wake's memory, held until its record accounts for it. With `reclaim`, quiet
+    /// on-request apps are put to sleep, lowest priority first, until it fits or none is left.
     pub(crate) async fn reserve_memory(
-        &self,
+        self: &Arc<Self>,
         app_id: &AppId,
         wanted: protocol::InstanceResources,
+        purpose: crate::domain::reconcile::pressure::ReclaimPurpose,
     ) -> Result<crate::state::MemoryReservation, u64> {
-        self.reserve_memory_once(
-            app_id,
-            wanted,
-            crate::domain::memory_admission::MemoryOperation::Start,
-        )
-        .await
+        use crate::domain::memory_admission::MemoryOperation;
+        let first = self
+            .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+            .await;
+        if first.is_ok()
+            || !self
+                .config
+                .memory_admission
+                .as_ref()
+                .is_some_and(|policy| policy.reclaim)
+        {
+            return first;
+        }
+        let Ok(_reclaiming) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.state.reclaim.lock()).await
+        else {
+            return first;
+        };
+        let mut result = self
+            .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+            .await;
+        for _ in 0..MAX_RECLAIMED_FOR_ONE_START {
+            if result.is_ok()
+                || !crate::domain::reconcile::pressure::reclaim_one(self, purpose, Some(app_id)).await
+            {
+                return result;
+            }
+            result = self
+                .reserve_memory_once(app_id, wanted, MemoryOperation::Start)
+                .await;
+        }
+        result
     }
 
     pub(crate) async fn reserve_memory_once(

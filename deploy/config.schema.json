@@ -190,11 +190,17 @@
         "pool": {
           "description": "A root-level systemd slice the operator has already bounded. Every VMM's cgroup is\nplaced under it, and admission respects what is left of it.",
           "$ref": "#/$defs/memory_admission.pool"
+        },
+        "reclaim": {
+          "description": "Put quiet on-request apps to sleep before refusing a start or a wake, and while the host or\nthe pool is short of memory.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
       "required": [
         "mode",
+        "reclaim",
         "headroom_mib"
       ]
     },

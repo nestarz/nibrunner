@@ -15,6 +15,7 @@ use crate::domain::report::InstanceRecord;
 #[derive(Debug, Default, Clone)]
 pub struct HostSnapshot {
     pub records: BTreeMap<AppId, InstanceRecord>,
+    pub(crate) memory_pressure: crate::domain::reconcile::pressure::PressureState,
     // Only ever this daemon's own account of what it set out on: a restart starts each over,
     // and so is measured as one.
     pub deploys: BTreeMap<AppId, Deploy>,
@@ -115,6 +116,9 @@ pub struct HostState {
     transitions: Mutex<Transitions>,
     cron_runs: CronRuns,
     memory_reservations: SharedReservations,
+    /// Held by whatever is putting quiet apps to sleep to make room, so that two of them do not
+    /// pick the same victims.
+    pub(crate) reclaim: tokio::sync::Mutex<()>,
 }
 
 impl HostState {
@@ -126,6 +130,7 @@ impl HostState {
             transitions: Mutex::new(BTreeMap::new()),
             cron_runs: Arc::new(Mutex::new(BTreeMap::new())),
             memory_reservations: Arc::default(),
+            reclaim: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -261,6 +266,18 @@ impl HostState {
         })
     }
 
+    pub(crate) fn try_transition(&self, app_id: &AppId) -> Option<OwnedMutexGuard<()>> {
+        let lock = {
+            let mut transitions = self
+                .transitions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            transitions.retain(|_, lock| Arc::strong_count(lock) > 1);
+            transitions.entry(app_id.clone()).or_default().clone()
+        };
+        lock.try_lock_owned().ok()
+    }
+
     /// The lock a sleep or a wake of this app holds for as long as it is moving the microVM.
     /// One transition of an app at a time, so that neither finds the other half way through a
     /// snapshot; and each app's own, so that the sleeps a pass runs side by side wait on nothing
@@ -308,6 +325,11 @@ impl HostState {
 
     pub async fn record(&self, app_id: &AppId) -> Option<InstanceRecord> {
         self.snapshot.read().await.records.get(app_id).cloned()
+    }
+
+    /// The snapshot held for writing, for a decision that must not race what it decides on.
+    pub(crate) async fn locked_snapshot(&self) -> tokio::sync::RwLockWriteGuard<'_, HostSnapshot> {
+        self.snapshot.write().await
     }
 
     pub async fn modify<T>(&self, change: impl FnOnce(&mut HostSnapshot) -> T) -> T {
