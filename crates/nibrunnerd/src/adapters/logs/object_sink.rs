@@ -14,8 +14,10 @@ use protocol::{AppId, DeploymentId, HostDesiredState, InstanceLabels, TenantLogS
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::adapters::proxy::encode::Encoding;
 use crate::adapters::proxy::http_log::HttpRequestRecord;
 use crate::domain::metrics::rollup::{hour_key, micros_rfc3339, mmss};
+use crate::domain::metrics::CacheOutcome;
 use crate::ports::{TenantLogBody, TenantLogEvent};
 
 pub const LIVE_WINDOW_S: i64 = 120;
@@ -185,6 +187,11 @@ pub struct LogLine {
     pub job: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache: Option<CacheOutcome>,
+    /// The coding the response left the proxy in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) encoding: Option<Encoding>,
 }
 
 impl LogLine {
@@ -457,6 +464,8 @@ impl ObjectSink {
                 status: Some(record.status),
                 dur_us: Some(record.duration_micros),
                 wake_us: record.wake_micros,
+                cache: record.cache,
+                encoding: record.encoding,
                 ..l
             },
         );
@@ -643,6 +652,9 @@ mod tests {
                 path: Some("/checkout".into()),
                 status: Some(500),
                 dur_us: Some(312_000),
+                wake_us: Some(240_000),
+                cache: Some(CacheOutcome::Miss),
+                encoding: Some(Encoding::Br),
                 ..line("2026-10-16T12:05:02.500000Z", LogKind::Req)
             },
             LogLine {
@@ -757,7 +769,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_line_carries_the_labels_of_the_deployment_that_wrote_it_and_a_cron_run_its_ids() {
+    async fn a_line_carries_the_labels_of_the_deployment_that_wrote_it_a_cron_run_its_ids_and_a_request_what_the_proxy_did(
+    ) {
         let (sink, store) = sink();
         let cron = TenantLogEvent {
             body: TenantLogBody::CronData {
@@ -776,7 +789,8 @@ mod tests {
         let uri: hyper::Uri = "/checkout".parse().unwrap();
         let record = HttpRequestRecord::new("GET", &uri, 500, 312_000, deployment_id())
             .labelled(labels("r-2"))
-            .woken_for(Some(240_000));
+            .woken_for(Some(240_000))
+            .served_as(Some(CacheOutcome::Stale), Some(Encoding::Gzip));
         sink.request(&app_id(), &record);
         sink.forget(&app_id()).await.unwrap();
         let chunk = read(&store, "logs/site/2026101612/0500-ovh-1.jsonl.gz")
@@ -792,13 +806,12 @@ mod tests {
             (Some("tick"), Some("nightly"), Some("r-1"))
         );
         assert_eq!(
-            (
-                chunk[1].k,
-                chunk[1].rev.as_str(),
-                chunk[1].status,
-                chunk[1].wake_us
-            ),
-            (LogKind::Req, "r-2", Some(500), Some(240_000))
+            (chunk[1].k, chunk[1].rev.as_str(), chunk[1].status),
+            (LogKind::Req, "r-2", Some(500))
+        );
+        assert_eq!(
+            (chunk[1].wake_us, chunk[1].cache, chunk[1].encoding),
+            (Some(240_000), Some(CacheOutcome::Stale), Some(Encoding::Gzip))
         );
     }
 

@@ -23,7 +23,8 @@ const GZIP_LEVEL: i32 = 6;
 const BYTES_PER_KIB: u64 = 1024;
 
 /// The representation a body travels in, as `Content-Encoding` names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Encoding {
     Br,
     Gzip,

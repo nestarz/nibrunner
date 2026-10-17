@@ -42,9 +42,9 @@ pub struct HttpRequestRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) wake_micros: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache: Option<&'static str>,
+    pub(crate) cache: Option<CacheOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    encoding: Option<&'static str>,
+    pub(crate) encoding: Option<Encoding>,
 }
 
 /// The header on which the activator hands back how long it held a request for its app to wake,
@@ -91,8 +91,8 @@ impl HttpRequestRecord {
     /// What the response cache did with the request, and the coding its body left in: `None` for
     /// each on a host without that part of `[proxy.http]`.
     pub(crate) fn served_as(mut self, cache: Option<CacheOutcome>, encoding: Option<Encoding>) -> Self {
-        self.cache = cache.map(CacheOutcome::as_str);
-        self.encoding = encoding.map(Encoding::token);
+        self.cache = cache;
+        self.encoding = encoding;
         self
     }
 

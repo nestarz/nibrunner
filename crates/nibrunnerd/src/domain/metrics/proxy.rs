@@ -50,7 +50,8 @@ pub const OUTCOMES: [Outcome; 5] = [
 
 /// What the response cache did with a request: answered it from a fresh entry, from a stale one
 /// while it revalidates or because the app failed, asked the app, or was not the place for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CacheOutcome {
     Hit,
     Stale,

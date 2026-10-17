@@ -139,7 +139,9 @@ a warning once when usage reaches 80%, and once more when it drops back below.
 A host can also send each app's output, its requests and an hourly rollup of its counters to an
 object store, in the objects a control plane reads. Only an instance whose `desired.json` entry carries `labels.app` is shipped; its
 `labels.rev` and `labels.context` and its `appId` (as `unit`) go on every line and counter, and a
-cron run's output carries its `job` and `run` ids.
+cron run's output carries its `job` and `run` ids. A request line carries `wake_us` when it waited
+for a wake, and `cache` and `encoding` on a host with
+[`[proxy.http.cache]` or `[proxy.http.encode]`](/docs/guides/response-cache).
 
 ```toml
 [logs]
@@ -157,7 +159,7 @@ sink = "s3://my-bucket/fleets/my-fleet"
 |---|---|
 | `logs/<app>/live-<hostId>.jsonl.gz` | every 5 s that the app printed: its last 2 minutes, at most 256 KiB |
 | `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | every 5 minutes that it printed, and when `desired.json` stops naming it; named after its first line, never overwritten |
-| `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, per unit |
+| `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, cache outcomes and bytes compressed, per unit |
 
 Log objects are gzipped JSON lines sealed with XChaCha20-Poly1305 under the 32 raw bytes in
 `seal_key_file`, authenticated with `<fleet>/<key>`. A sink URL ends in `fleets/<fleet>`. A
