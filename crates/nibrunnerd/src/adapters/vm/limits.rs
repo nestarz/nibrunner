@@ -15,6 +15,7 @@ pub(crate) struct VmLimits {
     cpu_quota_us: u64,
     memory_max_bytes: u64,
     snapshot_memory_max_bytes: u64,
+    controls: Option<RuntimeControls>,
 }
 
 impl VmLimits {
@@ -30,17 +31,37 @@ impl VmLimits {
             cpu_quota_us: u64::from(machine.vcpu_count) * CPU_PERIOD_US,
             memory_max_bytes,
             snapshot_memory_max_bytes: memory_max_bytes + guest_bytes,
+            controls: None,
         })
     }
 
+    /// The jailer writes these as it makes the cgroup, before the VMM runs: a write from here
+    /// once the jailer is spawned would race it to the cgroup's creation.
+    pub(crate) fn constrain(&mut self, controls: RuntimeControls) {
+        self.controls = Some(controls);
+    }
+
     pub(crate) fn configure(&self, command: &mut tokio::process::Command) {
-        command
-            .arg("--cgroup")
-            .arg(format!("cpu.max={} {CPU_PERIOD_US}", self.cpu_quota_us))
-            .arg("--cgroup")
-            .arg(format!("memory.max={}", self.memory_max_bytes))
-            .arg("--cgroup")
-            .arg("memory.swap.max=0");
+        let memory_max = ("memory.max", self.memory_max_bytes.to_string());
+        let files: Vec<_> = match &self.controls {
+            Some(controls) => std::iter::once(memory_max)
+                .chain(controls.cgroup_files())
+                .collect(),
+            None => vec![
+                ("cpu.max", format!("{} {CPU_PERIOD_US}", self.cpu_quota_us)),
+                memory_max,
+                ("memory.swap.max", "0".to_string()),
+            ],
+        };
+        for (file, value) in files {
+            command.arg("--cgroup").arg(format!("{file}={value}"));
+        }
+    }
+
+    pub(crate) fn write_oom_score(&self, pid: i32) -> std::io::Result<()> {
+        self.controls
+            .as_ref()
+            .map_or(Ok(()), |controls| controls.write_oom_score(pid))
     }
 
     pub(crate) fn reserve_snapshot_memory(
@@ -129,15 +150,26 @@ impl RuntimeControls {
     /// Writes the controls into a running VMM's cgroup and its OOM score. Each cgroup file takes its
     /// value whole, so a VMM is never seen with half of a change.
     pub(crate) fn write(&self, cgroup: &Path, pid: i32) -> std::io::Result<()> {
-        let write = |name: &str, value: String| std::fs::write(cgroup.join(name), value);
-        write("cpu.max", format!("{} {CPU_PERIOD_US}", self.cpu_quota_us))?;
-        write("memory.low", self.memory_low_bytes.to_string())?;
-        write(
-            "memory.high",
-            self.memory_high_bytes
-                .map_or_else(|| "max".to_string(), |bytes| bytes.to_string()),
-        )?;
-        write("memory.swap.max", self.swap_max_bytes.to_string())?;
+        for (file, value) in self.cgroup_files() {
+            std::fs::write(cgroup.join(file), value)?;
+        }
+        self.write_oom_score(pid)
+    }
+
+    fn cgroup_files(&self) -> [(&'static str, String); 4] {
+        [
+            ("cpu.max", format!("{} {CPU_PERIOD_US}", self.cpu_quota_us)),
+            ("memory.low", self.memory_low_bytes.to_string()),
+            (
+                "memory.high",
+                self.memory_high_bytes
+                    .map_or_else(|| "max".to_string(), |bytes| bytes.to_string()),
+            ),
+            ("memory.swap.max", self.swap_max_bytes.to_string()),
+        ]
+    }
+
+    fn write_oom_score(&self, pid: i32) -> std::io::Result<()> {
         std::fs::write(
             format!("/proc/{pid}/oom_score_adj"),
             self.oom_score_adj.to_string(),
@@ -402,6 +434,44 @@ mod tests {
                 .memory_high_bytes,
             Some(1024 * BYTES_PER_MIB),
             "a target is capped at the guest's memory"
+        );
+    }
+
+    #[test]
+    fn the_jailer_is_given_an_instances_controls_so_its_cgroup_is_made_with_them() {
+        let mut vm = VmLimits::for_machine(&machine(2, 1024)).unwrap();
+        vm.constrain(RuntimeControls::for_instance(
+            resources(2, 1024),
+            Some(&limits(
+                Some(50),
+                Some(protocol::MemoryPolicy {
+                    target_mib: 384.try_into().unwrap(),
+                    swap_mib: 512,
+                    priority: MemoryPriority::Build,
+                }),
+            )),
+        ));
+        let mut command = tokio::process::Command::new("jailer");
+        vm.configure(&mut command);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--cgroup",
+                &format!("memory.max={}", vm.memory_max_bytes),
+                "--cgroup",
+                "cpu.max=50000 100000",
+                "--cgroup",
+                "memory.low=0",
+                "--cgroup",
+                &format!("memory.high={}", 384 * BYTES_PER_MIB),
+                "--cgroup",
+                &format!("memory.swap.max={}", 512 * BYTES_PER_MIB),
+            ]
         );
     }
 
