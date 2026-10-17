@@ -1008,4 +1008,17 @@ pub struct HostReportedState {
     /// that only reads this file learns from it that its last write did not land, and why.
     #[serde(default)]
     pub message: Option<StateMessage>,
+    /// What the proxy holds. Absent when `[proxy.http.cache]` is not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ReportedProxy>,
+}
+
+/// The proxy's own state, beside the instances it serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedProxy {
+    /// What the response cache's stored answers weigh now, headers and bodies as stored, against
+    /// `[proxy.http.cache] memory_mib`. The `nibrunner_proxy_cache_bytes` gauge, as of this report.
+    pub cache_bytes: u64,
 }

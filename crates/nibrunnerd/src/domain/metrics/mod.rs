@@ -548,6 +548,7 @@ pub(crate) mod tests {
             accepted_digest: None,
             accepted_revision: None,
             message: None,
+            proxy: None,
         }
     }
 

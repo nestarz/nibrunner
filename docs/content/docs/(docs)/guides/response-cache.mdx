@@ -96,3 +96,7 @@ on a host with either section. The metrics are in the
 | `nibrunner_proxy_cache_requests_total` | `app`, `outcome` |
 | `nibrunner_proxy_cache_bytes` | none |
 | `nibrunner_proxy_encode_bytes_total` | `app`, `encoding`, `direction` |
+
+`reported.json` carries the cache's weight as `proxy.cacheBytes` on a host with
+`[proxy.http.cache]`, so a control plane that reads the report needs no scrape for it. It is
+refreshed with the report's heartbeat, not on every answer stored.
