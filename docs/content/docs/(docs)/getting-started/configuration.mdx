@@ -22,7 +22,8 @@ the key and the reason.
   is an error that names the key.
 - **Unknown keys are errors.** A typo is reported as an unknown key, not as a missing one.
 - **Only whole sections are optional.** `[proxy.http.tls]`, `[proxy.raw]`, `[metrics]` and
-  `[logs]` and `[network.host_tcp]` can be omitted. If present, they must be complete.
+  `[logs]` and `[network.host_tcp]` can be omitted. If present, they must be complete. The one
+  optional key is `allowed_egress_endpoints` in `[network]`.
 
 Example errors:
 
@@ -82,6 +83,22 @@ Replace these example addresses with the host's public addresses. This allows TC
 these exact endpoints. Other host ports and addresses, including management services, remain
 blocked. Named egress denies still take precedence. Removing an endpoint also blocks existing
 guest-initiated connections to it. Run `nibrunnerd start` to apply the change.
+
+## Reaching one private endpoint from a guest
+
+Guests cannot open connections to private destinations (RFC 1918, link-local, loopback, CGNAT,
+and their IPv6 counterparts). To let them reach one service on your own network, such as an
+object store, name its exact address and port:
+
+```toml
+[network]
+allowed_egress_endpoints = ["10.0.0.5:9000", "[fd00::5]:9000"]
+```
+
+This allows TCP only to these exact endpoints, each an IP literal and a port; ranges and
+hostnames are refused. Named egress denies, the instance metadata endpoint and other guests
+still take precedence, and every other private destination stays denied. Run `nibrunnerd start`
+to apply the change.
 
 ## Environment variables
 
