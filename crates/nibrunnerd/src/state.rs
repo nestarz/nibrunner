@@ -74,12 +74,47 @@ impl Drop for CronActivity {
     }
 }
 
+#[derive(Clone)]
+struct ReservedMemory {
+    resources: protocol::InstanceResources,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct MemoryReservations {
+    // Moves with every reservation taken or given back, so that readings taken before one cannot
+    // discount what it holds.
+    generation: u64,
+    held: BTreeMap<AppId, ReservedMemory>,
+}
+
+type SharedReservations = Arc<Mutex<MemoryReservations>>;
+
+/// Memory a start, a wake or a snapshot holds until its instance record accounts for it. Two of
+/// them never admit against the same room.
+pub(crate) struct MemoryReservation {
+    app_id: AppId,
+    reservations: SharedReservations,
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reservations.held.remove(&self.app_id);
+        reservations.generation = reservations.generation.wrapping_add(1);
+    }
+}
+
 pub struct HostState {
     snapshot: RwLock<HostSnapshot>,
     refresh: Notify,
     report: Notify,
     transitions: Mutex<Transitions>,
     cron_runs: CronRuns,
+    memory_reservations: SharedReservations,
 }
 
 impl HostState {
@@ -90,6 +125,139 @@ impl HostState {
             report: Notify::new(),
             transitions: Mutex::new(BTreeMap::new()),
             cron_runs: Arc::new(Mutex::new(BTreeMap::new())),
+            memory_reservations: Arc::default(),
+        })
+    }
+
+    pub(crate) fn memory_generation(&self) -> u64 {
+        self.memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    /// Whether anything other than `app` is starting or holds a reservation: something whose
+    /// memory may settle soon enough for a wake to wait for it.
+    pub(crate) async fn other_memory_transitions(&self, app: &AppId) -> bool {
+        let snapshot = self.snapshot.read().await;
+        if snapshot
+            .records
+            .values()
+            .any(|record| &record.app_id != app && record.state == protocol::InstanceState::Starting)
+        {
+            return true;
+        }
+        self.memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .held
+            .keys()
+            .any(|held| held != app)
+    }
+
+    /// Called under the app's transition lock. Admits `wanted` beside every record that holds memory
+    /// and every reservation not yet accounted for by one, strictly against ceilings and, when
+    /// `measured` is given, against what is measured too: `observe` only logs it, and a pool bounds
+    /// it.
+    pub(crate) async fn reserve_memory(
+        &self,
+        capacity_mib: u64,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+        operation: crate::domain::memory_admission::MemoryOperation,
+        measured: Option<(
+            crate::config::MemoryAdmissionMode,
+            crate::domain::memory_admission::MemoryReadings,
+        )>,
+    ) -> Result<MemoryReservation, u64> {
+        use crate::domain::memory_admission::MemoryOperation;
+        let snapshot = self.snapshot.read().await;
+        let mut reservations = self
+            .memory_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records: Vec<_> = snapshot
+            .records
+            .values()
+            .filter(|record| &record.app_id != app_id && !reservations.held.contains_key(&record.app_id))
+            .cloned()
+            .collect();
+        let mut committed = crate::domain::report::capacity::committed_resources(&records);
+        committed.extend(reservations.held.values().map(|reserved| reserved.resources));
+        let strict_shortfall = match operation {
+            MemoryOperation::Start => {
+                crate::domain::report::capacity::memory_shortfall_mib(capacity_mib, &committed, &wanted)
+            }
+            // Strict admission already charged this VM's whole ceiling; sleeping it gives that back.
+            MemoryOperation::Snapshot => 0,
+        };
+        let mut shortfall = strict_shortfall;
+        let mut bytes = crate::adapters::vm::limits::memory_max_bytes(wanted.memory_mib);
+        if measured.as_ref().is_some_and(|(_, readings)| {
+            readings.pool.is_some() && !readings.is_fresh(crate::clock::now_ms())
+        }) {
+            // A reading that waited this long for the lock may no longer describe the host.
+            return Err(bytes.div_ceil(1_048_576));
+        }
+        if let Some((mode, mut readings)) = measured {
+            if readings.reservation_generation != reservations.generation {
+                // A reservation taken or given back since the reading: its working sets no longer
+                // stand for what is held.
+                readings.apps.clear();
+            }
+            bytes = readings.ceiling(app_id, wanted);
+            let reserved_bytes = reservations
+                .held
+                .values()
+                .fold(0u64, |total, held| total.saturating_add(held.bytes));
+            let resident_reserved_bytes = reservations.held.iter().fold(0u64, |total, (held_app, held)| {
+                let resident = snapshot
+                    .records
+                    .get(held_app)
+                    .map_or(0, |record| readings.anonymous_resident_bytes(record))
+                    .min(held.bytes);
+                total.saturating_add(resident)
+            });
+            let wanted_resident_bytes = snapshot
+                .records
+                .get(app_id)
+                .map_or(0, |record| readings.anonymous_resident_bytes(record))
+                .min(bytes);
+            let measured_shortfall = readings.shortfall_mib(
+                capacity_mib,
+                &records,
+                reserved_bytes.saturating_add(bytes),
+                resident_reserved_bytes.saturating_add(wanted_resident_bytes),
+                0,
+            );
+            tracing::info!(
+                %app_id,
+                ?mode,
+                reservation_mib = bytes.div_ceil(1_048_576),
+                strict_shortfall_mib = strict_shortfall,
+                measured_shortfall_mib = measured_shortfall,
+                "memory admission evaluated"
+            );
+            if readings.pool.is_some() {
+                shortfall = strict_shortfall
+                    .max(measured_shortfall)
+                    .max(readings.strict_pool_shortfall_mib(&records, reserved_bytes, bytes));
+            }
+        }
+        if shortfall > 0 {
+            return Err(shortfall);
+        }
+        reservations.held.insert(
+            app_id.clone(),
+            ReservedMemory {
+                resources: wanted,
+                bytes,
+            },
+        );
+        reservations.generation = reservations.generation.wrapping_add(1);
+        Ok(MemoryReservation {
+            app_id: app_id.clone(),
+            reservations: self.memory_reservations.clone(),
         })
     }
 
@@ -242,6 +410,100 @@ mod tests {
     use super::*;
     use crate::test_support::{app_id, instance_record, volume_id};
     use protocol::{InstanceState, VolumeState};
+
+    use crate::config::MemoryAdmissionMode::Observe;
+    use crate::domain::memory_admission::{MemoryOperation, MemoryReadings, PoolMemory};
+
+    type Measured = Option<(crate::config::MemoryAdmissionMode, MemoryReadings)>;
+
+    fn measured(mode: crate::config::MemoryAdmissionMode, available_mib: u64) -> Measured {
+        Some((
+            mode,
+            MemoryReadings {
+                pool: None,
+                reservation_generation: 0,
+                available_bytes: available_mib * 1_048_576,
+                headroom_bytes: 1024 * 1_048_576,
+                measured_at_ms: crate::clock::now_ms(),
+                apps: BTreeMap::new(),
+            },
+        ))
+    }
+
+    async fn reserve(
+        state: &HostState,
+        room_mib: u64,
+        app: &AppId,
+        measured: Measured,
+    ) -> Result<MemoryReservation, u64> {
+        state
+            .reserve_memory(
+                room_mib,
+                app,
+                protocol::DEFAULT_INSTANCE_RESOURCES,
+                MemoryOperation::Start,
+                measured,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn observation_preserves_strict_admission_even_when_the_host_measurement_disagrees() {
+        let state = HostState::shared();
+        assert!(reserve(&state, 8192, &app_id(), measured(Observe, 0))
+            .await
+            .is_ok());
+        assert!(reserve(&state, 0, &app_id(), measured(Observe, 8192))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pool_admission_refuses_a_stale_reading() {
+        let state = HostState::shared();
+        let (mode, mut readings) = measured(Observe, 8192).unwrap();
+        readings.measured_at_ms -= 5001;
+        readings.pool = Some(PoolMemory {
+            current_bytes: 0,
+            reclaimable_file_bytes: 0,
+            high_bytes: 1800 * 1_048_576,
+            max_bytes: 2048 * 1_048_576,
+        });
+        assert!(reserve(&state, 8192, &app_id(), Some((mode, readings)))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_starts_and_wakes_cannot_reserve_the_same_capacity() {
+        let state = HostState::shared();
+        let room = u64::from(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib);
+        let second = AppId::parse("app-2").unwrap();
+        let first = app_id();
+        let (one, two) = tokio::join!(
+            reserve(&state, room, &first, None),
+            reserve(&state, room, &second, None)
+        );
+        assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+        drop(one);
+        drop(two);
+        assert!(reserve(&state, room, &second, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_reservation_and_its_starting_record_are_counted_once_until_the_guard_is_released() {
+        let state = HostState::shared();
+        let room = u64::from(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib) * 2;
+        let second = AppId::parse("app-2").unwrap();
+        let held = reserve(&state, room, &app_id(), None).await.ok().unwrap();
+        state
+            .put_record(instance_record(|record| record.state = InstanceState::Starting))
+            .await;
+        assert!(reserve(&state, room, &second, None).await.is_ok());
+        drop(held);
+        assert!(reserve(&state, room, &second, None).await.is_ok());
+        assert!(reserve(&state, room / 2, &second, None).await.is_err());
+    }
 
     #[test]
     fn cron_activity_lasts_until_the_last_command_finishes() {

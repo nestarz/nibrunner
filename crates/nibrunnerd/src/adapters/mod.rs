@@ -1,4 +1,5 @@
 pub mod artifact_store;
+pub(crate) mod cgroup;
 pub mod cron_execution;
 pub mod cron_registration;
 pub mod exec;

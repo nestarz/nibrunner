@@ -194,11 +194,22 @@ impl VmProcesses {
         if record.jail_uid.is_some() && process_uid(record.pid) != record.jail_uid {
             return None;
         }
-        let cgroup = record
-            .jail_root
-            .is_some()
-            .then(|| super::limits::cgroup_path(app_id));
-        super::memory::read_process(record.pid, cgroup)
+        super::memory::read_process(record.pid)
+    }
+
+    /// The cgroup a running VMM is in, read from the process so that one spawned before a pool was
+    /// configured is still found where it is. `None` once it is not running.
+    pub fn cgroup(&self, app_id: &AppId) -> Option<std::path::PathBuf> {
+        let record = self.read_record(app_id)?;
+        if record.host_boot_id != self.boot_id || record.exit().is_some() || !is_alive(record.pid) {
+            return None;
+        }
+        if record.jail_uid.is_some() && process_uid(record.pid) != record.jail_uid {
+            return None;
+        }
+        crate::adapters::cgroup::cgroup_path(
+            &std::fs::read_to_string(format!("/proc/{}/cgroup", record.pid)).ok()?,
+        )
     }
 
     pub(crate) async fn spawn(
@@ -234,7 +245,7 @@ impl VmProcesses {
             .arg("--cgroup-version")
             .arg("2")
             .arg("--parent-cgroup")
-            .arg(super::limits::CGROUP_PARENT);
+            .arg(super::limits::cgroup_parent());
         jail.limits.configure(&mut command);
         command.arg("--").arg("--api-sock").arg("/api.sock");
         if boot {

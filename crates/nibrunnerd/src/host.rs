@@ -59,45 +59,67 @@ pub struct Host {
 }
 
 impl Host {
-    /// Under `[memory_admission] mode = "observe"`, what a measured decision would have said about
-    /// a start or a wake the ceilings decided, logged beside it. It never changes the decision.
-    pub(crate) async fn observe_memory_admission(
+    /// A start's or a wake's memory, held until its record accounts for it.
+    pub(crate) async fn reserve_memory(
         &self,
         app_id: &AppId,
-        wanted: &protocol::InstanceResources,
-        records: &[crate::domain::report::InstanceRecord],
-        strict_shortfall_mib: u64,
-    ) {
+        wanted: protocol::InstanceResources,
+    ) -> Result<crate::state::MemoryReservation, u64> {
+        self.reserve_memory_once(
+            app_id,
+            wanted,
+            crate::domain::memory_admission::MemoryOperation::Start,
+        )
+        .await
+    }
+
+    pub(crate) async fn reserve_memory_once(
+        &self,
+        app_id: &AppId,
+        wanted: protocol::InstanceResources,
+        operation: crate::domain::memory_admission::MemoryOperation,
+    ) -> Result<crate::state::MemoryReservation, u64> {
         let Some(policy) = &self.config.memory_admission else {
-            return;
+            return self
+                .state
+                .reserve_memory(self.guest_memory_mib, app_id, wanted, operation, None)
+                .await;
         };
-        let Some(available_bytes) = crate::domain::report::capacity::read_memory_available_bytes() else {
-            return;
+        let measured = self.memory_readings().await;
+        if measured.is_none() && policy.pool.is_some() {
+            tracing::warn!(%app_id, "memory admission waits for a host memory reading");
+            return Err(u64::from(wanted.memory_mib));
+        }
+        self.state
+            .reserve_memory(self.guest_memory_mib, app_id, wanted, operation, measured)
+            .await
+    }
+
+    /// What the host and every VM it runs were measured at just now.
+    pub(crate) async fn memory_readings(
+        &self,
+    ) -> Option<(
+        crate::config::MemoryAdmissionMode,
+        crate::domain::memory_admission::MemoryReadings,
+    )> {
+        let policy = self.config.memory_admission.as_ref()?;
+        let reservation_generation = self.state.memory_generation();
+        let records = self.state.records().await;
+        let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
+        let apps = self.vms.memory(&ids).await;
+        let pool = match &policy.pool {
+            None => None,
+            Some(configuration) => Some(crate::adapters::cgroup::read_pool(configuration).ok()?),
         };
-        let others: Vec<_> = records
-            .iter()
-            .filter(|record| &record.app_id != app_id)
-            .cloned()
-            .collect();
-        let ids: Vec<_> = others.iter().map(|record| record.app_id.clone()).collect();
         let readings = crate::domain::memory_admission::MemoryReadings {
-            available_bytes,
+            pool,
+            reservation_generation,
+            available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
             headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
             measured_at_ms: crate::clock::now_ms(),
-            apps: self.vms.memory(&ids).await,
+            apps,
         };
-        let measured_shortfall_mib = readings.shortfall_mib(
-            self.guest_memory_mib,
-            &others,
-            crate::domain::memory_admission::MemoryReadings::ceiling(*wanted),
-        );
-        tracing::info!(
-            %app_id,
-            mode = ?policy.mode,
-            strict_shortfall_mib,
-            measured_shortfall_mib,
-            "memory admission evaluated"
-        );
+        Some((policy.mode, readings))
     }
 
     /// Takes up every instance's `limits` without a new deployment: the proxy's per-instance
