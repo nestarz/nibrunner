@@ -72,6 +72,10 @@ certificate = "/etc/nibrunner/tls/origin-pull-ca.pem"
 host_concurrent = 128
 app_concurrent = 16
 
+[proxy.http.cache]
+memory_mib = 128
+max_entry_kib = 1024
+
 [proxy.http.encode]
 encodings = ["br", "gzip"]
 min_kib = 1

@@ -273,6 +273,10 @@
       "description": "The one HTTP listener, where the edge reaches it. One per host: nothing here redirects, so a\nplain port beside a TLS one would serve every app both ways forever.",
       "type": "object",
       "properties": {
+        "cache": {
+          "description": "Absent caches nothing. Changes require `nibrunnerd start`.",
+          "$ref": "#/$defs/proxy.http.cache"
+        },
         "concurrency": {
           "description": "Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.",
           "$ref": "#/$defs/proxy.http.concurrency"
@@ -303,6 +307,30 @@
         "port"
       ]
     },
+    "proxy.http.cache": {
+      "description": "A shared response cache in front of every app, RFC 9111 to the letter: only what the app's own\nheaders make storable for an explicit lifetime is kept, so an app that says nothing about caching\nis never cached. A hit is answered without waking the app or counting as its activity. Absent\ncaches nothing.",
+      "type": "object",
+      "properties": {
+        "max_entry_kib": {
+          "description": "The largest body stored, as stored — after compression — in KiB. A larger one is still\nserved, streamed through without being kept.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1048576,
+          "minimum": 1
+        },
+        "memory_mib": {
+          "description": "What every stored response may weigh together, headers and bodies, in MiB. The least\nrecently and least often used go first. Changes require `nibrunnerd start`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "memory_mib",
+        "max_entry_kib"
+      ]
+    },
     "proxy.http.concurrency": {
       "description": "Optional limits on requests through the hostname router. Omission preserves unrestricted ingress.",
       "type": "object",
@@ -329,7 +357,7 @@
       ]
     },
     "proxy.http.encode": {
-      "description": "Compression of responses on their way out, negotiated from the visitor's `Accept-Encoding`,\nonce per response. Absent passes every body on as the app sent it.",
+      "description": "Compression of responses on their way out, negotiated from the visitor's `Accept-Encoding`,\nonce per response, before the cache stores it. Absent passes every body on as the app sent it.",
       "type": "object",
       "properties": {
         "encodings": {

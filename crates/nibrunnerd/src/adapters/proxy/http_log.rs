@@ -20,6 +20,7 @@ use protocol::{AppId, DeploymentId, Timestamp};
 use serde::Serialize;
 
 use crate::adapters::proxy::encode::Encoding;
+use crate::domain::metrics::CacheOutcome;
 use crate::json_store::make_directory;
 
 const QUEUED_RECORDS: usize = 1024;
@@ -37,6 +38,8 @@ pub struct HttpRequestRecord {
     deployment_id: DeploymentId,
     #[serde(skip_serializing_if = "Option::is_none")]
     wake_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding: Option<&'static str>,
 }
@@ -76,12 +79,15 @@ impl HttpRequestRecord {
             duration_micros,
             deployment_id,
             wake_micros: None,
+            cache: None,
             encoding: None,
         }
     }
 
-    /// The coding the response's body left in: `None` on a host without `[proxy.http.encode]`.
-    pub(crate) fn served_as(mut self, encoding: Option<Encoding>) -> Self {
+    /// What the response cache did with the request, and the coding its body left in: `None` for
+    /// each on a host without that part of `[proxy.http]`.
+    pub(crate) fn served_as(mut self, cache: Option<CacheOutcome>, encoding: Option<Encoding>) -> Self {
+        self.cache = cache.map(CacheOutcome::as_str);
         self.encoding = encoding.map(Encoding::token);
         self
     }
@@ -319,17 +325,19 @@ mod tests {
     }
 
     #[test]
-    fn a_record_says_the_coding_sent_only_where_the_host_compresses() {
+    fn a_record_says_what_the_cache_did_and_the_coding_sent_only_where_the_host_has_them() {
         let uri: Uri = "/".parse().expect("a request URI");
-        let record = |encoding| {
+        let record = |cache, encoding| {
             serde_json::to_value(
                 HttpRequestRecord::new("GET", &uri, 200, 90, crate::test_support::deployment_id())
-                    .served_as(encoding),
+                    .served_as(cache, encoding),
             )
             .expect("a record")
         };
-        assert_eq!(record(Some(Encoding::Br))["encoding"], "br");
-        assert!(record(None).get("encoding").is_none());
+        let hit = record(Some(CacheOutcome::Hit), Some(Encoding::Br));
+        assert_eq!((&hit["cache"], &hit["encoding"]), (&"hit".into(), &"br".into()));
+        let plain = record(None, None);
+        assert!(plain.get("cache").is_none() && plain.get("encoding").is_none());
     }
 
     #[test]

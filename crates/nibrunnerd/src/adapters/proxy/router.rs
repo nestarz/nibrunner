@@ -13,10 +13,11 @@ use hyper_util::server::conn::auto;
 use protocol::{AppId, DeploymentId, HostPort};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::config::{Compression, HttpEncode};
-use crate::domain::metrics::{HostMetrics, Outcome};
+use crate::config::{Compression, HttpCache, HttpEncode};
+use crate::domain::metrics::{CacheOutcome, HostMetrics, Outcome};
 use tokio::sync::RwLock;
 
+use crate::adapters::proxy::cache::{self, Asked, Origin, ResponseCache};
 use crate::adapters::proxy::encode::{self, Encoding, Metered};
 use crate::adapters::proxy::forward::{
     forward, hostname_of, note_the_hop, say, ProxyBody, Unreachable, Upstreams,
@@ -110,6 +111,7 @@ pub struct Router {
     metrics: Arc<HostMetrics>,
     http_log: Option<Arc<HttpRequestLog>>,
     concurrency: Option<super::concurrency::ConcurrencyLimiter>,
+    cache: Option<Arc<ResponseCache>>,
     encode: Option<HttpEncode>,
 }
 
@@ -133,6 +135,32 @@ fn busy() -> Response<ProxyBody> {
     response
 }
 
+/// The app behind one route, as the response cache asks it.
+struct TheApp {
+    router: Arc<Router>,
+    route: Route,
+}
+
+impl Origin for TheApp {
+    fn ask(&self, request: Request<ProxyBody>) -> futures::future::BoxFuture<'static, Response<ProxyBody>> {
+        let (router, route) = (self.router.clone(), self.route.clone());
+        Box::pin(async move { router.ask_the_app(&route, request).await })
+    }
+
+    fn recode(&self, response: Response<ProxyBody>, encoding: Encoding) -> Response<ProxyBody> {
+        let (metrics, app_id) = (self.router.metrics.clone(), self.route.app_id.clone());
+        let meter = Metered::reporting(move |taken, given| {
+            let compression = match encoding {
+                Encoding::Br => Compression::Br,
+                Encoding::Gzip => Compression::Gzip,
+                Encoding::Identity => return,
+            };
+            metrics.proxy.encoded(&app_id, compression, taken, given);
+        });
+        encode::recoded(response, encoding, self.router.encode.as_ref(), meter)
+    }
+}
+
 impl Router {
     pub fn new(metrics: Arc<HostMetrics>, http_log: Option<Arc<HttpRequestLog>>) -> Arc<Self> {
         Self::with_concurrency(metrics, http_log, None)
@@ -143,23 +171,27 @@ impl Router {
         http_log: Option<Arc<HttpRequestLog>>,
         limits: Option<crate::config::HttpConcurrency>,
     ) -> Arc<Self> {
-        Self::with_http(metrics, http_log, limits, None)
+        Self::with_http(metrics, http_log, limits, None, None)
     }
 
-    /// The router `[proxy.http]` describes: admission and compression, each absent when its
-    /// section is.
+    /// The router `[proxy.http]` describes: admission, the response cache, compression, each
+    /// absent when its section is.
     pub fn with_http(
         metrics: Arc<HostMetrics>,
         http_log: Option<Arc<HttpRequestLog>>,
         limits: Option<crate::config::HttpConcurrency>,
+        cache: Option<&HttpCache>,
         encode: Option<HttpEncode>,
     ) -> Arc<Self> {
+        let cache = cache
+            .map(|settings| ResponseCache::new(settings, ResponseCache::system_clock(), metrics.clone()));
         Arc::new(Self {
             concurrency: limits.map(super::concurrency::ConcurrencyLimiter::new),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
             metrics,
             http_log,
+            cache,
             encode,
         })
     }
@@ -264,7 +296,7 @@ impl Router {
             (route, logging)
         };
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
-        let (response, encoding) = self.exchange(request, &route).await;
+        let (response, cache, encoding) = self.exchange(request, &route, &hostname).await;
         let outcome = if response.extensions().get::<Busy>().is_some() {
             self.metrics.proxy.app_refused(&route.app_id);
             Outcome::Refused
@@ -279,6 +311,9 @@ impl Router {
                 Outcome::Unreachable
             }
         };
+        if let Some(cache) = cache {
+            self.metrics.proxy.cached(&route.app_id, cache);
+        }
         let wake_micros = response.extensions().get::<Woken>().map(|woken| woken.0);
         if let (Some(log), Some((scope, method, uri))) = (&self.http_log, logging) {
             log.record(
@@ -291,48 +326,52 @@ impl Router {
                     route.deployment_id.clone(),
                 )
                 .woken_for(wake_micros)
-                .served_as(encoding),
+                .served_as(cache, encoding),
             );
         }
         (response, outcome, Some(route))
     }
 
-    /// The request answered by the app, compressed on the way out on a host that compresses. A
-    /// host without `[proxy.http.encode]` relays the app's answer as it came.
+    /// The request answered: from the response cache before the app is asked, which is what lets
+    /// a hit be served while the app sleeps without waking it; from the app otherwise, compressed
+    /// on the way out. A host with neither section relays the app's answer as it came.
     async fn exchange(
-        &self,
+        self: &Arc<Self>,
         mut request: Request<Incoming>,
         route: &Route,
-    ) -> (Response<ProxyBody>, Option<Encoding>) {
-        let Some(settings) = &self.encode else {
-            return (self.ask_the_app(route, request).await, None);
-        };
-        let encoding = encode::negotiate(request.headers(), &settings.encodings);
-        encode::as_negotiated(request.headers_mut(), encoding);
-        let response = self.recode(route, self.ask_the_app(route, request).await, encoding);
-        let sent = Encoding::of(response.headers());
-        (response, sent)
-    }
-
-    fn recode(
-        &self,
-        route: &Route,
-        response: Response<ProxyBody>,
-        encoding: Encoding,
-    ) -> Response<ProxyBody> {
-        let (metrics, app_id) = (self.metrics.clone(), route.app_id.clone());
-        let meter = Metered::reporting(move |taken, given| {
-            let compression = match encoding {
-                Encoding::Br => Compression::Br,
-                Encoding::Gzip => Compression::Gzip,
-                Encoding::Identity => return,
-            };
-            metrics.proxy.encoded(&app_id, compression, taken, given);
+        hostname: &str,
+    ) -> (Response<ProxyBody>, Option<CacheOutcome>, Option<Encoding>) {
+        if self.cache.is_none() && self.encode.is_none() {
+            return (self.ask_the_app(route, request).await, None, None);
+        }
+        let encoding = self.encode.as_ref().map_or(Encoding::Identity, |settings| {
+            encode::negotiate(request.headers(), &settings.encodings)
         });
-        encode::recoded(response, encoding, self.encode.as_ref(), meter)
+        encode::as_negotiated(request.headers_mut(), encoding);
+        let origin: Arc<dyn Origin> = Arc::new(TheApp {
+            router: self.clone(),
+            route: route.clone(),
+        });
+        let (response, outcome) = match &self.cache {
+            Some(cache) if cache::answerable(&request) => {
+                let (visitor, _) = request.into_parts();
+                let asked = Asked::new(visitor, route.deployment_id.clone(), hostname, encoding);
+                let answered = cache.answer(asked, origin).await;
+                (answered.response, Some(answered.outcome))
+            }
+            cached => {
+                let response = origin.recode(self.ask_the_app(route, request).await, encoding);
+                (response, cached.as_ref().map(|_| CacheOutcome::Bypass))
+            }
+        };
+        let sent = Encoding::of(response.headers());
+        (response, outcome, sent)
     }
 
-    async fn ask_the_app(&self, route: &Route, request: Request<Incoming>) -> Response<ProxyBody> {
+    async fn ask_the_app<B>(&self, route: &Route, request: Request<B>) -> Response<ProxyBody>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes, Error = hyper::Error> + Send + Sync + Unpin + 'static,
+    {
         let Ok(permit) = self
             .concurrency
             .as_ref()
@@ -1350,6 +1389,82 @@ mod tests {
             let _ = feed.unbounded_send(bytes::Bytes::from_static(b"to nobody"));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A tenant whose every answer may be shared for a minute, counting the requests it is asked.
+    async fn sharing_and_counting() -> (HostPort, Arc<std::sync::atomic::AtomicUsize>) {
+        let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let host_port = HostPort::new(upstream.local_addr().unwrap().port()).unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream.accept().await else {
+                    return;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_request: Request<Incoming>| {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async move {
+                            let mut shared = say(StatusCode::OK, "shared\n");
+                            shared.headers_mut().insert(
+                                "cache-control",
+                                hyper::header::HeaderValue::from_static("public, max-age=60"),
+                            );
+                            Ok::<_, std::convert::Infallible>(shared)
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (host_port, asked)
+    }
+
+    #[tokio::test]
+    async fn a_shareable_get_is_answered_from_memory_and_a_post_goes_to_the_app() {
+        let (host_port, asked_of_the_app) = sharing_and_counting().await;
+        let metrics = Arc::new(HostMetrics::new());
+        let router = Router::with_http(
+            metrics.clone(),
+            None,
+            None,
+            Some(&HttpCache {
+                memory_mib: 8.try_into().unwrap(),
+                max_entry_kib: 1024.try_into().unwrap(),
+            }),
+            None,
+        );
+        routed_at(&router, host_port).await;
+        let proxy = serving(router).await;
+        let get = "GET /cart HTTP/1.0\r\nHost: app-1.apps.example.com\r\n\r\n";
+        let app_was_asked = || asked_of_the_app.load(std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while metrics.proxy.of(&crate::test_support::app_id()).cache[0] == 0 {
+            assert!(std::time::Instant::now() < deadline, "nothing was ever a hit");
+            assert!(asked(proxy, get).await.ends_with("shared\n"));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = app_was_asked();
+        asked(proxy, get).await;
+        assert_eq!(app_was_asked(), before, "a hit");
+
+        asked(
+            proxy,
+            "POST /cart HTTP/1.0\r\nHost: app-1.apps.example.com\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(app_was_asked(), before + 1, "the POST");
+        assert_eq!(
+            metrics.proxy.of(&crate::test_support::app_id()).cache[3],
+            1,
+            "a POST bypasses"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ pub mod resources;
 pub mod sleep_wake;
 
 pub use conntrack::{Conntrack, ConntrackWatch};
-pub use proxy::{Outcome, ProxyMetrics};
+pub use proxy::{CacheOutcome, Outcome, ProxyMetrics};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

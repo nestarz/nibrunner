@@ -171,6 +171,21 @@
     "name": "nibrunner_raw_port_bytes_total"
   },
   {
+    "help": "Requests for an app by what the response cache did: hit is answered from a fresh entry without the app, stale from an entry past its lifetime while it revalidates or because the app failed, miss asked the app, bypass is a request the cache does not hold answers to. Zero everywhere on a host with no [proxy.http.cache].",
+    "kind": "counter",
+    "labels": [
+      "app",
+      "outcome"
+    ],
+    "name": "nibrunner_proxy_cache_requests_total"
+  },
+  {
+    "help": "What the stored responses weigh together, headers and bodies as stored, against [proxy.http.cache] memory_mib.",
+    "kind": "gauge",
+    "labels": [],
+    "name": "nibrunner_proxy_cache_bytes"
+  },
+  {
     "help": "What the proxy compressed for an app, by coding: in is what the app sent, out is what left compressed. A hit compresses nothing and is not counted.",
     "kind": "counter",
     "labels": [
