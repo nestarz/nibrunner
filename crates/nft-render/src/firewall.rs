@@ -80,6 +80,9 @@ pub struct ForwardedInstance {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FirewallState {
     pub allowed_host_tcp_endpoints: Vec<SocketAddr>,
+    /// Exact private destinations a guest may still open TCP to, such as an object store on the
+    /// operator's own network. Every other private destination stays denied.
+    pub allowed_egress_endpoints: Vec<SocketAddr>,
     pub instances: Vec<ForwardedInstance>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
@@ -241,6 +244,24 @@ fn denied_egress_rules(tap: &str, daddr: &str, cidrs: &[String]) -> Vec<String> 
         .collect()
 }
 
+// After every named deny and before the private destinations, so an endpoint opens one exact
+// address and port and never a range, the metadata endpoint or another guest.
+fn allowed_egress_rules(tap: &str, state: &FirewallState, ipv4: bool) -> Vec<String> {
+    let daddr = if ipv4 { "ip daddr" } else { "ip6 daddr" };
+    state
+        .allowed_egress_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.is_ipv4() == ipv4)
+        .map(|endpoint| {
+            format!(
+                "iifname {tap} {daddr} {} tcp dport {} accept comment \"allowed egress endpoint\"",
+                endpoint.ip(),
+                endpoint.port()
+            )
+        })
+        .collect()
+}
+
 fn forward_chain_v4(state: &FirewallState) -> Vec<String> {
     let tap = tap_match();
     let mut rules = vec!["type filter hook forward priority filter; policy accept;".to_string()];
@@ -255,6 +276,7 @@ fn forward_chain_v4(state: &FirewallState) -> Vec<String> {
         format!("iifname {tap} oifname {tap} {DENY} comment \"guest to guest\""),
         format!("iifname {tap} ip daddr {GUEST_NETWORK_CIDR} {DENY} comment \"guest to guest\""),
     ]);
+    rules.extend(allowed_egress_rules(&tap, state, true));
     rules.push(format!(
         "iifname {tap} ip daddr {} {DENY} comment \"private destinations\"",
         set(&PRIVATE_DESTINATIONS_V4)
@@ -308,6 +330,7 @@ fn forward_chain_v6(state: &FirewallState) -> Vec<String> {
         format!("iifname {tap} ip6 daddr {INSTANCE_METADATA_ADDRESS_V6} {DENY} comment \"instance metadata endpoint\""),
         format!("iifname {tap} oifname {tap} {DENY} comment \"guest to guest\""),
     ]);
+    rules.extend(allowed_egress_rules(&tap, state, false));
     rules.push(format!(
         "iifname {tap} ip6 daddr {} {DENY} comment \"private destinations\"",
         set(&PRIVATE_DESTINATIONS_V6)
@@ -407,6 +430,7 @@ mod tests {
         FirewallState {
             instances,
             allowed_host_tcp_endpoints: vec![],
+            allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: v4.iter().map(|s| s.to_string()).collect(),
             denied_egress_addresses_v6: v6.iter().map(|s| s.to_string()).collect(),
         }
@@ -435,6 +459,45 @@ mod tests {
             assert!(!rules.contains("udp dport"));
             assert_eq!(rules.matches("allowed host endpoint").count(), 1);
         }
+    }
+
+    fn egress_rules_in_order(rules: &str, allowed: &str, before: &[&str]) {
+        let allow_at = rules.find(allowed).unwrap();
+        for deny in before {
+            assert!(rules.find(deny).unwrap() < allow_at, "{deny}");
+        }
+        assert!(allow_at < rules.find("private destinations").unwrap());
+        assert_eq!(rules.matches("allowed egress endpoint").count(), 1);
+        assert!(!rules.contains("allowed host endpoint"));
+    }
+
+    fn with_egress_endpoints() -> FirewallState {
+        let mut configured = state(vec![], &["198.51.100.0/24"], &["2001:db8:1::/48"]);
+        configured.allowed_egress_endpoints = vec![
+            "10.0.0.5:9000".parse().unwrap(),
+            "[fd00::5]:9000".parse().unwrap(),
+        ];
+        configured
+    }
+
+    #[test]
+    fn an_allowed_egress_endpoint_opens_one_private_v4_address_after_the_named_denies() {
+        let rules = forward_chain_v4(&with_egress_endpoints()).join("\n");
+        egress_rules_in_order(
+            &rules,
+            "iifname \"nbr*\" ip daddr 10.0.0.5 tcp dport 9000 accept comment \"allowed egress endpoint\"",
+            &["denied egress", "instance metadata endpoint", "guest to guest"],
+        );
+    }
+
+    #[test]
+    fn an_allowed_egress_endpoint_opens_one_private_v6_address_after_the_named_denies() {
+        let rules = forward_chain_v6(&with_egress_endpoints()).join("\n");
+        egress_rules_in_order(
+            &rules,
+            "iifname \"nbr*\" ip6 daddr fd00::5 tcp dport 9000 accept comment \"allowed egress endpoint\"",
+            &["denied egress", "instance metadata endpoint", "guest to guest"],
+        );
     }
 
     #[test]

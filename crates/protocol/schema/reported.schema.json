@@ -68,6 +68,17 @@
       ],
       "default": null
     },
+    "proxy": {
+      "description": "What the proxy holds. Absent when `[proxy.http.cache]` is not configured.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReportedProxy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "reportedAt": {
       "$ref": "#/$defs/Timestamp"
     },
@@ -748,6 +759,21 @@
       },
       "required": [
         "lowBytes"
+      ]
+    },
+    "ReportedProxy": {
+      "description": "The proxy's own state, beside the instances it serves.",
+      "type": "object",
+      "properties": {
+        "cacheBytes": {
+          "description": "What the response cache's stored answers weigh now, headers and bodies as stored, against\n`[proxy.http.cache] memory_mib`. The `nibrunner_proxy_cache_bytes` gauge, as of this report.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "cacheBytes"
       ]
     },
     "ReportedRestart": {

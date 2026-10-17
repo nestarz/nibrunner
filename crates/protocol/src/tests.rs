@@ -1090,6 +1090,7 @@ mod schema {
             message: Some(StateMessage::new(
                 "the last document named a volume this host does not hold",
             )),
+            proxy: Some(ReportedProxy { cache_bytes: 4096 }),
         };
         serde_json::to_value(state).unwrap()
     }

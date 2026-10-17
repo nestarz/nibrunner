@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use protocol::{HostCapacity, HostId, HostReportedState, HostState, HostVersions};
+use protocol::{HostCapacity, HostId, HostReportedState, HostState, HostVersions, ReportedProxy};
 
 use crate::clock::now_timestamp;
+use crate::config::ProxyConfig;
 use crate::domain::report::build_report::{build_reported_state, ReportInputs};
 use crate::domain::report::capacity::{
     allocatable_capacity, committed_resources, read_filesystem_space, read_vcpu_count,
@@ -54,6 +55,7 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
         accepted_digest: snapshot.accepted_digest.clone(),
         accepted_revision: snapshot.accepted_revision.clone(),
         message: snapshot.desired_refusal.clone(),
+        proxy: proxy_of(&host.config.proxy, host.metrics.proxy.cache_bytes()),
     });
     let ids = records
         .iter()
@@ -66,10 +68,19 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
     report
 }
 
+/// The response cache's weight, copied from the gauge the cache keeps, when there is a cache.
+fn proxy_of(proxy: &ProxyConfig, cache_bytes: u64) -> Option<ReportedProxy> {
+    proxy
+        .http
+        .as_ref()
+        .and_then(|http| http.cache.as_ref())
+        .map(|_| ReportedProxy { cache_bytes })
+}
+
 /// Whether a report says what the one before it said.
 ///
-/// `reportedAt` moves every time a report is built, and the capacity figures are readings of a
-/// disk that moves under every write — this host's own report and logs included — so neither is
+/// `reportedAt` moves every time a report is built, the cache's weight moves with every answer
+/// it stores, and the capacity figures are readings of a disk that moves under every write — this host's own report and logs included — so neither is
 /// a change worth waking a watcher for. Everything else counts, so a field added to the report
 /// is compared without being remembered here. What this excuses is carried by the heartbeat the
 /// reporter writes on anyway, which is why free space can be up to that far behind.
@@ -94,6 +105,7 @@ pub fn says_the_same(held: &HostReportedState, built: &HostReportedState) -> boo
             capacity: held.capacity,
             allocatable: held.allocatable,
             instances,
+            proxy: held.proxy,
             ..built.clone()
         }
 }
@@ -120,6 +132,30 @@ mod tests {
 
     fn versions() -> HostVersions {
         crate::domain::report::versions::compiled_versions("v1.16.1", "6.1.180-test")
+    }
+
+    #[test]
+    fn a_host_with_a_response_cache_reports_what_it_weighs_and_one_without_reports_no_proxy() {
+        let caching = ProxyConfig {
+            http: Some(crate::config::HttpListener {
+                concurrency: None,
+                cache: Some(crate::config::HttpCache {
+                    memory_mib: std::num::NonZeroU32::new(64).unwrap(),
+                    max_entry_kib: std::num::NonZeroU32::new(512).unwrap(),
+                }),
+                encode: None,
+                listen_address: std::net::Ipv4Addr::LOCALHOST.into(),
+                port: 8080,
+                tls: None,
+                redirect_from_port: None,
+            }),
+            raw: None,
+        };
+        assert_eq!(
+            proxy_of(&caching, 4096),
+            Some(ReportedProxy { cache_bytes: 4096 })
+        );
+        assert_eq!(proxy_of(&ProxyConfig::default(), 4096), None);
     }
 
     #[tokio::test]
