@@ -1,9 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(test)]
-use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
-use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
+use async_compression::tokio::bufread::{BrotliDecoder, BrotliEncoder, GzipDecoder, GzipEncoder};
 use async_compression::Level;
 use bytes::Bytes;
 use futures::{future, StreamExt, TryStreamExt};
@@ -33,6 +31,8 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
+    pub(crate) const ALL: [Encoding; 3] = [Encoding::Br, Encoding::Gzip, Encoding::Identity];
+
     pub(crate) const fn token(self) -> &'static str {
         match self {
             Encoding::Br => "br",
@@ -216,6 +216,13 @@ pub(crate) fn as_encoded(headers: &mut HeaderMap, encoding: Encoding) {
     vary_on(headers, "accept-encoding");
 }
 
+/// On a response this proxy compressed: the `ETag` the app sent, before it was weakened, which is
+/// the one the app recognises when asked to revalidate.
+#[derive(Debug, Clone)]
+pub(crate) struct Recoded {
+    pub(crate) origin_etag: Option<HeaderValue>,
+}
+
 /// The app's response as it leaves for a visitor that was given `encoding`: compressed when this
 /// host compresses and the response is one worth compressing, as it was otherwise.
 pub(crate) fn recoded(
@@ -235,6 +242,8 @@ pub(crate) fn recoded(
     if encoding == Encoding::Identity {
         return Response::from_parts(parts, body);
     }
+    let origin_etag = parts.headers.get(ETAG).cloned();
+    parts.extensions.insert(Recoded { origin_etag });
     as_encoded(&mut parts.headers, encoding);
     Response::from_parts(parts, encoded(body, encoding, meter))
 }
@@ -257,7 +266,6 @@ impl Metered {
         })
     }
 
-    #[cfg(test)]
     fn unmetered() -> Arc<Self> {
         Self::reporting(|_, _| {})
     }
@@ -342,8 +350,7 @@ pub(crate) fn encoded(body: ProxyBody, encoding: Encoding, meter: Arc<Metered>) 
     }
 }
 
-/// A body in `from`, decoded as it is read.
-#[cfg(test)]
+/// A stored body in `from`, decoded as it is sent, for a visitor that accepts no coding.
 pub(crate) fn decoded(stored: Bytes, from: Encoding) -> ProxyBody {
     let coded = std::io::Cursor::new(stored);
     let nothing_from_the_app = Arc::new(Mutex::new(None));

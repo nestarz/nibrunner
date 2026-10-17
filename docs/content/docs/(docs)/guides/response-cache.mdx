@@ -39,9 +39,12 @@ heuristic freshness: a response is stored only when the app gives it an explicit
 | `Set-Cookie` without `public` | no |
 | an answer to a request with `Authorization`, without `public`, `s-maxage` or `must-revalidate` | no |
 
-Only `GET` requests without a body or a `Range` are answered from the cache. A response is stored under the app's `deploymentId`, the hostname,
+Only `GET` and `HEAD` requests without a body or a `Range` are answered from the cache; a `HEAD` is
+answered from the stored `GET`. A response is stored under the app's `deploymentId`, the hostname,
 the path and query, and the coding it was sent in, and under each variant its `Vary` names. A new
 `deploymentId` starts from an empty cache; what the old one stored is evicted as memory is needed.
+A `POST`, `PUT`, `PATCH` or `DELETE` that succeeds removes what is stored for its path and for the
+`Location` and `Content-Location` it names on the same hostname.
 
 A visitor's own `Cache-Control: no-cache` or `max-age=0` does not bypass a fresh entry, so a
 reload does not wake a sleeping app.
@@ -54,7 +57,14 @@ reload does not wake a sleeping app.
 
 ## Past a response's lifetime
 
-A stale entry is not served: the request goes to the app, and its answer replaces the entry.
+| The app sent | A stale entry is |
+| --- | --- |
+| `stale-while-revalidate=N` | served for `N` seconds while one request revalidates it in the background; that request wakes the app once |
+| `stale-if-error=N` | served for `N` seconds when revalidation fails or the app cannot be woken |
+| neither | revalidated with `If-None-Match` or `If-Modified-Since` before it is served; a `304` refreshes it |
+
+`no-cache`, `must-revalidate`, `proxy-revalidate` and `s-maxage` forbid serving a stale entry at
+all. A visitor holding the stored `ETag` or `Last-Modified` is answered `304` from the cache.
 
 ## Compression
 
@@ -67,10 +77,12 @@ A response is compressed when its status is `200`, `203`, `404` or `410`, it has
 is text: `text/*`, JSON, JavaScript, XML, RSS, Atom, web manifests, `application/wasm`, SVG,
 `font/ttf` and `font/otf`. Images, video, archives and `font/woff2` are sent as they are. A
 compressed response gets `Vary: Accept-Encoding`, and a strong `ETag` becomes weak (`"v1"` becomes
-`W/"v1"`).
+`W/"v1"`); `If-None-Match` still matches it.
 
 The cache stores the compressed body, so a hit compresses nothing. Each coding is stored apart. A
-body the app compressed itself is stored as it is, under its own coding.
+visitor that accepts no coding is served a stored `gzip` or `br` body decompressed as it is sent,
+without asking the app. A body the app compressed itself is stored as it is and never
+decompressed for a visitor that did not ask for its coding.
 
 ## What to watch
 

@@ -360,7 +360,18 @@ impl Router {
                 (answered.response, Some(answered.outcome))
             }
             cached => {
+                let invalidates = cache::invalidating(request.method());
+                let target = request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", |target| target.as_str())
+                    .to_string();
                 let response = origin.recode(self.ask_the_app(route, request).await, encoding);
+                if let (Some(cache), true) = (cached, invalidates) {
+                    cache
+                        .invalidate(&route.deployment_id, hostname, &target, &response)
+                        .await;
+                }
                 (response, cached.as_ref().map(|_| CacheOutcome::Bypass))
             }
         };
@@ -1391,6 +1402,266 @@ mod tests {
         }
     }
 
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl CountingWaker {
+        fn woken(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::Waker for CountingWaker {
+        async fn wake(
+            &self,
+            _app_id: &AppId,
+        ) -> Result<crate::ports::WakeOutcome, crate::ports::WakeRefusal> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::ports::WakeOutcome::Restored)
+        }
+    }
+
+    fn three_megabytes_of_html() -> bytes::Bytes {
+        bytes::Bytes::from("<p>a page worth keeping, and worth compressing</p>\n".repeat(60_000))
+    }
+
+    /// A guest answering every request with a 3 MB page any visitor may share for a minute.
+    async fn a_guest_with_a_shareable_page() -> u16 {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(|_request: Request<Incoming>| async move {
+                        let mut page = Response::new(
+                            http_body_util::Full::new(three_megabytes_of_html())
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        );
+                        for (name, value) in [
+                            ("content-type", "text/html; charset=utf-8"),
+                            ("cache-control", "public, max-age=60"),
+                            ("etag", "\"v1\""),
+                        ] {
+                            page.headers_mut()
+                                .insert(name, hyper::header::HeaderValue::from_static(value));
+                        }
+                        Ok::<Response<ProxyBody>, std::convert::Infallible>(page)
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// The router of a host with `[proxy.http.cache]` and `[proxy.http.encode]`, in front of a real
+    /// activator for one app that is asleep, whose wakes are counted.
+    async fn caching_in_front_of_a_sleeping_app() -> (
+        u16,
+        Arc<CountingWaker>,
+        crate::state::SharedState,
+        Arc<HostMetrics>,
+        tempfile::TempDir,
+    ) {
+        let guest_port = a_guest_with_a_shareable_page().await;
+        let state = crate::state::HostState::shared();
+        let waker = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let metrics = Arc::new(HostMetrics::new());
+        let activator = crate::adapters::proxy::activator::AppActivator::new(
+            state.clone(),
+            waker.clone(),
+            metrics.clone(),
+        );
+        let host_port = loop {
+            let port = nobody_listening().await;
+            activator.serve(&[(crate::test_support::app_id(), port)]).await;
+            if !activator.listening_for().await.is_empty() {
+                break port;
+            }
+        };
+        let record = instance_record(|record| {
+            record.on_request = true;
+            record.state = protocol::InstanceState::Idle;
+            record.guest_ipv4 = Some(protocol::Ipv4Address::parse("127.0.0.1").unwrap());
+            record.http_port = protocol::HttpPort::new(guest_port).unwrap();
+            record.host_port = Some(host_port);
+        });
+        state.put_record(record.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let http_log = Arc::new(HttpRequestLog::new(directory.path().to_path_buf()).unwrap());
+        let router = Router::with_http(
+            metrics.clone(),
+            Some(http_log),
+            None,
+            Some(&HttpCache {
+                memory_mib: 64.try_into().unwrap(),
+                max_entry_kib: 1024.try_into().unwrap(),
+            }),
+            Some(HttpEncode {
+                encodings: vec![Compression::Br, Compression::Gzip],
+                min_kib: 1,
+            }),
+        );
+        router
+            .apply(RouteTable::from_targets(&renderable_routes(&[record])))
+            .await;
+        (serving(router).await, waker, state, metrics, directory)
+    }
+
+    async fn fetched(proxy: u16, accept_encoding: Option<&str>) -> reqwest::Response {
+        crate::install_crypto_provider();
+        let mut request = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{proxy}/"))
+            .header("host", "app-1.apps.example.com");
+        if let Some(accepted) = accept_encoding {
+            request = request.header("accept-encoding", accepted);
+        }
+        request.send().await.expect("the proxy answers")
+    }
+
+    async fn once_stored(metrics: &HostMetrics, more_than: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while metrics.proxy.cache_bytes() <= more_than {
+            assert!(std::time::Instant::now() < deadline, "nothing was stored");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn records(directory: &tempfile::TempDir) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(directory.path().join("app-1.http.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    async fn once_recorded(directory: &tempfile::TempDir, count: usize) -> Vec<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let written = records(directory);
+            if written.len() >= count {
+                return written;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {count} records",
+                written.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // In-process, the guest lane's done-when: what the cache answers, the activator never sees,
+    // so the app stays asleep and nothing it serves counts as its activity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_the_app_made_shareable_is_served_from_memory_while_the_app_sleeps() {
+        let (proxy, waker, state, metrics, directory) = caching_in_front_of_a_sleeping_app().await;
+        let app = crate::test_support::app_id();
+
+        let first = fetched(proxy, Some("gzip, deflate, br, zstd")).await;
+        assert_eq!(first.status(), 200);
+        assert_eq!(first.headers()["content-encoding"], "br");
+        assert_eq!(first.headers()["etag"], "W/\"v1\"");
+        first.bytes().await.unwrap();
+        assert_eq!(
+            waker.woken(),
+            1,
+            "the miss went through the activator, which woke the app"
+        );
+        once_stored(&metrics, 0).await;
+        let stored = metrics.proxy.cache_bytes();
+        assert!(
+            stored < 1024 * 1024,
+            "3 MB of html is stored at its encoded size: {stored}"
+        );
+        let active_after_the_miss = state.snapshot().await.last_active_at_ms.get(&app).copied();
+
+        for _ in 0..5 {
+            let hit = fetched(proxy, Some("br, gzip")).await;
+            assert_eq!(hit.status(), 200);
+            assert_eq!(hit.headers()["content-encoding"], "br");
+            assert!(hit.headers().contains_key("age"));
+            let body = hit.bytes().await.unwrap();
+            assert_eq!(
+                encode::decoded(body, Encoding::Br)
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes(),
+                three_megabytes_of_html()
+            );
+        }
+        let revalidating = fetched(proxy, Some("br")).await;
+        let held = revalidating.headers()["etag"].clone();
+        let not_modified = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{proxy}/"))
+            .header("host", "app-1.apps.example.com")
+            .header("accept-encoding", "br")
+            .header("if-none-match", held)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(not_modified.status(), 304);
+        assert_eq!(waker.woken(), 1, "no hit woke the app");
+        assert!(
+            state.record(&app).await.unwrap().is_idle(),
+            "the instance is still idle"
+        );
+        assert_eq!(
+            state.snapshot().await.last_active_at_ms.get(&app).copied(),
+            active_after_the_miss,
+            "a hit is not the app's activity"
+        );
+        assert_eq!(metrics.proxy.open_requests_for(&app), 0);
+
+        let gzip = fetched(proxy, Some("gzip")).await;
+        assert_eq!(gzip.headers()["content-encoding"], "gzip");
+        gzip.bytes().await.unwrap();
+        assert_eq!(waker.woken(), 2, "a gzip visitor's variant is its own");
+        once_stored(&metrics, stored).await;
+        let identity = fetched(proxy, None).await;
+        assert!(!identity.headers().contains_key("content-encoding"));
+        assert_eq!(identity.bytes().await.unwrap(), three_megabytes_of_html());
+        assert_eq!(
+            waker.woken(),
+            2,
+            "identity is decoded from the stored gzip without a wake"
+        );
+
+        let written = once_recorded(&directory, 10).await;
+        let hits: Vec<&serde_json::Value> =
+            written.iter().filter(|record| record["cache"] == "hit").collect();
+        assert_eq!(hits.len(), 8, "{written:?}");
+        assert_eq!(written[0]["cache"], "miss");
+        assert_eq!(written[0]["encoding"], "br");
+        assert!(written[0]["wakeMicros"].is_u64(), "{:?}", written[0]);
+        assert!(hits.iter().all(|hit| hit.get("wakeMicros").is_none()));
+        let fastest = hits
+            .iter()
+            .filter_map(|hit| hit["durationMicros"].as_u64())
+            .min()
+            .unwrap();
+        assert!(fastest < 2_000, "the fastest hit took {fastest}µs");
+        let counted = crate::domain::metrics::tests::page(
+            &crate::domain::metrics::tests::report(),
+            &metrics,
+            &state.snapshot().await,
+            0,
+        );
+        assert!(
+            counted.contains("nibrunner_proxy_cache_requests_total{app=\"app-1\",outcome=\"hit\"} 8\n"),
+            "{counted}"
+        );
+    }
+
     /// A tenant whose every answer may be shared for a minute, counting the requests it is asked.
     async fn sharing_and_counting() -> (HostPort, Arc<std::sync::atomic::AtomicUsize>) {
         let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -1427,7 +1698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shareable_get_is_answered_from_memory_and_a_post_goes_to_the_app() {
+    async fn a_post_that_succeeds_sends_the_next_get_for_its_target_to_the_app() {
         let (host_port, asked_of_the_app) = sharing_and_counting().await;
         let metrics = Arc::new(HostMetrics::new());
         let router = Router::with_http(
@@ -1459,7 +1730,12 @@ mod tests {
             "POST /cart HTTP/1.0\r\nHost: app-1.apps.example.com\r\nContent-Length: 0\r\n\r\n",
         )
         .await;
-        assert_eq!(app_was_asked(), before + 1, "the POST");
+        asked(proxy, get).await;
+        assert_eq!(
+            app_was_asked(),
+            before + 2,
+            "the POST, then the GET it made stale"
+        );
         assert_eq!(
             metrics.proxy.of(&crate::test_support::app_id()).cache[3],
             1,

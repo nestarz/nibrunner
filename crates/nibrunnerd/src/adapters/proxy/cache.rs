@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
@@ -6,19 +7,20 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use http_body_util::{BodyExt, Empty, Full};
-use http_cache_semantics::{BeforeRequest, CacheOptions, CachePolicy};
+use http_cache_semantics::{AfterResponse, BeforeRequest, CacheOptions, CachePolicy};
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH,
-    CONTENT_RANGE, DATE, EXPIRES, HOST, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
-    IF_UNMODIFIED_SINCE, PRAGMA, RANGE, SET_COOKIE, TRANSFER_ENCODING, UPGRADE, VARY,
+    CONTENT_LOCATION, CONTENT_RANGE, DATE, ETAG, EXPIRES, HOST, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    IF_RANGE, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, PRAGMA, RANGE, SET_COOKIE, TRANSFER_ENCODING,
+    UPGRADE, VARY,
 };
 use hyper::http::{request, response};
 use hyper::{Method, Request, Response, StatusCode};
 use protocol::DeploymentId;
 
 use crate::adapters::proxy::encode::{self, Encoding};
-use crate::adapters::proxy::forward::ProxyBody;
+use crate::adapters::proxy::forward::{ProxyBody, Unreachable};
 use crate::config::HttpCache;
 use crate::domain::metrics::{CacheOutcome, HostMetrics};
 
@@ -47,6 +49,22 @@ pub(crate) struct Key {
     encoding: Encoding,
 }
 
+impl Key {
+    fn coded(&self, encoding: Encoding) -> Self {
+        Self {
+            encoding,
+            ..self.clone()
+        }
+    }
+}
+
+/// When a stale answer may still be given, past its lifetime: RFC 5861's two extensions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Windows {
+    while_revalidating: Duration,
+    if_error: Duration,
+}
+
 fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
     headers
         .get_all(CACHE_CONTROL)
@@ -66,6 +84,35 @@ fn says(directives: &[(String, Option<String>)], name: &str) -> bool {
     directives.iter().any(|(named, _)| named == name)
 }
 
+fn seconds(directives: &[(String, Option<String>)], name: &str) -> Duration {
+    directives
+        .iter()
+        .find(|(named, _)| named == name)
+        .and_then(|(_, value)| value.as_deref()?.parse().ok())
+        .map_or(Duration::ZERO, Duration::from_secs)
+}
+
+impl Windows {
+    // RFC 9111 §4.2.4: these four forbid a shared cache from ever giving a stale answer.
+    fn of(headers: &HeaderMap) -> Self {
+        let directives = directives(headers);
+        if ["no-cache", "must-revalidate", "proxy-revalidate", "s-maxage"]
+            .iter()
+            .any(|forbidding| says(&directives, forbidding))
+        {
+            return Self::default();
+        }
+        Self {
+            while_revalidating: seconds(&directives, "stale-while-revalidate"),
+            if_error: seconds(&directives, "stale-if-error"),
+        }
+    }
+
+    fn widest(self) -> Duration {
+        self.while_revalidating.max(self.if_error)
+    }
+}
+
 fn options() -> CacheOptions {
     CacheOptions {
         shared: true,
@@ -83,10 +130,18 @@ pub(crate) fn answerable<B>(request: &Request<B>) -> bool {
         || headers
             .get(CONTENT_LENGTH)
             .is_some_and(|length| length.as_bytes() != b"0");
-    *request.method() == Method::GET
+    matches!(*request.method(), Method::GET | Method::HEAD)
         && !headers.contains_key(RANGE)
         && !headers.contains_key(UPGRADE)
         && !has_body
+}
+
+/// A method RFC 9111 §4.4 says invalidates what is stored for its target once it succeeds.
+pub(crate) fn invalidating(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
 }
 
 const CONDITIONALS: [HeaderName; 5] = [
@@ -97,11 +152,62 @@ const CONDITIONALS: [HeaderName; 5] = [
     IF_RANGE,
 ];
 
+/// What the visitor already holds, which the cache answers with a 304 when it is still current.
+#[derive(Debug, Clone, Default)]
+struct Held {
+    if_none_match: Option<String>,
+    if_modified_since: Option<SystemTime>,
+}
+
+impl Held {
+    fn of(headers: &HeaderMap) -> Self {
+        Self {
+            if_none_match: headers
+                .get(IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            if_modified_since: headers
+                .get(IF_MODIFIED_SINCE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| httpdate::parse_http_date(value).ok()),
+        }
+    }
+
+    // `If-None-Match` compares weakly (RFC 9110 §13.1.2), which is what lets a 304 answer an etag
+    // this proxy weakened when it compressed the body.
+    fn is_current(&self, status: StatusCode, headers: &HeaderMap) -> bool {
+        if status != StatusCode::OK {
+            return false;
+        }
+        let weak = |etag: &str| etag.trim().trim_start_matches("W/").to_string();
+        if let Some(listed) = &self.if_none_match {
+            let Some(etag) = headers.get(ETAG).and_then(|value| value.to_str().ok()) else {
+                return false;
+            };
+            return listed
+                .split(',')
+                .any(|held| held.trim() == "*" || weak(held) == weak(etag));
+        }
+        match (
+            self.if_modified_since,
+            headers
+                .get(LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| httpdate::parse_http_date(value).ok()),
+        ) {
+            (Some(since), Some(modified)) => modified <= since,
+            _ => false,
+        }
+    }
+}
+
 /// A request the cache may answer, read the way it keys and matches.
 pub(crate) struct Asked {
     key: Key,
+    head: bool,
     visitor: request::Parts,
     canonical: request::Parts,
+    held: Held,
 }
 
 impl Asked {
@@ -143,6 +249,8 @@ impl Asked {
                 target,
                 encoding,
             },
+            head: visitor.method == Method::HEAD,
+            held: Held::of(&visitor.headers),
             visitor,
             canonical,
         }
@@ -170,6 +278,30 @@ fn whole(bytes: Bytes) -> ProxyBody {
     Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
+/// How a stored body came to be the one stored.
+#[derive(Debug, Clone, Default)]
+struct Provenance {
+    /// The app's own `ETag`, which revalidation sends back even when the served one was weakened.
+    origin_etag: Option<HeaderValue>,
+    /// Whether this proxy compressed it, so that headers refreshed by a 304 are made to say so again.
+    recoded: bool,
+}
+
+impl Provenance {
+    fn of(parts: &response::Parts) -> Self {
+        match parts.extensions.get::<encode::Recoded>() {
+            Some(recoded) => Self {
+                origin_etag: recoded.origin_etag.clone(),
+                recoded: true,
+            },
+            None => Self {
+                origin_etag: parts.headers.get(ETAG).cloned(),
+                recoded: false,
+            },
+        }
+    }
+}
+
 /// One stored answer: the policy the crate reads it by, the headers it is served with, the body
 /// as stored.
 pub(crate) struct Stored {
@@ -177,6 +309,11 @@ pub(crate) struct Stored {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+    encoding: Encoding,
+    provenance: Provenance,
+    windows: Windows,
+    fresh_until: SystemTime,
+    revalidating: AtomicBool,
     weight: u32,
 }
 
@@ -188,8 +325,19 @@ fn weight_of(headers: &HeaderMap) -> usize {
 }
 
 impl Stored {
+    fn staleness(&self, now: SystemTime) -> Duration {
+        now.duration_since(self.fresh_until).unwrap_or_default()
+    }
+
     fn lifetime(&self, now: SystemTime) -> Duration {
-        self.policy.time_to_live(now)
+        self.fresh_until
+            .duration_since(now)
+            .unwrap_or_default()
+            .saturating_add(self.windows.widest())
+    }
+
+    fn claim_revalidation(&self) -> bool {
+        !self.revalidating.swap(true, Ordering::AcqRel)
     }
 
     fn headers_as_served(&self, now: SystemTime) -> HeaderMap {
@@ -201,9 +349,38 @@ impl Stored {
         headers
     }
 
-    fn serve(&self, now: SystemTime) -> Response<ProxyBody> {
-        let headers = self.headers_as_served(now);
-        let mut served = Response::new(whole(self.body.clone()));
+    /// The answer to `asked`, decoded from `self.encoding` when `decode` says so, or a 304 when
+    /// what the visitor holds is still this.
+    fn serve(&self, asked: &Asked, now: SystemTime, decode: bool) -> Response<ProxyBody> {
+        let mut headers = self.headers_as_served(now);
+        if asked.held.is_current(self.status, &headers) {
+            let mut not_modified = Response::new(empty());
+            *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+            for name in [
+                CACHE_CONTROL,
+                CONTENT_LOCATION,
+                DATE,
+                ETAG,
+                EXPIRES,
+                VARY,
+                AGE,
+                LAST_MODIFIED,
+            ] {
+                if let Some(value) = headers.get(&name) {
+                    not_modified.headers_mut().insert(name, value.clone());
+                }
+            }
+            return not_modified;
+        }
+        let body = match (asked.head, decode) {
+            (true, _) => empty(),
+            (false, true) => encode::decoded(self.body.clone(), self.encoding),
+            (false, false) => whole(self.body.clone()),
+        };
+        if decode {
+            encode::as_encoded(&mut headers, Encoding::Identity);
+        }
+        let mut served = Response::new(body);
         *served.status_mut() = self.status;
         *served.headers_mut() = headers;
         served
@@ -235,6 +412,19 @@ impl moka::Expiry<Key, Arc<Variants>> for UntilTheLastVariantExpires {
     }
 }
 
+enum Found {
+    Fresh(Arc<Stored>),
+    Stale(Arc<Stored>, Box<request::Parts>),
+}
+
+enum Revalidated {
+    Refreshed(Arc<Stored>),
+    Replaced(Response<ProxyBody>),
+    Failed(Response<ProxyBody>),
+    /// A 304 that does not answer for what is stored, or one that made it unstorable.
+    Unmatched,
+}
+
 /// What the cache answered, and how.
 pub(crate) struct Answered {
     pub(crate) response: Response<ProxyBody>,
@@ -246,6 +436,10 @@ pub(crate) struct ResponseCache {
     max_entry_bytes: usize,
     clock: Clock,
     metrics: Arc<HostMetrics>,
+}
+
+fn failed(response: &Response<ProxyBody>) -> bool {
+    response.extensions().get::<Unreachable>().is_some() || response.status().is_server_error()
 }
 
 fn explicit_lifetime(headers: &HeaderMap) -> bool {
@@ -278,35 +472,69 @@ impl ResponseCache {
         self.metrics.proxy.cache_weighs(self.entries.weighted_size());
     }
 
-    /// A request the cache may answer: a fresh stored answer when there is one, the app's
-    /// otherwise, kept on its way to the visitor when the app made it storable. A stale entry is
-    /// asked again and replaced.
+    /// A request the cache may answer: a stored answer when there is one it may give, the app's
+    /// otherwise, kept on its way to the visitor when the app made it storable.
     pub(crate) async fn answer(self: &Arc<Self>, asked: Asked, origin: Arc<dyn Origin>) -> Answered {
         let now = (self.clock)();
         match self.find(&asked.key, &asked.canonical, now).await {
-            Some(stored) => self.hit(&stored, now),
-            None => self.miss(asked, origin).await,
+            Some(Found::Fresh(stored)) => self.hit(&asked, &stored, now, false),
+            Some(Found::Stale(_, _)) if asked.head => self.miss(asked, origin).await,
+            Some(Found::Stale(stored, revalidation)) => {
+                if stored.staleness(now) <= stored.windows.while_revalidating {
+                    self.stale_while_revalidating(asked, stored, *revalidation, origin, now)
+                } else {
+                    self.revalidate_inline(asked, stored, *revalidation, origin).await
+                }
+            }
+            None => match self.coded_for_identity(&asked, now).await {
+                Some(stored) => {
+                    let decode = stored.encoding != Encoding::Identity;
+                    self.hit(&asked, &stored, now, decode)
+                }
+                None => self.miss(asked, origin).await,
+            },
         }
     }
 
-    async fn find(&self, key: &Key, canonical: &request::Parts, now: SystemTime) -> Option<Arc<Stored>> {
+    async fn find(&self, key: &Key, canonical: &request::Parts, now: SystemTime) -> Option<Found> {
         let variants = self.entries.get(key).await?;
-        variants
-            .stored
-            .iter()
-            .find(|stored| {
-                matches!(
-                    stored.policy.before_request(canonical, now),
-                    BeforeRequest::Fresh(_)
-                )
-            })
-            .cloned()
+        let mut stale = None;
+        for stored in &variants.stored {
+            match stored.policy.before_request(canonical, now) {
+                BeforeRequest::Fresh(_) => return Some(Found::Fresh(stored.clone())),
+                BeforeRequest::Stale {
+                    request,
+                    matches: true,
+                } if stale.is_none() => stale = Some(Found::Stale(stored.clone(), Box::new(request))),
+                BeforeRequest::Stale { .. } => {}
+            }
+        }
+        stale
+    }
+
+    // An identity visitor is served from a stored gzip, then a stored br, by decoding it as it is
+    // sent: one inflate pass instead of a wake.
+    async fn coded_for_identity(&self, asked: &Asked, now: SystemTime) -> Option<Arc<Stored>> {
+        if asked.key.encoding != Encoding::Identity {
+            return None;
+        }
+        for coded in [Encoding::Gzip, Encoding::Br] {
+            let mut canonical = asked.canonical.clone();
+            encode::as_negotiated(&mut canonical.headers, coded);
+            // What the app compressed itself is the app's to decode, and is never decoded here.
+            if let Some(Found::Fresh(stored)) = self.find(&asked.key.coded(coded), &canonical, now).await {
+                if stored.provenance.recoded || stored.encoding == Encoding::Identity {
+                    return Some(stored);
+                }
+            }
+        }
+        None
     }
 
     /// Flow 1: fresh, answered from memory without the app.
-    fn hit(&self, stored: &Stored, now: SystemTime) -> Answered {
+    fn hit(&self, asked: &Asked, stored: &Stored, now: SystemTime, decode: bool) -> Answered {
         Answered {
-            response: stored.serve(now),
+            response: stored.serve(asked, now, decode),
             outcome: CacheOutcome::Hit,
         }
     }
@@ -315,11 +543,158 @@ impl ResponseCache {
     async fn miss(self: &Arc<Self>, asked: Asked, origin: Arc<dyn Origin>) -> Answered {
         let requested_at = (self.clock)();
         let response = origin.ask(asked.forwarded()).await;
-        let response = self.keeping(&asked, origin.recode(response, asked.key.encoding), requested_at);
+        let response = if asked.head {
+            response
+        } else {
+            self.keeping(&asked, origin.recode(response, asked.key.encoding), requested_at)
+        };
         Answered {
             response,
             outcome: CacheOutcome::Miss,
         }
+    }
+
+    /// Flow 3: stale within `stale-while-revalidate`, given at once, revalidated behind it by one
+    /// request to the app however many visitors arrive meanwhile.
+    fn stale_while_revalidating(
+        self: &Arc<Self>,
+        asked: Asked,
+        stored: Arc<Stored>,
+        revalidation: request::Parts,
+        origin: Arc<dyn Origin>,
+        now: SystemTime,
+    ) -> Answered {
+        let response = stored.serve(&asked, now, false);
+        if stored.claim_revalidation() {
+            let cache = self.clone();
+            tokio::spawn(async move {
+                if let Revalidated::Replaced(response) =
+                    cache.revalidated(&asked, &stored, revalidation, origin).await
+                {
+                    let _ = response.into_body().collect().await;
+                }
+                stored.revalidating.store(false, Ordering::Release);
+            });
+        }
+        Answered {
+            response,
+            outcome: CacheOutcome::Stale,
+        }
+    }
+
+    /// Flows 4 and 5: stale past `stale-while-revalidate`, revalidated before answering; an app
+    /// that fails or cannot be woken is covered for by the stale answer within `stale-if-error`.
+    async fn revalidate_inline(
+        self: &Arc<Self>,
+        asked: Asked,
+        stored: Arc<Stored>,
+        revalidation: request::Parts,
+        origin: Arc<dyn Origin>,
+    ) -> Answered {
+        let miss = |response| Answered {
+            response,
+            outcome: CacheOutcome::Miss,
+        };
+        let origin_again = origin.clone();
+        match self.revalidated(&asked, &stored, revalidation, origin).await {
+            Revalidated::Refreshed(refreshed) => miss(refreshed.serve(&asked, (self.clock)(), false)),
+            Revalidated::Replaced(response) => miss(response),
+            Revalidated::Unmatched => self.miss(asked, origin_again).await,
+            Revalidated::Failed(response) => {
+                let now = (self.clock)();
+                if stored.staleness(now) <= stored.windows.if_error {
+                    Answered {
+                        response: stored.serve(&asked, now, false),
+                        outcome: CacheOutcome::Stale,
+                    }
+                } else {
+                    miss(response)
+                }
+            }
+        }
+    }
+
+    async fn revalidated(
+        self: &Arc<Self>,
+        asked: &Asked,
+        stored: &Stored,
+        mut revalidation: request::Parts,
+        origin: Arc<dyn Origin>,
+    ) -> Revalidated {
+        if let Some(etag) = &stored.provenance.origin_etag {
+            revalidation.headers.insert(IF_NONE_MATCH, etag.clone());
+        }
+        let requested_at = (self.clock)();
+        let response = origin
+            .ask(Request::from_parts(revalidation.clone(), empty()))
+            .await;
+        if failed(&response) {
+            return Revalidated::Failed(response);
+        }
+        if response.status() == StatusCode::NOT_MODIFIED {
+            if let AfterResponse::NotModified(_, mut refreshed) =
+                stored
+                    .policy
+                    .after_response(&revalidation, &response, requested_at)
+            {
+                if stored.provenance.recoded {
+                    encode::as_encoded(&mut refreshed.headers, stored.encoding);
+                }
+                refreshed
+                    .headers
+                    .insert(CONTENT_LENGTH, HeaderValue::from(stored.body.len()));
+                refreshed.headers.remove(AGE);
+                let now = (self.clock)();
+                if let Some(refreshed) = self.stored(
+                    &asked.canonical,
+                    refreshed,
+                    stored.body.clone(),
+                    stored.provenance.clone(),
+                    requested_at,
+                    now,
+                ) {
+                    let refreshed = Arc::new(refreshed);
+                    self.keep(asked.key.clone(), &asked.canonical, refreshed.clone(), now)
+                        .await;
+                    return Revalidated::Refreshed(refreshed);
+                }
+            }
+            return Revalidated::Unmatched;
+        }
+        Revalidated::Replaced(self.keeping(asked, origin.recode(response, asked.key.encoding), requested_at))
+    }
+
+    /// Flow 6: a `POST`, `PUT`, `PATCH` or `DELETE` that succeeded makes what is stored for its
+    /// target, and for the `Location` and `Content-Location` it names on this authority, unusable.
+    pub(crate) async fn invalidate(
+        &self,
+        deployment_id: &DeploymentId,
+        authority: &str,
+        target: &str,
+        response: &Response<ProxyBody>,
+    ) {
+        if !(response.status().is_success() || response.status().is_redirection()) {
+            return;
+        }
+        let named = [LOCATION, CONTENT_LOCATION].into_iter().filter_map(|header| {
+            let uri: hyper::Uri = response.headers().get(header)?.to_str().ok()?.parse().ok()?;
+            let same_authority = uri.host().is_none_or(|host| host.eq_ignore_ascii_case(authority));
+            let path = uri.path_and_query()?.as_str();
+            (same_authority && path.starts_with('/')).then(|| path.to_string())
+        });
+        for target in std::iter::once(target.to_string()).chain(named) {
+            for encoding in Encoding::ALL {
+                self.entries
+                    .invalidate(&Key {
+                        deployment_id: deployment_id.clone(),
+                        authority: authority.to_string(),
+                        target: target.clone(),
+                        encoding,
+                    })
+                    .await;
+            }
+        }
+        self.weighed().await;
     }
 
     fn stored(
@@ -327,24 +702,26 @@ impl ResponseCache {
         canonical: &request::Parts,
         mut response: response::Parts,
         body: Bytes,
+        provenance: Provenance,
         requested_at: SystemTime,
         now: SystemTime,
     ) -> Option<Stored> {
-        // A coding this proxy neither produces nor reads is passed on and never stored.
-        Encoding::of(&response.headers)?;
+        let encoding = Encoding::of(&response.headers)?;
         // Given the time the request left rather than the time the answer came, the crate's
         // `age_value + resident_time` is RFC 9111 §4.2.3's `age_value + response_delay +
         // resident_time`, without the apparent age a skewed `Date` would add.
         let policy = CachePolicy::new_options(canonical, &response, requested_at, options());
         let shared_with_cookies =
             response.headers.contains_key(SET_COOKIE) && !says(&directives(&response.headers), "public");
+        let windows = Windows::of(&response.headers);
+        let fresh_until = now + policy.time_to_live(now);
         let storable = policy.is_storable()
             && explicit_lifetime(&response.headers)
             && !shared_with_cookies
             && !response.headers.contains_key(CONTENT_RANGE)
             && response.status != StatusCode::PARTIAL_CONTENT
             && body.len() <= self.max_entry_bytes
-            && policy.time_to_live(now) > Duration::ZERO;
+            && policy.time_to_live(now) + windows.widest() > Duration::ZERO;
         if !storable {
             return None;
         }
@@ -357,6 +734,11 @@ impl ResponseCache {
             status: response.status,
             headers: response.headers,
             body,
+            encoding,
+            provenance,
+            windows,
+            fresh_until,
+            revalidating: AtomicBool::new(false),
             weight: u32::try_from(weight).unwrap_or(u32::MAX),
         })
     }
@@ -415,6 +797,7 @@ impl ResponseCache {
         let (parts, body) = response.into_parts();
         let headers = parts.headers.clone();
         let status = parts.status;
+        let provenance = Provenance::of(&parts);
         let cache = self.clone();
         let key = asked.key.clone();
         let canonical = asked.canonical.clone();
@@ -428,7 +811,8 @@ impl ResponseCache {
                     .insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
                 let now = (cache.clock)();
                 let (response, ()) = response.into_parts();
-                if let Some(stored) = cache.stored(&canonical, response, body, requested_at, now) {
+                if let Some(stored) = cache.stored(&canonical, response, body, provenance, requested_at, now)
+                {
                     cache.keep(key, &canonical, Arc::new(stored), now).await;
                 }
             });
@@ -538,8 +922,7 @@ impl Body for Tee {
 mod tests {
     use super::*;
     use crate::config::{Compression, HttpEncode};
-    use hyper::header::ETAG;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     /// A clock the test moves by hand.
@@ -731,6 +1114,7 @@ mod tests {
                     &canonical,
                     parts,
                     Bytes::from_static(b"x"),
+                    Provenance::default(),
                     hands.now(),
                     hands.now(),
                 )
@@ -746,6 +1130,7 @@ mod tests {
                     canonical,
                     parts,
                     Bytes::from_static(b"x"),
+                    Provenance::default(),
                     hands.now(),
                     hands.now(),
                 )
@@ -776,6 +1161,10 @@ mod tests {
         for (headers, expected) in table {
             assert_eq!(storable(headers), expected, "{headers:?}");
         }
+        assert!(storable(&[(
+            "cache-control",
+            "max-age=0, stale-while-revalidate=30"
+        )]));
         assert!(!storable_for(&mut authorized, "max-age=60"));
         assert!(storable_for(&mut authorized, "public, max-age=60"));
         assert!(storable_for(&mut authorized, "s-maxage=60"));
@@ -783,7 +1172,14 @@ mod tests {
         let mut partial = partial;
         partial.status = StatusCode::PARTIAL_CONTENT;
         assert!(cache
-            .stored(&canonical, partial, Bytes::new(), hands.now(), hands.now())
+            .stored(
+                &canonical,
+                partial,
+                Bytes::new(),
+                Provenance::default(),
+                hands.now(),
+                hands.now()
+            )
             .is_none());
     }
 
@@ -796,7 +1192,14 @@ mod tests {
         hands.forward(Duration::from_secs(2));
         let (parts, _) = answer(&[("cache-control", "max-age=60"), ("age", "10")], Bytes::new()).into_parts();
         let stored = cache
-            .stored(&canonical, parts, Bytes::new(), requested_at, hands.now())
+            .stored(
+                &canonical,
+                parts,
+                Bytes::new(),
+                Provenance::default(),
+                requested_at,
+                hands.now(),
+            )
             .unwrap();
         // current_age = age_value (10) + response_delay (2) + resident_time; fresh while below 60.
         assert_eq!(stored.policy.age(hands.now()), Duration::from_secs(12));
@@ -808,7 +1211,9 @@ mod tests {
         ));
         hands.forward(Duration::from_secs(1));
         assert!(stored.policy.is_stale(hands.now()));
+        assert_eq!(stored.staleness(hands.now()), Duration::ZERO);
         hands.forward(Duration::from_secs(5));
+        assert_eq!(stored.staleness(hands.now()), Duration::from_secs(5));
         assert_eq!(stored.headers_as_served(hands.now())[AGE], "65");
     }
 
@@ -862,6 +1267,255 @@ mod tests {
             sent(&cache, asked("deflate, gzip"), &app).await.1,
             CacheOutcome::Hit
         );
+    }
+
+    #[tokio::test]
+    async fn a_visitor_that_accepts_no_coding_is_served_the_stored_gzip_decoded_without_a_wake() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(html("public, max-age=60"));
+        sent(&cache, asked("gzip"), &app).await;
+        let (plain, outcome, body) = sent(&cache, asked_with(Method::GET, "/", "dep-1", &[]), &app).await;
+        assert_eq!((outcome, app.woken()), (CacheOutcome::Hit, 1));
+        assert!(!plain.headers().contains_key("content-encoding"));
+        assert_eq!(body, page());
+    }
+
+    #[tokio::test]
+    async fn a_strong_etag_comes_back_weak_and_a_visitor_holding_it_is_answered_304() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(html("public, max-age=60"));
+        let (first, _, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(first.headers()[ETAG], "W/\"v1\"");
+        for held in ["W/\"v1\"", "\"v1\"", "\"v0\", W/\"v1\""] {
+            let (not_modified, outcome, body) = sent(
+                &cache,
+                asked_with(
+                    Method::GET,
+                    "/",
+                    "dep-1",
+                    &[("accept-encoding", "br"), ("if-none-match", held)],
+                ),
+                &app,
+            )
+            .await;
+            assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED, "{held}");
+            assert_eq!(outcome, CacheOutcome::Hit);
+            assert!(body.is_empty());
+            assert_eq!(not_modified.headers()[ETAG], "W/\"v1\"");
+        }
+        let (changed, _, _) = sent(
+            &cache,
+            asked_with(
+                Method::GET,
+                "/",
+                "dep-1",
+                &[("accept-encoding", "br"), ("if-none-match", "\"v0\"")],
+            ),
+            &app,
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_eq!(app.woken(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_visitor_holding_the_last_modified_date_is_answered_304() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|_| {
+            answer(
+                &[
+                    ("content-type", "text/plain"),
+                    ("cache-control", "max-age=60"),
+                    ("last-modified", "Wed, 21 Oct 2026 07:28:00 GMT"),
+                ],
+                Bytes::from_static(b"short"),
+            )
+        });
+        sent(&cache, asked("identity"), &app).await;
+        let since = |date| asked_with(Method::GET, "/", "dep-1", &[("if-modified-since", date)]);
+        assert_eq!(
+            sent(&cache, since("Wed, 21 Oct 2026 07:28:00 GMT"), &app)
+                .await
+                .0
+                .status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(
+            sent(&cache, since("Tue, 20 Oct 2026 07:28:00 GMT"), &app)
+                .await
+                .0
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_is_answered_from_the_get_it_shares_a_key_with() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(html("public, max-age=60"));
+        sent(&cache, asked("br"), &app).await;
+        let (head, outcome, body) = sent(
+            &cache,
+            asked_with(Method::HEAD, "/", "dep-1", &[("accept-encoding", "br")]),
+            &app,
+        )
+        .await;
+        assert_eq!((outcome, app.woken()), (CacheOutcome::Hit, 1));
+        assert!(body.is_empty());
+        assert_eq!(head.headers()["content-encoding"], "br");
+    }
+
+    #[tokio::test]
+    async fn a_stale_answer_within_stale_while_revalidate_is_served_and_revalidated_once_behind_it() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|parts| {
+            if parts
+                .headers
+                .get(IF_NONE_MATCH)
+                .is_some_and(|held| held == "\"v1\"")
+            {
+                let mut not_modified = answer(
+                    &[
+                        ("cache-control", "public, max-age=60, stale-while-revalidate=30"),
+                        ("etag", "\"v1\""),
+                    ],
+                    Bytes::new(),
+                );
+                *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+                return not_modified;
+            }
+            html("public, max-age=60, stale-while-revalidate=30")(parts)
+        });
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(70));
+        // Answered back to back, before the revalidation behind the first has had a turn to run.
+        let mut stale = Vec::new();
+        for _ in 0..5 {
+            stale.push(cache.answer(asked("br"), app.clone()).await);
+        }
+        for answered in stale {
+            assert_eq!(answered.outcome, CacheOutcome::Stale);
+            assert_eq!(answered.response.headers()[AGE], "70");
+            let body = answered.response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(inflated(body, Encoding::Br).await, page());
+        }
+        settled(&cache).await;
+        assert_eq!(app.woken(), 2, "five stale answers, one revalidation");
+        assert_eq!(
+            app.last_heard().headers[IF_NONE_MATCH],
+            "\"v1\"",
+            "revalidated with the app's own etag, not the weakened one"
+        );
+        let (refreshed, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(outcome, CacheOutcome::Hit, "the 304 made it fresh again");
+        assert_eq!(refreshed.headers()[ETAG], "W/\"v1\"");
+        assert_eq!(app.woken(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stale_answer_past_its_windows_is_revalidated_before_it_is_served() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|parts| {
+            if parts.headers.contains_key(IF_NONE_MATCH) {
+                let mut not_modified = answer(&[("etag", "\"v1\"")], Bytes::new());
+                *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+                return not_modified;
+            }
+            html("public, max-age=60, stale-if-error=600")(parts)
+        });
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(61));
+        let (revalidated, outcome, body) = sent(&cache, asked("br"), &app).await;
+        assert_eq!((outcome, app.woken()), (CacheOutcome::Miss, 2));
+        assert_eq!(revalidated.status(), StatusCode::OK);
+        assert_eq!(inflated(body, Encoding::Br).await, page());
+        assert_eq!(sent(&cache, asked("br"), &app).await.1, CacheOutcome::Hit);
+    }
+
+    #[tokio::test]
+    async fn an_app_that_fails_its_revalidation_is_covered_for_within_stale_if_error_and_not_after() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let failing = Arc::new(AtomicBool::new(false));
+        let fails = failing.clone();
+        let app = App::answering(move |parts| {
+            if fails.load(Ordering::SeqCst) {
+                let mut refused = answer(&[], Bytes::from_static(b"This app could not be started.\n"));
+                *refused.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                return refused;
+            }
+            html("public, max-age=60, stale-if-error=300")(parts)
+        });
+        sent(&cache, asked("br"), &app).await;
+        failing.store(true, Ordering::SeqCst);
+        hands.forward(Duration::from_secs(120));
+        let (covered, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!((covered.status(), outcome), (StatusCode::OK, CacheOutcome::Stale));
+        hands.forward(Duration::from_secs(300));
+        let (refused, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(
+            (refused.status(), outcome),
+            (StatusCode::SERVICE_UNAVAILABLE, CacheOutcome::Miss)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_unsafe_request_invalidates_its_target_and_the_locations_it_names() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(html("public, max-age=600"));
+        for path in ["/cart", "/cart/1", "/other"] {
+            sent(
+                &cache,
+                asked_with(Method::GET, path, "dep-1", &[("accept-encoding", "br")]),
+                &app,
+            )
+            .await;
+            sent(
+                &cache,
+                asked_with(Method::GET, path, "dep-1", &[("accept-encoding", "gzip")]),
+                &app,
+            )
+            .await;
+        }
+        let deployment = DeploymentId::parse("dep-1").unwrap();
+        let mut refused = answer(&[], Bytes::new());
+        *refused.status_mut() = StatusCode::FORBIDDEN;
+        cache
+            .invalidate(&deployment, "app-1.apps.example.com", "/cart", &refused)
+            .await;
+        assert_eq!(cache.entries.entry_count(), 6, "a refused POST changed nothing");
+        let created = answer(
+            &[("location", "https://app-1.apps.example.com/cart/1")],
+            Bytes::new(),
+        );
+        cache
+            .invalidate(&deployment, "app-1.apps.example.com", "/cart", &created)
+            .await;
+        let woken = app.woken();
+        for path in ["/cart", "/cart/1"] {
+            let (_, outcome, _) = sent(
+                &cache,
+                asked_with(Method::GET, path, "dep-1", &[("accept-encoding", "br")]),
+                &app,
+            )
+            .await;
+            assert_eq!(outcome, CacheOutcome::Miss, "{path}");
+        }
+        let (_, outcome, _) = sent(
+            &cache,
+            asked_with(Method::GET, "/other", "dep-1", &[("accept-encoding", "br")]),
+            &app,
+        )
+        .await;
+        assert_eq!(outcome, CacheOutcome::Hit);
+        assert_eq!(app.woken(), woken + 2);
     }
 
     #[tokio::test]
@@ -993,6 +1647,8 @@ mod tests {
                 CacheOutcome::Hit,
                 "{content_type}"
             );
+            let (_, outcome, body) = sent(&cache, asked_with(Method::GET, &path, "dep-1", &[]), &app).await;
+            assert_eq!((outcome, body), (CacheOutcome::Hit, page()), "{content_type}");
         }
     }
 
@@ -1026,6 +1682,37 @@ mod tests {
         );
         let (_, outcome, body) = sent(&cache, identity(), &app).await;
         assert_eq!((outcome, body, app.woken()), (CacheOutcome::Hit, page(), 1));
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_app_compressed_itself_is_stored_under_that_coding_and_never_decoded_for_others() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|parts| {
+            let gzip = parts.headers[ACCEPT_ENCODING] == "gzip";
+            let mut headers = vec![
+                ("content-type", "text/html"),
+                ("cache-control", "public, max-age=60"),
+            ];
+            if gzip {
+                headers.push(("content-encoding", "gzip"));
+            }
+            answer(&headers, Bytes::from_static(b"as the app sent it"))
+        });
+        sent(&cache, asked("gzip"), &app).await;
+        let (_, outcome, body) = sent(&cache, asked("gzip"), &app).await;
+        assert_eq!(
+            (outcome, body),
+            (CacheOutcome::Hit, Bytes::from_static(b"as the app sent it"))
+        );
+        let (plain, outcome, _) = sent(&cache, asked_with(Method::GET, "/", "dep-1", &[]), &app).await;
+        assert_eq!(
+            outcome,
+            CacheOutcome::Miss,
+            "the app's own gzip is not decoded for it"
+        );
+        assert!(!plain.headers().contains_key("content-encoding"));
+        assert_eq!(app.woken(), 2);
     }
 
     #[tokio::test]
