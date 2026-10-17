@@ -215,18 +215,14 @@ impl Jail {
         }
     }
 
-    /// Writes an instance's runtime controls into the cgroup the jailer just made for `pid`.
-    pub(crate) fn apply_controls(
-        &self,
-        app_id: &AppId,
-        pid: i32,
-        controls: &super::limits::RuntimeControls,
-    ) -> std::io::Result<()> {
+    /// The OOM score belongs to the process rather than its cgroup, so it is written once the VMM's
+    /// process exists; the jailer's exec keeps it.
+    pub(crate) fn apply_oom_score(&self, pid: i32) -> std::io::Result<()> {
         #[cfg(test)]
         if self.fake_mounts {
             return Ok(());
         }
-        controls.write(&super::limits::cgroup_path(app_id), pid)
+        self.limits.write_oom_score(pid)
     }
 
     pub(crate) fn grant_socket(&self, path: &Path) -> std::io::Result<()> {
