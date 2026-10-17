@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 pub const DEFAULT_CONFIG_FILE: &str = "/etc/nibrunner/config.toml";
@@ -214,6 +214,7 @@ pub struct HostConfig {
     pub artifact_store_url: String,
     pub storage_prefix: String,
     pub volumes: VolumeBackend,
+    pub allowed_egress_endpoints: Vec<SocketAddr>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
     pub proxy: ProxyConfig,
@@ -470,6 +471,10 @@ mod file {
     #[serde(deny_unknown_fields)]
     #[schemars(rename = "network")]
     pub(super) struct Network {
+        /// Exact private IP:port pairs guests may still open TCP to, such as an object store on
+        /// your own network. Absent, every private destination stays denied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) allowed_egress_endpoints: Option<Vec<String>>,
         /// Each `a.b.c.d/n`, `n` at most 32.
         #[schemars(inner(pattern(CIDR_V4)))]
         pub(super) denied_egress_addresses_v4: Option<Vec<String>>,
@@ -737,6 +742,12 @@ impl HostConfig {
                 required_str("volumes.storage_prefix", &volumes.storage_prefix)?,
             )?,
             volumes: backend,
+            allowed_egress_endpoints: network
+                .allowed_egress_endpoints
+                .as_deref()
+                .map(allowed_egress_endpoints)
+                .transpose()?
+                .unwrap_or_default(),
             denied_egress_addresses_v4: cidrs(
                 "network.denied_egress_addresses_v4",
                 required(
@@ -816,6 +827,7 @@ impl HostConfig {
             artifact_store_url: state_dir.join("artifact-store").display().to_string(),
             storage_prefix: "volumes".to_string(),
             volumes: VolumeBackend::LocalFile,
+            allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: vec![],
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig::default(),
@@ -870,6 +882,7 @@ impl HostConfig {
                 checkpoint_config_file: PathBuf::from("/etc/zerofs/checkpoint.toml"),
                 checkpoint_cache_dir: PathBuf::from("/data/zerofs-checkpoint"),
             })),
+            allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: vec![],
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig {
@@ -973,6 +986,12 @@ impl HostConfig {
                 staging_dir: text(&self.export_staging_dir),
             }),
             network: Some(file::Network {
+                allowed_egress_endpoints: (!self.allowed_egress_endpoints.is_empty()).then(|| {
+                    self.allowed_egress_endpoints
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect()
+                }),
                 denied_egress_addresses_v4: Some(self.denied_egress_addresses_v4.clone()),
                 denied_egress_addresses_v6: Some(self.denied_egress_addresses_v6.clone()),
             }),
@@ -1258,6 +1277,50 @@ enum Family {
     V6,
 }
 
+fn host_tcp_endpoints(field: &str, values: &[String]) -> Result<Vec<SocketAddr>, ConfigError> {
+    let invalid = || ConfigError::invalid(field, "IP:port pairs with a nonzero port and a unicast address");
+    let mut endpoints = values
+        .iter()
+        .map(|value| {
+            let endpoint: SocketAddr = value.parse().map_err(|_| invalid())?;
+            if endpoint.port() == 0
+                || endpoint.ip().is_unspecified()
+                || endpoint.ip().is_multicast()
+                || matches!(endpoint.ip(), IpAddr::V4(address) if address.is_broadcast())
+                || matches!(endpoint, SocketAddr::V6(address) if address.scope_id() != 0)
+            {
+                return Err(invalid());
+            }
+            Ok(endpoint)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    Ok(endpoints)
+}
+
+/// A guest's packets to loopback or to the guest network never take the forward chain past the
+/// guest-to-guest deny, so such an endpoint would render a rule that opens nothing; it is refused.
+/// Guests have no IPv6 network of their own, so loopback is the one IPv6 refusal.
+fn allowed_egress_endpoints(values: &[String]) -> Result<Vec<SocketAddr>, ConfigError> {
+    const FIELD: &str = "network.allowed_egress_endpoints";
+    let endpoints = host_tcp_endpoints(FIELD, values)?;
+    for endpoint in &endpoints {
+        let refusal = match endpoint.ip().to_canonical() {
+            ip if ip.is_loopback() => "loopback (127.0.0.0/8, ::1)".to_string(),
+            IpAddr::V4(ip) if nft_render::in_guest_network(ip) => {
+                format!("the guest network ({})", nft_render::GUEST_NETWORK_CIDR)
+            }
+            _ => continue,
+        };
+        return Err(ConfigError::invalid(
+            FIELD,
+            format_args!("a list of private endpoints a guest can reach: {endpoint} is in {refusal}"),
+        ));
+    }
+    Ok(endpoints)
+}
+
 fn cidrs(field: &str, values: &[String], family: Family) -> Result<Vec<String>, ConfigError> {
     values
         .iter()
@@ -1394,6 +1457,79 @@ staging_dir = "/var/lib/nibrunner/exports"
 denied_egress_addresses_v4 = []
 denied_egress_addresses_v6 = []
 "#;
+
+    #[test]
+    fn allowed_egress_endpoints_are_optional_exact_pairs() {
+        assert!(parsed(WHOLE).allowed_egress_endpoints.is_empty());
+        let config = parsed(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.5:9000\", \"[fd00::5]:9000\", \"10.0.0.5:9000\"]\n"
+        ));
+        assert_eq!(
+            config.allowed_egress_endpoints,
+            vec![
+                "10.0.0.5:9000".parse::<SocketAddr>().unwrap(),
+                "[fd00::5]:9000".parse().unwrap()
+            ]
+        );
+        assert_eq!(parsed(&config.to_toml()), config);
+        for invalid in [
+            "10.0.0.0/8:9000",
+            "storage.internal:9000",
+            "10.0.0.5:0",
+            "[ff02::1]:9000",
+        ] {
+            assert!(
+                refused(&format!("{WHOLE}allowed_egress_endpoints = [\"{invalid}\"]\n"))
+                    .contains("network.allowed_egress_endpoints is not IP:port pairs"),
+                "{invalid}"
+            );
+        }
+    }
+
+    fn egress_refusal(endpoint: &str) -> String {
+        refused(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.5:9000\", \"{endpoint}\"]\n"
+        ))
+    }
+
+    #[test]
+    fn an_allowed_egress_endpoint_on_loopback_is_refused() {
+        for endpoint in [
+            "127.0.0.1:9000",
+            "127.255.0.9:9000",
+            "[::1]:9000",
+            "[::ffff:127.0.0.1]:9000",
+        ] {
+            let message = egress_refusal(endpoint);
+            assert!(
+                message.starts_with("network.allowed_egress_endpoints is not"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("{endpoint} is in loopback (127.0.0.0/8, ::1)")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_allowed_egress_endpoint_in_the_guest_network_is_refused() {
+        for endpoint in [
+            "10.201.0.2:3000",
+            "10.201.255.254:9000",
+            "[::ffff:10.201.0.1]:9000",
+        ] {
+            let message = egress_refusal(endpoint);
+            assert!(
+                message.contains(&format!("{endpoint} is in the guest network (10.201.0.0/16)")),
+                "{message}"
+            );
+        }
+        assert!(HostConfig::from_toml(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.200.0.2:3000\", \"10.202.0.2:3000\"]\n"
+        ))
+        .is_ok());
+    }
 
     /// A key as the refusals name it: `section.key`, or the bare key above the first section.
     fn field_of(section: &str, key: &str) -> String {

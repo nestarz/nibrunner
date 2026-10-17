@@ -266,6 +266,10 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
             host_ipv4: protocol::Ipv4Address::parse("10.201.0.1").unwrap(),
             guest_ipv4: protocol::Ipv4Address::parse("10.201.0.2").unwrap(),
         }],
+        allowed_egress_endpoints: vec![
+            "10.0.0.5:9000".parse().unwrap(),
+            "[fd00::5]:9000".parse().unwrap(),
+        ],
         denied_egress_addresses_v4: vec!["10.43.0.0/16".into()],
         denied_egress_addresses_v6: vec!["2600:1f18:abcd::/56".into()],
     };
@@ -283,6 +287,7 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(held.contains("reject comment \"instance metadata endpoint\""));
     assert!(held.contains("reject comment \"guest to guest\""));
     assert!(held.contains("reject comment \"guest to host\""));
+    assert!(held.contains("ip daddr 10.0.0.5 tcp dport 9000 accept comment \"allowed egress endpoint\""));
     assert!(held.contains("dnat to 10.201.0.2:3000"));
     assert!(held.contains("masquerade"));
     assert!(held.contains("hook output"));
@@ -296,6 +301,7 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
         .expect("the kernel names the v6 table");
     assert!(v6.contains("fe80::/10"));
     assert!(v6.contains("2600:1f18:abcd::/56"));
+    assert!(v6.contains("ip6 daddr fd00::5 tcp dport 9000 accept comment \"allowed egress endpoint\""));
 
     let traffic = firewall.traffic().await.expect("the kernel lists its counters");
     assert!(traffic.contains_key(&protocol::AppId::parse("app-1").unwrap()));

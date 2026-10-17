@@ -22,7 +22,8 @@ the key and the reason.
   is an error that names the key.
 - **Unknown keys are errors.** A typo is reported as an unknown key, not as a missing one.
 - **Only whole sections are optional.** `[proxy.http.tls]`, `[proxy.raw]`, `[metrics]` and
-  `[logs]` can be omitted. If present, they must be complete.
+  `[logs]` can be omitted. If present, they must be complete. The one optional key is
+  `allowed_egress_endpoints` in `[network]`.
 
 Example errors:
 
@@ -67,6 +68,23 @@ shows every section filled in.
 Each app slot reserves eight consecutive ports starting at 21000. Every listener in `config.toml`
 must be outside the range `21000` to `21000 + 8 × max_apps − 1`. Port `0` is rejected.
 `metrics.port` must differ from `proxy.http.port`.
+
+## Reaching one private endpoint from a guest
+
+Guests cannot open connections to private destinations (RFC 1918, link-local, loopback, CGNAT,
+and their IPv6 counterparts). To let them reach one service on your own network, such as an
+object store, name its exact address and port:
+
+```toml
+[network]
+allowed_egress_endpoints = ["10.0.0.5:9000", "[fd00::5]:9000"]
+```
+
+This allows TCP only to these exact endpoints, each an IP literal and a port; ranges and
+hostnames are refused, and so are loopback (`127.0.0.0/8`, `::1`) and the guest network
+(`10.201.0.0/16`), which a guest never reaches through the host. Named egress denies, the
+instance metadata endpoint and other guests still take precedence, and every other private
+destination stays denied. Run `nibrunnerd start` to apply the change.
 
 ## Environment variables
 

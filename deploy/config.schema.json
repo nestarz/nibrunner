@@ -186,6 +186,13 @@
       "description": "The ranges a guest is denied by name, on top of the blanket rules: public addresses that are\nstill yours, and that a tenant must not reach. Both may be empty; both must be there.",
       "type": "object",
       "properties": {
+        "allowed_egress_endpoints": {
+          "description": "Exact private IP:port pairs guests may still open TCP to, such as an object store on\nyour own network. Absent, every private destination stays denied.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "denied_egress_addresses_v4": {
           "description": "Each `a.b.c.d/n`, `n` at most 32.",
           "type": "array",
