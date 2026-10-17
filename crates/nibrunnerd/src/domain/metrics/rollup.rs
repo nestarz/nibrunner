@@ -1,5 +1,5 @@
 //! The per-unit hour and day a control plane charts, summed from this page's own `nibrunner_app_`
-//! counters. The shapes are the control plane's `metrics/<host>/<yyyymmddhh>.json` and `<yyyymmdd>.json`,
+//! counters and the per-app `nibrunner_proxy_` ones. The shapes are the control plane's `metrics/<host>/<yyyymmddhh>.json` and `<yyyymmdd>.json`,
 //! which its readers parse: a field renamed here is a chart gone blank there.
 use std::collections::BTreeMap;
 
@@ -22,6 +22,13 @@ pub struct UnitMetrics {
     pub tx_bytes: u64,
     pub wakes: u64,
     pub sleeps: u64,
+    pub cache_hit: u64,
+    pub cache_stale: u64,
+    pub cache_miss: u64,
+    pub cache_bypass: u64,
+    /// What the proxy's compression took from the app and gave out, every coding together.
+    pub encoded_bytes_in: u64,
+    pub encoded_bytes_out: u64,
 }
 
 impl UnitMetrics {
@@ -39,6 +46,12 @@ impl UnitMetrics {
         self.tx_bytes += other.tx_bytes;
         self.wakes += other.wakes;
         self.sleeps += other.sleeps;
+        self.cache_hit += other.cache_hit;
+        self.cache_stale += other.cache_stale;
+        self.cache_miss += other.cache_miss;
+        self.cache_bypass += other.cache_bypass;
+        self.encoded_bytes_in += other.encoded_bytes_in;
+        self.encoded_bytes_out += other.encoded_bytes_out;
     }
 }
 
@@ -72,13 +85,20 @@ pub fn micros_rfc3339(micros: i64) -> String {
     at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
-/// Series by unit, then by name without `nibrunner_app_` and the labels other than `app`.
+/// Series by unit, then by name without `nibrunner_app_` (a proxy series keeps `proxy_`) and the
+/// labels other than `app`.
 pub type Samples = BTreeMap<String, BTreeMap<String, f64>>;
+
+fn unit_series(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("nibrunner_")?;
+    rest.strip_prefix("app_")
+        .or_else(|| rest.starts_with("proxy_").then_some(rest))
+}
 
 pub fn parse(page: &str) -> Samples {
     let mut out = Samples::new();
     for line in page.lines() {
-        let Some(rest) = line.strip_prefix("nibrunner_app_") else {
+        let Some(rest) = unit_series(line) else {
             continue;
         };
         let Some(split) = rest.find(['{', ' ']) else {
@@ -206,6 +226,18 @@ impl Counting {
                     },
                     "wakes_total" => m.wakes += n,
                     "sleeps_total" => m.sleeps += n,
+                    "proxy_cache_requests_total" => match label(s, "outcome") {
+                        Some("hit") => m.cache_hit += n,
+                        Some("stale") => m.cache_stale += n,
+                        Some("miss") => m.cache_miss += n,
+                        Some("bypass") => m.cache_bypass += n,
+                        _ => {}
+                    },
+                    "proxy_encode_bytes_total" => match label(s, "direction") {
+                        Some("in") => m.encoded_bytes_in += n,
+                        Some("out") => m.encoded_bytes_out += n,
+                        _ => {}
+                    },
                     _ => continue,
                 }
                 unit_moved |= d > 0.0;
@@ -261,8 +293,21 @@ mod tests {
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"rx\"}} 100\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"tx\"}} 200\n\
              nibrunner_app_wakes_total{{app=\"site\"}} 1\n\
+             nibrunner_proxy_requests_total{{app=\"site\",outcome=\"served\"}} {requests}\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"hit\"}} {requests}\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"stale\"}} 1\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"miss\"}} {}\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"bypass\"}} 0\n\
+             nibrunner_proxy_cache_bytes 4096\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"br\",direction=\"in\"}} {}\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"br\",direction=\"out\"}} {requests}\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"gzip\",direction=\"in\"}} {}\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"gzip\",direction=\"out\"}} {requests}\n\
              nibrunner_app_requests_total{{app=\"build-x\",class=\"2xx\"}} 9\n",
-            requests + 1
+            requests + 1,
+            requests * 2,
+            requests * 10,
+            requests * 10,
         )
     }
 
@@ -289,6 +334,16 @@ mod tests {
             [("0.005".to_string(), 2), ("+Inf".to_string(), 0)].into()
         );
         assert_eq!((site.cpu_s, site.mem_peak_mib), (1.5, 64));
+        assert_eq!(
+            (
+                site.cache_hit,
+                site.cache_stale,
+                site.cache_miss,
+                site.cache_bypass
+            ),
+            (2, 0, 4, 0)
+        );
+        assert_eq!((site.encoded_bytes_in, site.encoded_bytes_out), (40, 4));
         assert!(
             !document.units.contains_key("build-x"),
             "a unit without labels is not charted"
@@ -322,6 +377,12 @@ mod tests {
                 tx_bytes: 200,
                 wakes: 1,
                 sleeps: 0,
+                cache_hit: 2,
+                cache_stale: 0,
+                cache_miss: 1,
+                cache_bypass: 0,
+                encoded_bytes_in: 30_000,
+                encoded_bytes_out: 2_000,
             },
         )];
         let document = MetricsHour {
