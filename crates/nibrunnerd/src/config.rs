@@ -357,6 +357,7 @@ pub struct HostConfig {
     pub storage_prefix: String,
     pub volumes: VolumeBackend,
     pub allowed_host_tcp_endpoints: Vec<SocketAddr>,
+    pub allowed_egress_endpoints: Vec<SocketAddr>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
     pub proxy: ProxyConfig,
@@ -637,6 +638,10 @@ mod file {
         /// Exact host TCP endpoints guests may call. Absent permits no guest-initiated host connections.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) host_tcp: Option<HostTcp>,
+        /// Exact private IP:port pairs guests may still open TCP to, such as an object store on
+        /// your own network. Absent, every private destination stays denied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) allowed_egress_endpoints: Option<Vec<String>>,
         /// Each `a.b.c.d/n`, `n` at most 32.
         #[schemars(inner(pattern(CIDR_V4)))]
         pub(super) denied_egress_addresses_v4: Option<Vec<String>>,
@@ -986,8 +991,17 @@ impl HostConfig {
                 .host_tcp
                 .as_ref()
                 .map(|tcp| {
-                    host_tcp_endpoints(required("network.host_tcp.endpoints", tcp.endpoints.as_ref())?)
+                    host_tcp_endpoints(
+                        "network.host_tcp.endpoints",
+                        required("network.host_tcp.endpoints", tcp.endpoints.as_ref())?,
+                    )
                 })
+                .transpose()?
+                .unwrap_or_default(),
+            allowed_egress_endpoints: network
+                .allowed_egress_endpoints
+                .as_deref()
+                .map(|endpoints| host_tcp_endpoints("network.allowed_egress_endpoints", endpoints))
                 .transpose()?
                 .unwrap_or_default(),
             denied_egress_addresses_v4: cidrs(
@@ -1071,6 +1085,7 @@ impl HostConfig {
             storage_prefix: "volumes".to_string(),
             volumes: VolumeBackend::LocalFile,
             allowed_host_tcp_endpoints: vec![],
+            allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: vec![],
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig::default(),
@@ -1130,6 +1145,7 @@ impl HostConfig {
                 checkpoint_cache_dir: PathBuf::from("/data/zerofs-checkpoint"),
             })),
             allowed_host_tcp_endpoints: vec![],
+            allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: vec![],
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig {
@@ -1266,6 +1282,12 @@ impl HostConfig {
                             .map(ToString::to_string)
                             .collect(),
                     ),
+                }),
+                allowed_egress_endpoints: (!self.allowed_egress_endpoints.is_empty()).then(|| {
+                    self.allowed_egress_endpoints
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect()
                 }),
                 denied_egress_addresses_v4: Some(self.denied_egress_addresses_v4.clone()),
                 denied_egress_addresses_v6: Some(self.denied_egress_addresses_v6.clone()),
@@ -1658,13 +1680,8 @@ enum Family {
     V6,
 }
 
-fn host_tcp_endpoints(values: &[String]) -> Result<Vec<SocketAddr>, ConfigError> {
-    let invalid = || {
-        ConfigError::invalid(
-            "network.host_tcp.endpoints",
-            "IP:port pairs with a nonzero port and a unicast address",
-        )
-    };
+fn host_tcp_endpoints(field: &str, values: &[String]) -> Result<Vec<SocketAddr>, ConfigError> {
+    let invalid = || ConfigError::invalid(field, "IP:port pairs with a nonzero port and a unicast address");
     let mut endpoints = values
         .iter()
         .map(|value| {
@@ -1852,7 +1869,8 @@ denied_egress_addresses_v6 = []
 
     #[test]
     fn host_tcp_endpoints_are_exact_validated_and_optional() {
-        assert!(host_tcp_endpoints(&[]).unwrap().is_empty());
+        const FIELD: &str = "network.host_tcp.endpoints";
+        assert!(host_tcp_endpoints(FIELD, &[]).unwrap().is_empty());
         assert!(parsed(WHOLE).allowed_host_tcp_endpoints.is_empty());
         assert!(refused(&format!("{WHOLE}\n[network.host_tcp]\n")).contains("network.host_tcp.endpoints"));
         let config = parsed(&format!(
@@ -1868,7 +1886,7 @@ denied_egress_addresses_v6 = []
             "[2001:db8::10]:443".to_string(),
             "203.0.113.10:443".to_string(),
         ];
-        assert_eq!(host_tcp_endpoints(&valid).unwrap().len(), 2);
+        assert_eq!(host_tcp_endpoints(FIELD, &valid).unwrap().len(), 2);
         for invalid in [
             "example.com:443",
             "203.0.113.0/24:443",
@@ -1881,8 +1899,30 @@ denied_egress_addresses_v6 = []
             "[ff02::1]:443",
             "203.0.113.10:443; accept",
         ] {
-            assert!(host_tcp_endpoints(&[invalid.to_string()]).is_err(), "{invalid}");
+            assert!(
+                host_tcp_endpoints(FIELD, &[invalid.to_string()]).is_err(),
+                "{invalid}"
+            );
         }
+    }
+
+    #[test]
+    fn allowed_egress_endpoints_are_optional_exact_pairs() {
+        assert!(parsed(WHOLE).allowed_egress_endpoints.is_empty());
+        let config = parsed(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.5:9000\", \"[fd00::5]:9000\"]\n"
+        ));
+        assert_eq!(
+            config.allowed_egress_endpoints,
+            vec![
+                "10.0.0.5:9000".parse::<SocketAddr>().unwrap(),
+                "[fd00::5]:9000".parse().unwrap()
+            ]
+        );
+        assert!(refused(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.0/8:9000\"]\n"
+        ))
+        .contains("network.allowed_egress_endpoints"));
     }
 
     /// A key as the refusals name it: `section.key`, or the bare key above the first section.

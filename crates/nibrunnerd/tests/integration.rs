@@ -312,6 +312,10 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
             "203.0.113.10:443".parse().unwrap(),
             "[2001:db8::10]:443".parse().unwrap(),
         ],
+        allowed_egress_endpoints: vec![
+            "10.0.0.5:9000".parse().unwrap(),
+            "[fd00::5]:9000".parse().unwrap(),
+        ],
         denied_egress_addresses_v4: vec!["10.43.0.0/16".into()],
         denied_egress_addresses_v6: vec!["2600:1f18:abcd::/56".into()],
     };
@@ -330,6 +334,7 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(held.contains("reject comment \"guest to guest\""));
     assert!(held.contains("reject comment \"guest to host\""));
     assert!(held.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
+    assert!(held.contains("ip daddr 10.0.0.5 tcp dport 9000 accept comment \"allowed egress endpoint\""));
     assert!(held.contains("ct direction reply ct state established,related accept"));
     let activity_rules: Vec<_> = held
         .lines()
