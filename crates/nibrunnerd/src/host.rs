@@ -100,6 +100,42 @@ impl Host {
         );
     }
 
+    /// Takes up every instance's `limits` without a new deployment: the proxy's per-instance
+    /// concurrency for the next request, and a running microVM's cgroup and OOM score now. A boot
+    /// or a wake applies what the record holds, so an instance asleep picks them up as it wakes.
+    pub(crate) async fn apply_instance_limits(&self, desired: &protocol::HostDesiredState) {
+        self.router.set_instance_concurrency(
+            desired
+                .instances
+                .iter()
+                .filter_map(|instance| {
+                    instance
+                        .limits
+                        .and_then(|limits| limits.concurrent)
+                        .map(|limit| (instance.app_id.clone(), limit))
+                })
+                .collect(),
+        );
+        for instance in &desired.instances {
+            let Some(record) = self.state.record(&instance.app_id).await else {
+                continue;
+            };
+            if record.deployment_id != instance.deployment_id || record.limits == instance.limits {
+                continue;
+            }
+            self.state
+                .update_record(&instance.app_id, |record| record.limits = instance.limits)
+                .await;
+            if let Err(error) = self
+                .vms
+                .apply_limits(&instance.app_id, record.resources, instance.limits)
+                .await
+            {
+                tracing::warn!(app_id = %instance.app_id, error = %error.message(), "limits not applied");
+            }
+        }
+    }
+
     pub async fn slot_for(
         &self,
         app_id: &AppId,
@@ -242,6 +278,52 @@ mod tests {
     use crate::repositories::slots_repository::MockSlotRepository;
     use crate::repositories::Repositories;
     use crate::test_support::*;
+
+    fn limited(concurrent: u16) -> protocol::InstanceLimits {
+        protocol::InstanceLimits {
+            concurrent: Some(concurrent.try_into().unwrap()),
+            cpu_percent: Some(25.try_into().unwrap()),
+            memory: Some(protocol::MemoryPolicy {
+                target_mib: 128.try_into().unwrap(),
+                swap_mib: 0,
+                priority: protocol::MemoryPriority::Preview,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn limits_a_document_changes_reach_the_record_without_a_new_deployment() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let mut desired = desired_state(|state| {
+            state.instances = vec![desired_instance(|instance| instance.limits = Some(limited(2)))]
+        });
+        host.apply_instance_limits(&desired).await;
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().limits,
+            Some(limited(2))
+        );
+
+        desired.instances[0].limits = None;
+        host.apply_instance_limits(&desired).await;
+        assert_eq!(host.state.record(&app_id()).await.unwrap().limits, None);
+        assert_eq!(host.vms.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn another_deployments_limits_are_left_for_its_own_boot() {
+        let host = test_host().await;
+        host.state.put_record(instance_record(|_| {})).await;
+        let desired = desired_state(|state| {
+            state.instances = vec![desired_instance(|instance| {
+                instance.deployment_id = protocol::DeploymentId::parse("dep-2").unwrap();
+                instance.limits = Some(limited(2));
+            })]
+        });
+        host.apply_instance_limits(&desired).await;
+        assert_eq!(host.state.record(&app_id()).await.unwrap().limits, None);
+        assert!(host.vms.calls().is_empty());
+    }
 
     fn mocked() -> (
         MockInstanceRepository,

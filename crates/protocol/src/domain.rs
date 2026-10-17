@@ -477,6 +477,51 @@ pub const DEFAULT_INSTANCE_RESOURCES: InstanceResources = InstanceResources {
     memory_mib: 256,
 };
 
+/// What the host enforces on an instance beyond what `resources` gives it. Every field is optional
+/// and applied live, without replacing the deployment: a running microVM's cgroup is rewritten and
+/// the proxy's limit takes the next request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstanceLimits {
+    /// Requests the proxy carries to this instance at once, in place of the host's
+    /// `proxy.http.concurrency.app_concurrent`. Its host-wide limit still applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<std::num::NonZeroU16>,
+    /// Host CPU time in percent of one core, enforced as a `cpu.max` quota that only ever tightens
+    /// the `vcpuCount` cores `resources` gives: `25` is a quarter of a core, and a value above
+    /// `vcpuCount × 100` changes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<std::num::NonZeroU16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPolicy>,
+}
+
+/// How the kernel treats this instance's memory when the host runs short. None of it changes the
+/// guest's RAM or the cgroup's hard ceiling, which `resources` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryPolicy {
+    /// Working-set target, capped by the hard memory budget. Does not resize guest RAM.
+    pub target_mib: std::num::NonZeroU32,
+    /// Maximum uncompressed bytes allowed in host swap, in MiB. Zero disables swap.
+    pub swap_mib: u32,
+    pub priority: MemoryPriority,
+}
+
+/// `production` keeps its target resident (`memory.low`) and is the last the OOM killer picks;
+/// `preview` and `build` are throttled at their target (`memory.high`) and picked first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryPriority {
+    Production,
+    Standard,
+    Preview,
+    Build,
+}
+
 /// What tells this host an instance is well — and so what a wake waits for before it hands the
 /// caller on, and what the instance's liveness is read from after that. Named in every document:
 /// a default would be a kind nobody chose, and the one that looks obvious lies. A TCP connect is

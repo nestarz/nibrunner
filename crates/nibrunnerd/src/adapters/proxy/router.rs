@@ -121,7 +121,7 @@ impl Router {
         limits: Option<crate::config::HttpConcurrency>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            concurrency: limits.map(super::concurrency::ConcurrencyLimiter::new),
+            concurrency: Some(super::concurrency::ConcurrencyLimiter::new(limits)),
             routes: RwLock::new(Arc::new(RouteTable::default())),
             upstreams: Upstreams::default(),
             metrics,
@@ -135,6 +135,13 @@ impl Router {
             .retain(|_, route| &route.app_id != app_id);
         if let Some(http_log) = &self.http_log {
             http_log.discard(app_id).await;
+        }
+    }
+
+    /// Each instance's `limits.concurrent`, taken by the next request routed to it.
+    pub fn set_instance_concurrency(&self, limits: BTreeMap<AppId, std::num::NonZeroU16>) {
+        if let Some(concurrency) = &self.concurrency {
+            concurrency.set_instance_limits(limits);
         }
     }
 

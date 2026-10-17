@@ -370,6 +370,21 @@ impl VmManager {
             .map_err(|error| VmError::Host(format!("snapshot memory could not be reserved: {error}")))
     }
 
+    fn lift_memory_high(&self, app_id: &AppId) -> Result<Option<super::limits::MemoryHighLift>, VmError> {
+        if !self
+            .processes
+            .read_record(app_id)
+            .is_some_and(|record| record.jail_root.is_some())
+        {
+            return Ok(None);
+        }
+        super::limits::lift_memory_high(&super::limits::cgroup_path(app_id)).map_err(|error| {
+            VmError::Host(format!(
+                "memory.high could not be lifted for the snapshot: {error}"
+            ))
+        })
+    }
+
     async fn snapshot_paused_vm(
         &self,
         request: &SuspendRequest,
@@ -377,6 +392,7 @@ impl VmManager {
         stamp: SnapshotStamp,
     ) -> Result<u64, VmError> {
         let mut memory = self.reserve_snapshot_memory(&request.app_id)?;
+        let _unthrottled = self.lift_memory_high(&request.app_id)?;
         let outcome = async {
             let staged = StagedSnapshot::create(&self.snapshot_dir)?;
             self.create_snapshot(
@@ -456,15 +472,24 @@ impl Vmm for VmManager {
         let app_id = request.desired.app_id.clone();
         self.discard_snapshot(&app_id);
         let staged = std::time::Instant::now();
-        let prepared = self.stage(&request).await?;
+        let mut prepared = self.stage(&request).await?;
         let staged_ms = staged.elapsed().as_millis();
+        prepared
+            .jail
+            .limits
+            .constrain(super::limits::RuntimeControls::for_instance(
+                request.desired.config.resources,
+                request.desired.limits.as_ref(),
+            ));
 
         let starting = std::time::Instant::now();
         let started = self
             .processes
             .spawn(&app_id, &self.firecracker, &self.jailer, &prepared.jail, true)
-            .await;
+            .await
+            .and_then(|record| prepared.jail.apply_oom_score(record.pid));
         if let Err(error) = started {
+            self.processes.stop(&app_id).await;
             self.cron_registration.detach(&app_id).await;
             let _ = self.logs.detach(&app_id).await;
             return Err(VmError::Host(error.to_string()));
@@ -577,7 +602,7 @@ impl Vmm for VmManager {
         }
 
         let _ = std::fs::remove_file(&paths.stamp_path);
-        let jail = self.prepare_jail(&request.app_id).await?;
+        let mut jail = self.prepare_jail(&request.app_id).await?;
         self.readopt(&request.app_id).await?;
         jail.grant_socket(&tenant_log_socket_path(&jail.root))
             .map_err(|error| VmError::Host(error.to_string()))?;
@@ -600,10 +625,18 @@ impl Vmm for VmManager {
         }
         let state_path = PathBuf::from("/snapshots/state");
         let memory_path = PathBuf::from("/snapshots/memory");
+        if let Some(record) = self.state.record(&request.app_id).await {
+            jail.limits
+                .constrain(super::limits::RuntimeControls::for_instance(
+                    record.resources,
+                    record.limits.as_ref(),
+                ));
+        }
         let started = self
             .processes
             .spawn(&request.app_id, &self.firecracker, &self.jailer, &jail, false)
             .await
+            .and_then(|record| jail.apply_oom_score(record.pid))
             .map_err(|error| VmError::Host(error.to_string()));
         let outcome = match started {
             Err(error) => Err(error),
@@ -681,6 +714,28 @@ impl Vmm for VmManager {
             .iter()
             .filter_map(|id| self.processes.memory(id).map(|memory| (id.clone(), memory)))
             .collect()
+    }
+
+    async fn apply_limits(
+        &self,
+        app_id: &AppId,
+        resources: protocol::InstanceResources,
+        limits: Option<protocol::InstanceLimits>,
+    ) -> Result<(), VmError> {
+        let Some(record) = self
+            .processes
+            .read_record(app_id)
+            .filter(|record| record.jail_root.is_some() && self.processes.status(app_id).active)
+        else {
+            return Ok(());
+        };
+        let cgroup = super::limits::cgroup_path(app_id);
+        if !cgroup.exists() {
+            return Ok(());
+        }
+        super::limits::RuntimeControls::for_instance(resources, limits.as_ref())
+            .write(&cgroup, record.pid)
+            .map_err(|error| VmError::Host(format!("the instance's limits could not be applied: {error}")))
     }
 
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
