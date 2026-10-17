@@ -174,7 +174,9 @@ impl Counting {
             let Some(app) = apps.get(unit) else { continue };
             let last = self.last.as_ref().map(|l| l.get(unit));
             let mut m = UnitMetrics::default();
-            let mut buckets: Vec<(f64, String, u64)> = vec![];
+            // What each cumulative bucket counted, summed by `le` across the other labels (the
+            // status class): a bucket is one series per class, and only their sum is the unit's.
+            let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
             let mut unit_moved = false;
             for (s, v) in series {
                 let name = s.split_once('{').map_or(s.as_str(), |(n, _)| n);
@@ -196,7 +198,7 @@ impl Counting {
                     }
                     "request_seconds_bucket" => {
                         let le = label(s, "le").unwrap_or("+Inf");
-                        buckets.push((le.parse().unwrap_or(f64::INFINITY), le.to_owned(), n));
+                        *buckets.entry(le.to_owned()).or_default() += n;
                     }
                     "cpu_seconds_total" => m.cpu_s += d,
                     "network_bytes_total" => match label(s, "direction") {
@@ -210,6 +212,10 @@ impl Counting {
                 }
                 unit_moved |= d > 0.0;
             }
+            let mut buckets: Vec<(f64, String, u64)> = buckets
+                .into_iter()
+                .map(|(le, n)| (le.parse().unwrap_or(f64::INFINITY), le, n))
+                .collect();
             buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
             let mut below = 0;
             for (_, le, n) in buckets {
@@ -254,15 +260,16 @@ mod tests {
             "# TYPE nibrunner_app_requests_total counter\n\
              nibrunner_app_requests_total{{app=\"site\",class=\"2xx\"}} {requests}\n\
              nibrunner_app_requests_total{{app=\"site\",class=\"5xx\"}} 1\n\
-             nibrunner_app_request_seconds_bucket{{app=\"site\",le=\"0.005\"}} {requests}\n\
-             nibrunner_app_request_seconds_bucket{{app=\"site\",le=\"+Inf\"}} {}\n\
+             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"0.005\"}} {requests}\n\
+             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"+Inf\"}} {requests}\n\
+             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"0.005\"}} 0\n\
+             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"+Inf\"}} 1\n\
              nibrunner_app_cpu_seconds_total{{app=\"site\"}} {cpu}\n\
              nibrunner_app_memory_used_bytes{{app=\"site\"}} 67108864\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"rx\"}} 100\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"tx\"}} 200\n\
              nibrunner_app_wakes_total{{app=\"site\"}} 1\n\
-             nibrunner_app_requests_total{{app=\"build-x\",class=\"2xx\"}} 9\n",
-            requests + 1
+             nibrunner_app_requests_total{{app=\"build-x\",class=\"2xx\"}} 9\n"
         )
     }
 
@@ -292,6 +299,41 @@ mod tests {
         assert!(
             !document.units.contains_key("build-x"),
             "a unit without labels is not charted"
+        );
+    }
+
+    #[test]
+    fn the_latency_buckets_of_every_status_class_are_summed_before_they_are_split() {
+        let page = |ok: u64, failed: u64| {
+            format!(
+                "nibrunner_app_requests_total{{app=\"site\",class=\"2xx\"}} {ok}\n\
+                 nibrunner_app_requests_total{{app=\"site\",class=\"5xx\"}} {failed}\n\
+                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"0.005\"}} {ok}\n\
+                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"0.1\"}} {ok}\n\
+                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"+Inf\"}} {ok}\n\
+                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"0.005\"}} 0\n\
+                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"0.1\"}} {failed}\n\
+                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"+Inf\"}} {failed}\n"
+            )
+        };
+        let mut counting = Counting::carried(HOUR, None, None);
+        counting.count(parse(&page(0, 0)), &units());
+        assert!(counting.count(parse(&page(3, 1)), &units()));
+        let site = &counting.documents(HOUR)[0].1.units["site"];
+        assert_eq!(site.requests, 4);
+        assert_eq!(
+            site.by_status,
+            [("2xx".to_string(), 3), ("5xx".to_string(), 1)].into()
+        );
+        assert_eq!(
+            site.latency_hist,
+            [
+                ("0.005".to_string(), 3),
+                ("0.1".to_string(), 1),
+                ("+Inf".to_string(), 0)
+            ]
+            .into(),
+            "three 2xx under 5ms and one 5xx between 5ms and 100ms"
         );
     }
 
