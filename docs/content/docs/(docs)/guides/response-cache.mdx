@@ -1,0 +1,98 @@
+---
+title: Response cache and compression
+description: Answer from memory while an app sleeps, and compress what leaves the proxy.
+---
+
+The HTTP proxy can keep the responses an app marks as shareable and answer later requests from
+memory, and it can compress responses on their way out. Each is a section under `[proxy.http]`,
+and each is off while its section is absent.
+
+```toml
+[proxy.http.cache]
+memory_mib = 128
+max_entry_kib = 1024
+
+[proxy.http.encode]
+encodings = ["br", "gzip"]
+min_kib = 1
+```
+
+| Key | Meaning |
+| --- | --- |
+| [`cache.memory_mib`](/docs/reference/config#proxyhttpcache-memory_mib) | What every stored response may weigh together, headers and bodies. The least recently and least often used go first. |
+| [`cache.max_entry_kib`](/docs/reference/config#proxyhttpcache-max_entry_kib) | The largest body kept, measured as stored, after compression. A larger one is served and not kept. |
+| [`encode.encodings`](/docs/reference/config#proxyhttpencode-encodings) | The codings offered, in order of preference when a visitor accepts several equally. Empty offers none. |
+| [`encode.min_kib`](/docs/reference/config#proxyhttpencode-min_kib) | A body whose `Content-Length` is smaller is sent as it is. |
+
+Changing either section takes `nibrunnerd start`.
+
+## What is cached
+
+The app decides, with its own headers. The cache is a shared cache as RFC 9111 defines one, with no
+heuristic freshness: a response is stored only when the app gives it an explicit lifetime.
+
+| The app sends | Stored |
+| --- | --- |
+| `Cache-Control: public, max-age=60`, `s-maxage=60`, or `Expires` | yes |
+| no caching headers, or only `Last-Modified` | no |
+| `no-store` or `private` | no |
+| `Set-Cookie` without `public` | no |
+| an answer to a request with `Authorization`, without `public`, `s-maxage` or `must-revalidate` | no |
+
+Only `GET` and `HEAD` requests without a body or a `Range` are answered from the cache; a `HEAD` is
+answered from the stored `GET`. A response is stored under the app's `deploymentId`, the hostname,
+the path and query, and the coding it was sent in, and under each variant its `Vary` names. A new
+`deploymentId` starts from an empty cache; what the old one stored is evicted as memory is needed.
+A `POST`, `PUT`, `PATCH` or `DELETE` that succeeds removes what is stored for its path and for the
+`Location` and `Content-Location` it names on the same hostname.
+
+A visitor's own `Cache-Control: no-cache` or `max-age=0` does not bypass a fresh entry, so a
+reload does not wake a sleeping app.
+
+<Callout title="A hit does not wake the app">
+  The proxy looks in the cache before it hands the request to the app. A request answered from
+  memory never reaches the activator: a sleeping app stays asleep, and the request does not count
+  as the app's activity. A static site keeps serving while its microVM sleeps.
+</Callout>
+
+## Past a response's lifetime
+
+| The app sent | A stale entry is |
+| --- | --- |
+| `stale-while-revalidate=N` | served for `N` seconds while one request revalidates it in the background; that request wakes the app once |
+| `stale-if-error=N` | served for `N` seconds when revalidation fails or the app cannot be woken |
+| neither | revalidated with `If-None-Match` or `If-Modified-Since` before it is served; a `304` refreshes it |
+
+`no-cache`, `must-revalidate`, `proxy-revalidate` and `s-maxage` forbid serving a stale entry at
+all. A visitor holding the stored `ETag` or `Last-Modified` is answered `304` from the cache.
+
+## Compression
+
+The proxy negotiates one coding from the visitor's `Accept-Encoding`: `br` or `gzip` as
+`encodings` allows, the visitor's highest `q` first, `*` counting as `gzip`, `identity` when the
+visitor accepts neither. The app is asked with that one coding in `Accept-Encoding`.
+
+A response is compressed when its status is `200`, `203`, `404` or `410`, it has no
+`Content-Encoding` or `Content-Range`, it does not say `Cache-Control: no-transform`, and its type
+is text: `text/*`, JSON, JavaScript, XML, RSS, Atom, web manifests, `application/wasm`, SVG,
+`font/ttf` and `font/otf`. Images, video, archives and `font/woff2` are sent as they are. A
+compressed response gets `Vary: Accept-Encoding`, and a strong `ETag` becomes weak (`"v1"` becomes
+`W/"v1"`); `If-None-Match` still matches it.
+
+The cache stores the compressed body, so a hit compresses nothing. Each coding is stored apart. A
+visitor that accepts no coding is served a stored `gzip` or `br` body decompressed as it is sent,
+without asking the app. A body the app compressed itself is stored as it is and never
+decompressed for a visitor that did not ask for its coding.
+
+## What to watch
+
+Each line of `<appId>.http.jsonl` gains `cache` (`hit`, `stale`, `miss` or `bypass`) on a host with
+`[proxy.http.cache]`, and `encoding` (`br`, `gzip` or `identity`, the coding the body was sent in)
+on a host with either section. The metrics are in the
+[reference](/docs/reference/metrics):
+
+| Metric | Labels |
+| --- | --- |
+| `nibrunner_proxy_cache_requests_total` | `app`, `outcome` |
+| `nibrunner_proxy_cache_bytes` | none |
+| `nibrunner_proxy_encode_bytes_total` | `app`, `encoding`, `direction` |

@@ -583,6 +583,8 @@ mod tests {
         let mut config = HostConfig::under(Path::new("/srv/nibrunner"));
         config.proxy.http = Some(HttpListener {
             concurrency: None,
+            cache: None,
+            encode: None,
             listen_address: "0.0.0.0".parse().unwrap(),
             port: 443,
             tls: Some(TlsMaterial {

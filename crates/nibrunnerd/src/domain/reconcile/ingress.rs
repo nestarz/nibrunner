@@ -67,6 +67,8 @@ mod tests {
         ProxyConfig {
             http: Some(HttpListener {
                 concurrency: None,
+                cache: None,
+                encode: None,
                 listen_address: here(),
                 port: 8080,
                 tls: None,

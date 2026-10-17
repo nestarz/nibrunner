@@ -163,6 +163,12 @@ pub enum WakeOutcome {
 }
 
 impl WakeOutcome {
+    /// Whether the request was held while a microVM was brought back from disk or booted, which is
+    /// the wait its HTTP request record attributes to it.
+    pub fn held_the_request(self) -> bool {
+        matches!(self, WakeOutcome::Restored | WakeOutcome::ColdBoot)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             WakeOutcome::Restored => "restored",
@@ -339,7 +345,8 @@ pub enum WakeRefusal {
 #[cfg_attr(any(test, feature = "testing"), mockall::automock)]
 #[async_trait]
 pub trait Waker: Send + Sync {
-    async fn wake(&self, app_id: &AppId) -> Result<(), WakeRefusal>;
+    /// Brings the app up for a request and says what that took, once it can be handed the request.
+    async fn wake(&self, app_id: &AppId) -> Result<WakeOutcome, WakeRefusal>;
 }
 
 #[cfg_attr(any(test, feature = "testing"), mockall::automock)]

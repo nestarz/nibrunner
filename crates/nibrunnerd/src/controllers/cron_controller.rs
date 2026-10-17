@@ -419,7 +419,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Waker for WakeChecksPin {
-        async fn wake(&self, app_id: &protocol::AppId) -> Result<(), WakeRefusal> {
+        async fn wake(&self, app_id: &protocol::AppId) -> Result<crate::ports::WakeOutcome, WakeRefusal> {
             assert!(self.state.cron_running(app_id));
             let _transition = self.state.transition(app_id).await;
             self.state
@@ -430,7 +430,7 @@ mod tests {
                 })
                 .await;
             self.called.store(true, Ordering::SeqCst);
-            Ok(())
+            Ok(crate::ports::WakeOutcome::Restored)
         }
     }
 
@@ -543,7 +543,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Waker for WaitingWake {
-        async fn wake(&self, _: &protocol::AppId) -> Result<(), WakeRefusal> {
+        async fn wake(&self, _: &protocol::AppId) -> Result<crate::ports::WakeOutcome, WakeRefusal> {
             self.ready.notify_one();
             std::future::pending().await
         }

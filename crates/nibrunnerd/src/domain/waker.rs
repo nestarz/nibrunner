@@ -9,11 +9,11 @@ use crate::domain::health::is_within_grace_period;
 use crate::domain::health::probe::probe_instance;
 use crate::domain::report::capacity::{committed_resources, memory_shortfall_mib};
 use crate::host::Host;
-use crate::ports::{WakeFailure, WakeRefusal, Waker};
+use crate::ports::{WakeFailure, WakeOutcome, WakeRefusal, Waker};
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(5);
 
-type Outcome = Result<(), WakeRefusal>;
+type Outcome = Result<WakeOutcome, WakeRefusal>;
 type Coalescing = BTreeMap<AppId, (broadcast::Sender<Outcome>, u64)>;
 type InFlight = Mutex<Coalescing>;
 
@@ -172,7 +172,7 @@ impl AppWaker {
             coalesced = joined,
             "app woken by a request"
         );
-        Ok(())
+        Ok(outcome)
     }
 
     /// A running app is booted by the pass, not by a request, so a request only reaches here
@@ -221,7 +221,8 @@ impl AppWaker {
                             coalesced = joined,
                             "app answered the request held through its boot"
                         );
-                        return Ok(());
+                        // The boot was the pass's; the request did not cause it.
+                        return Ok(WakeOutcome::AlreadyRunning);
                     }
                     if !is_within_grace_period(&record.grace_inputs(crate::clock::now_ms())) {
                         return Err(WakeRefusal::Failed {
@@ -292,7 +293,7 @@ impl Drop for Leader<'_> {
 
 #[async_trait::async_trait]
 impl Waker for AppWaker {
-    async fn wake(&self, app_id: &AppId) -> Result<(), WakeRefusal> {
+    async fn wake(&self, app_id: &AppId) -> Result<WakeOutcome, WakeRefusal> {
         let started = Instant::now();
         let role = {
             let mut in_flight = lock(&self.in_flight);

@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::adapters::proxy::forward::{forward, say, ProxyBody, Upstreams};
+use crate::adapters::proxy::http_log::wake_header;
 use crate::domain::metrics::sleep_wake::Answer;
 use crate::domain::metrics::HostMetrics;
 use crate::ports::{WakeFailure, WakeRefusal, Waker};
@@ -129,6 +130,7 @@ impl AppActivator {
         self.state.mark_active(&app_id, crate::clock::now_ms()).await;
 
         let started = std::time::Instant::now();
+        let mut held_for_a_wake = false;
         // An idle guest is asleep and has to be woken. Any other guest that reaches the activator
         // is one the firewall stopped forwarding because it is no longer Running, yet it may well
         // still be serving its port — an app the health tracker moved to Unhealthy is the case that
@@ -143,8 +145,9 @@ impl AppActivator {
         let guest = SocketAddr::from((guest_ipv4.addr(), record.http_port.get()));
         if record.is_idle() || self.state.is_snapshotting(&app_id).await || !accepts_a_connection(guest).await
         {
-            if let Err(refusal) = self.waker.wake(&app_id).await {
-                match refusal {
+            match self.waker.wake(&app_id).await {
+                Ok(outcome) => held_for_a_wake = outcome.held_the_request(),
+                Err(refusal) => match refusal {
                     WakeRefusal::NoRoom { shortfall_mib } => {
                         tracing::warn!(%app_id, shortfall_mib, "a request could not be given an app");
                         return (host_is_full(), Answer::HostFull);
@@ -162,10 +165,10 @@ impl AppActivator {
                         tracing::warn!(%app_id, reason, "a request could not be given an app");
                         return (app_would_not_start(), Answer::WouldNotStart);
                     }
-                }
+                },
             }
         }
-        let woke_ms = started.elapsed().as_millis();
+        let woke = started.elapsed();
 
         let Some(woken) = self.state.record(&app_id).await else {
             return (app_would_not_start(), Answer::WouldNotStart);
@@ -178,7 +181,7 @@ impl AppActivator {
         }
         let served = std::time::Instant::now();
         let upstream = self.upstreams.to(&app_id).await;
-        let response = forward(
+        let mut response = forward(
             &upstream,
             request,
             woken_guest_ipv4.as_str(),
@@ -188,9 +191,16 @@ impl AppActivator {
         )
         .await;
         self.metrics.sleep_wake.first_response(served.elapsed());
+        response.headers_mut().remove(wake_header());
+        if held_for_a_wake {
+            response.headers_mut().insert(
+                wake_header(),
+                hyper::header::HeaderValue::from(u64::try_from(woke.as_micros()).unwrap_or(u64::MAX)),
+            );
+        }
         tracing::debug!(
             %app_id,
-            woke_ms,
+            woke_ms = woke.as_millis(),
             served_ms = served.elapsed().as_millis(),
             "app answered the request that woke it"
         );
@@ -235,6 +245,7 @@ async fn accept(listener: TcpListener, activator: Arc<AppActivator>, app_id: App
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::WakeOutcome;
     use crate::state::HostState;
     use crate::test_support::{app_id, instance_record};
     use protocol::{HttpPort, InstanceState, Ipv4Address};
@@ -267,10 +278,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Waker for CountingWaker {
-        async fn wake(&self, _app_id: &AppId) -> Result<(), WakeRefusal> {
+        async fn wake(&self, _app_id: &AppId) -> Result<WakeOutcome, WakeRefusal> {
             self.woken.fetch_add(1, Ordering::SeqCst);
             match &self.refusal {
-                None => Ok(()),
+                None => Ok(WakeOutcome::Restored),
                 Some(refusal) => Err(refusal.clone()),
             }
         }
@@ -347,12 +358,12 @@ mod tests {
     struct WakingBringsUpAGuest {
         port: HostPort,
         body: &'static str,
-        outcome: Result<(), WakeRefusal>,
+        outcome: Result<WakeOutcome, WakeRefusal>,
     }
 
     #[async_trait::async_trait]
     impl Waker for WakingBringsUpAGuest {
-        async fn wake(&self, _app_id: &AppId) -> Result<(), WakeRefusal> {
+        async fn wake(&self, _app_id: &AppId) -> Result<WakeOutcome, WakeRefusal> {
             let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], self.port.get())))
                 .await
                 .unwrap();
@@ -379,14 +390,52 @@ mod tests {
         let waker = WakingBringsUpAGuest {
             port: HostPort::new(port).unwrap(),
             body: "served by the replacement\n",
-            outcome: Ok(()),
+            outcome: Ok(WakeOutcome::AlreadyRunning),
         };
         let activator = AppActivator::new(state, Arc::new(waker), Arc::default());
         let host_port = serving(&activator, &app_id()).await;
 
         let response = get(host_port).await;
         assert_eq!(response.status(), 200);
+        assert!(
+            response.headers().get(wake_header()).is_none(),
+            "the boot was the pass's, so the request is not charged with it"
+        );
         assert_eq!(response.text().await.unwrap(), "served by the replacement\n");
+    }
+
+    #[tokio::test]
+    async fn a_request_held_for_a_restore_or_a_cold_boot_is_handed_back_with_how_long_it_waited() {
+        for (outcome, attributed) in [
+            (WakeOutcome::Restored, true),
+            (WakeOutcome::ColdBoot, true),
+            (WakeOutcome::AlreadyRunning, false),
+        ] {
+            let state = HostState::shared();
+            let port = free_port().await;
+            state
+                .put_record(instance_record(|record| {
+                    record.on_request = true;
+                    record.state = InstanceState::Idle;
+                    record.guest_ipv4 = Some(Ipv4Address::parse("127.0.0.1").unwrap());
+                    record.http_port = HttpPort::new(port).unwrap();
+                }))
+                .await;
+            let waker = WakingBringsUpAGuest {
+                port: HostPort::new(port).unwrap(),
+                body: "woken\n",
+                outcome: Ok(outcome),
+            };
+            let activator = AppActivator::new(state, Arc::new(waker), Arc::default());
+            let host_port = serving(&activator, &app_id()).await;
+
+            let mut headers = get(host_port).await.headers().clone();
+            assert_eq!(
+                crate::adapters::proxy::http_log::take_wake_micros(&mut headers).is_some(),
+                attributed,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -522,10 +571,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Waker for HoldingWaker {
-        async fn wake(&self, _app_id: &AppId) -> Result<(), WakeRefusal> {
+        async fn wake(&self, _app_id: &AppId) -> Result<WakeOutcome, WakeRefusal> {
             self.woken.fetch_add(1, Ordering::SeqCst);
             self.gate.acquire().await.unwrap().forget();
-            Ok(())
+            Ok(WakeOutcome::Restored)
         }
     }
 
