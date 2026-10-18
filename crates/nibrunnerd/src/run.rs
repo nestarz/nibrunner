@@ -6,8 +6,9 @@ use tokio::sync::Mutex;
 
 use crate::adapters::artifact_store::ObjectArtifactStore;
 use crate::adapters::exec::HostCommands;
+use crate::adapters::logs::object_sink::{Bucket, SealKey, TelemetryError};
 use crate::adapters::logs::receiver::TenantLogReceiver;
-use crate::adapters::logs::FileLogSink;
+use crate::adapters::logs::{FileLogSink, ObjectSink};
 use crate::adapters::net::allocator::SlotAllocator;
 use crate::adapters::net::firewall::HostFirewall;
 use crate::adapters::net::tap::HostNetwork;
@@ -122,15 +123,17 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         .map_err(|error| StartupError::Unusable(error.to_string()))?;
     let cron_registration = crate::adapters::cron_registration::CronRegistrationReceiver::new(cron.clone());
     let logs = TenantLogReceiver::new();
-    let files = Arc::new(FileLogSink::new(
-        config.logs_dir(),
-        config.logs.keep_bytes_per_app,
-    ));
+    let telemetry = open_telemetry(&config)?;
+    let mut files = FileLogSink::new(config.logs_dir(), config.logs.keep_bytes_per_app);
+    let mut http_log = HttpRequestLog::new(config.logs_dir())
+        .map_err(|error| StartupError::Config(format!("HTTP request logs could not be opened: {error}")))?;
+    if let Some(telemetry) = &telemetry {
+        files = files.with_objects(telemetry.clone());
+        http_log = http_log.with_objects(telemetry.clone());
+    }
+    let files = Arc::new(files);
+    let http_log = Arc::new(http_log);
     let sink = Arc::new(RestartRecorder::new(state.clone(), files.clone()));
-    let http_log =
-        Arc::new(HttpRequestLog::new(config.logs_dir()).map_err(|error| {
-            StartupError::Config(format!("HTTP request logs could not be opened: {error}"))
-        })?);
 
     let processes = VmProcesses::new(config.runtime_dir.clone());
     let reaped = reap_stale_snapshots(
@@ -238,6 +241,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         cache: Mutex::new(DesiredStateCache::new()),
         vms,
         logs: files,
+        telemetry,
         volumes,
         artifacts,
         payloads,
@@ -262,6 +266,23 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     });
     let _ = waker_slot.set(AppWaker::new(host.clone()));
     Ok(host)
+}
+
+/// Absent when `[logs] sink` names no bucket.
+fn open_telemetry(config: &HostConfig) -> Result<Option<Arc<ObjectSink>>, StartupError> {
+    let refused = |error: TelemetryError| StartupError::Config(error.to_string());
+    config
+        .logs
+        .sink
+        .as_ref()
+        .map(|sink| {
+            Ok(ObjectSink::new((
+                Bucket::open(&sink.store_url)?,
+                SealKey::read(&sink.seal_key_file)?,
+            )))
+        })
+        .transpose()
+        .map_err(refused)
 }
 
 struct DeferredWaker {

@@ -19,6 +19,7 @@ use hyper::Uri;
 use protocol::{AppId, DeploymentId, InstanceLabels, Timestamp};
 use serde::Serialize;
 
+use crate::adapters::logs::ObjectSink;
 use crate::json_store::make_directory;
 
 const QUEUED_RECORDS: usize = 1024;
@@ -28,16 +29,16 @@ const KEPT_BYTES_PER_APP: u64 = 1024 * 1024;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpRequestRecord {
-    at: Timestamp,
-    method: String,
-    path: String,
-    status: u16,
-    duration_micros: u64,
+    pub(crate) at: Timestamp,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) status: u16,
+    pub(crate) duration_micros: u64,
     deployment_id: DeploymentId,
     #[serde(skip_serializing_if = "InstanceLabels::is_empty")]
-    labels: InstanceLabels,
+    pub(crate) labels: InstanceLabels,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wake_micros: Option<u64>,
+    pub(crate) wake_micros: Option<u64>,
 }
 
 /// The header on which the activator hands back how long it held a request for its app to wake,
@@ -96,6 +97,7 @@ pub struct HttpRequestLog {
     apps: Mutex<BTreeMap<AppId, Arc<AtomicBool>>>,
     worker: Option<JoinHandle<()>>,
     dropped: AtomicU64,
+    objects: Option<Arc<ObjectSink>>,
 }
 
 pub(super) struct HttpRequestScope {
@@ -120,7 +122,14 @@ impl HttpRequestLog {
             apps: Mutex::new(BTreeMap::new()),
             worker: Some(worker),
             dropped: AtomicU64::new(0),
+            objects: None,
         })
+    }
+
+    /// Every request is also shipped to a control plane's bucket.
+    pub fn with_objects(mut self, objects: Arc<ObjectSink>) -> Self {
+        self.objects = Some(objects);
+        self
     }
 
     pub(super) async fn begin(&self, app_id: &AppId) -> HttpRequestScope {
@@ -138,6 +147,9 @@ impl HttpRequestLog {
     }
 
     pub(super) fn record(&self, scope: HttpRequestScope, record: HttpRequestRecord) {
+        if let Some(objects) = &self.objects {
+            objects.request(&scope.app_id, &record);
+        }
         let Some(sender) = &self.sender else {
             return;
         };
@@ -472,6 +484,7 @@ mod tests {
             apps: Mutex::new(BTreeMap::new()),
             worker: None,
             dropped: AtomicU64::new(0),
+            objects: None,
         };
         let app = crate::test_support::app_id();
         let scope = logs.begin(&app).await;

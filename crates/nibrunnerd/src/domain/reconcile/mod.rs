@@ -210,6 +210,11 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
                 } else {
                     host.state.drop_record(app_id).await;
                 }
+                if let Some(telemetry) = &host.telemetry {
+                    if let Err(error) = telemetry.forget(app_id).await {
+                        tracing::warn!(%app_id, %error, "the last of an app's output did not reach its sink");
+                    }
+                }
                 host.logs.discard(app_id);
                 host.router.discard_http_log(app_id).await;
             }
@@ -325,6 +330,9 @@ async fn apply_starts(host: &Arc<Host>, plan: &ReconcilePlan) {
 /// timer runs one whether or not anything moved: that is how a volume whose device died under a
 /// standing document gets noticed.
 pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Trigger) {
+    if let Some(telemetry) = &host.telemetry {
+        telemetry.learn(desired);
+    }
     let deployments = desired
         .instances
         .iter()
