@@ -9,6 +9,8 @@ use crate::domain::report::capacity::FilesystemSpace;
 use crate::json_store::{make_directory, read_json, write_json};
 use crate::ports::VmError;
 
+use super::process::FIRECRACKER_VERSION;
+
 pub const SNAPSHOT_STATE_FILENAME: &str = "vmstate";
 pub const SNAPSHOT_MEMORY_FILENAME: &str = "memory";
 
@@ -41,6 +43,84 @@ pub struct SnapshotStamp {
     pub guest_image_version: String,
     pub host_boot_id: String,
     pub slot: u32,
+    /// The Firecracker that took it. A stamp an earlier daemon wrote does not say, and is
+    /// restored only on the boot it was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_version: Option<String>,
+    #[serde(flatten)]
+    pub host: SnapshotHost,
+}
+
+/// What of the machine a snapshot can only be restored on the same of, read once a run: KVM
+/// restores a guest's state only under the kernel it was saved from, and a guest given no CPU
+/// template was handed the host CPU's own features, which a microcode update can take away.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotHost {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_kernel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_template: Option<String>,
+}
+
+// nibrunner sets no Firecracker CPU template, so the guest sees the host's CPUID: the template is
+// named for that, with the host CPU's identity and features after it.
+const NO_CPU_TEMPLATE: &str = "none";
+
+fn kernel_from(release: &str, version: &str) -> String {
+    format!("{} {}", release.trim(), version.trim())
+}
+
+fn cpu_template_from(cpuinfo: &str) -> Option<String> {
+    use sha2::Digest;
+    let first_processor = cpuinfo.split("\n\n").next()?;
+    let identity: Vec<&str> = first_processor
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| {
+            matches!(
+                key.trim(),
+                "vendor_id" | "cpu family" | "model" | "stepping" | "flags"
+            )
+        })
+        .map(|(_, value)| value.trim())
+        .collect();
+    if identity.is_empty() {
+        return None;
+    }
+    let digest = sha2::Sha256::digest(identity.join("\n").as_bytes());
+    Some(format!("{NO_CPU_TEMPLATE}/{}", hex::encode(&digest[..8])))
+}
+
+impl SnapshotHost {
+    pub fn this_one() -> &'static Self {
+        static THIS_HOST: std::sync::OnceLock<SnapshotHost> = std::sync::OnceLock::new();
+        THIS_HOST.get_or_init(|| {
+            let read = |path: &str| std::fs::read_to_string(path).ok();
+            Self {
+                host_kernel: read("/proc/sys/kernel/osrelease")
+                    .zip(read("/proc/sys/kernel/version"))
+                    .map(|(release, version)| kernel_from(&release, &version)),
+                cpu_template: read("/proc/cpuinfo").as_deref().and_then(cpu_template_from),
+            }
+        })
+    }
+}
+
+/// Why a snapshot taken on an earlier boot cannot be restored on this one, if it cannot. One
+/// taken this boot was taken on this kernel and CPU, whatever its stamp has room for; one from a
+/// boot before is restored only onto the same of both, and a stamp that does not say is not.
+fn host_drift(stored: &SnapshotStamp, boot_id: &str, host: &SnapshotHost) -> Option<&'static str> {
+    if stored.host_boot_id == boot_id {
+        return None;
+    }
+    if stored.host.host_kernel.is_none() || stored.host.host_kernel != host.host_kernel {
+        return Some("the host has rebooted into another kernel");
+    }
+    if stored.host.cpu_template.is_none() || stored.host.cpu_template != host.cpu_template {
+        return Some("the host has rebooted onto another CPU");
+    }
+    None
 }
 
 fn drift_reason(stored: &SnapshotStamp, expected: &SnapshotStamp) -> Option<&'static str> {
@@ -50,8 +130,13 @@ fn drift_reason(stored: &SnapshotStamp, expected: &SnapshotStamp) -> Option<&'st
     if stored.guest_image_version != expected.guest_image_version {
         return Some("the guest image has changed");
     }
-    if stored.host_boot_id != expected.host_boot_id {
-        return Some("the host has rebooted");
+    if let Some(reason) = host_drift(stored, &expected.host_boot_id, &expected.host) {
+        return Some(reason);
+    }
+    if stored.firecracker_version != expected.firecracker_version
+        && (stored.firecracker_version.is_some() || stored.host_boot_id != expected.host_boot_id)
+    {
+        return Some("the snapshot was taken by another Firecracker");
     }
     if stored.slot != expected.slot {
         return Some("the app has moved to another slot");
@@ -226,13 +311,14 @@ pub struct Reaped {
     pub bytes: u64,
 }
 
-/// Removes every snapshot under `snapshot_dir` that was not taken this boot: one stamped with
-/// another boot id, and one with no stamp this host can read. Neither can ever be woken from —
-/// a wake refuses them by name — and each holds the memory its app was promised, so left alone
-/// they are the disk a reboot leaves behind, for good. One stamped this boot is never touched,
-/// whatever else its stamp says: that is the wake's to judge, and to say why. Unpublished
+/// Removes every snapshot under `snapshot_dir` this boot can never restore: one with no stamp
+/// this host can read, and one from an earlier boot taken under another Firecracker, kernel or
+/// CPU. A wake would refuse each by name, and each holds the memory its app was promised, so left
+/// alone they are the disk a reboot leaves behind, for good. One a reboot left restorable is kept,
+/// so that a nightly reboot does not cold-boot every app asleep. Whatever else a kept stamp says
+/// — another deployment, another slot — is the wake's to judge, and to say why. Unpublished
 /// staging directories are removed even during the same host boot.
-pub fn reap_stale_snapshots(snapshot_dir: &Path, host_boot_id: &str) -> Reaped {
+pub fn reap_stale_snapshots(snapshot_dir: &Path, boot_id: &str, host: &SnapshotHost) -> Reaped {
     let mut reaped = Reaped::default();
     let Ok(entries) = std::fs::read_dir(snapshot_dir) else {
         return reaped;
@@ -246,13 +332,18 @@ pub fn reap_stale_snapshots(snapshot_dir: &Path, host_boot_id: &str) -> Reaped {
             && crate::json_store::read_text(&directory.join(EXCHANGE_BOOT_ID_FILENAME))
                 .ok()
                 .flatten()
-                .is_some_and(|stored| stored == host_boot_id)
+                .is_some_and(|stored| stored == boot_id)
         {
             continue;
         }
         let stamp: Option<SnapshotStamp> = read_json(&directory.join(SNAPSHOT_STAMP_FILENAME)).ok().flatten();
+        let restorable = |stamp: &SnapshotStamp| {
+            stamp.host_boot_id == boot_id
+                || (host_drift(stamp, boot_id, host).is_none()
+                    && stamp.firecracker_version.as_deref() == Some(FIRECRACKER_VERSION))
+        };
         if !entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX)
-            && stamp.is_some_and(|stamp| stamp.host_boot_id == host_boot_id)
+            && stamp.as_ref().is_some_and(restorable)
         {
             continue;
         }
@@ -263,7 +354,7 @@ pub fn reap_stale_snapshots(snapshot_dir: &Path, host_boot_id: &str) -> Reaped {
                 reaped.bytes += bytes;
             }
             Err(error) => {
-                tracing::warn!(path = %directory.display(), %error, "a snapshot left by an earlier boot could not be removed");
+                tracing::warn!(path = %directory.display(), %error, "a snapshot this boot cannot restore could not be removed");
             }
         }
     }
@@ -446,10 +537,19 @@ mod tests {
 
     fn stamp() -> SnapshotStamp {
         SnapshotStamp {
+            firecracker_version: Some(FIRECRACKER_VERSION.to_string()),
             deployment_id: deployment_id(),
             guest_image_version: "6.1.180-98db6df338f0".into(),
             host_boot_id: "b6b8f0d2-0000-4000-8000-000000000001".into(),
             slot: 7,
+            host: this_host(),
+        }
+    }
+
+    fn this_host() -> SnapshotHost {
+        SnapshotHost {
+            host_kernel: Some("6.8.0-90-generic #91-Ubuntu SMP".into()),
+            cpu_template: Some("none/0123456789abcdef".into()),
         }
     }
 
@@ -483,7 +583,27 @@ mod tests {
             host_boot_id: "another".into(),
             ..stamp()
         };
-        assert!(drift_from(&rebooted, &stamp()).unwrap().contains("rebooted"));
+        assert_eq!(
+            drift_from(&rebooted, &stamp()),
+            None,
+            "the same kernel on the same CPU"
+        );
+        let patched = SnapshotStamp {
+            host: SnapshotHost {
+                host_kernel: Some("6.8.0-91-generic #92-Ubuntu SMP".into()),
+                ..this_host()
+            },
+            ..rebooted.clone()
+        };
+        assert!(drift_from(&patched, &stamp()).unwrap().contains("another kernel"));
+        let microcode = SnapshotStamp {
+            host: SnapshotHost {
+                cpu_template: Some("none/fedcba9876543210".into()),
+                ..this_host()
+            },
+            ..rebooted
+        };
+        assert!(drift_from(&microcode, &stamp()).unwrap().contains("another CPU"));
         let moved = SnapshotStamp { slot: 8, ..stamp() };
         assert!(drift_from(&moved, &stamp()).unwrap().contains("another slot"));
     }
@@ -607,8 +727,16 @@ mod tests {
             host_boot_id: "after-a-reboot".into(),
             ..stamp()
         };
-        let refused = ensure_loadable(&paths, &rebooted).unwrap_err();
-        assert!(refused.message().contains("rebooted"));
+        ensure_loadable(&paths, &rebooted).unwrap();
+        let upgraded = SnapshotStamp {
+            host: SnapshotHost {
+                host_kernel: Some("6.8.0-91-generic".into()),
+                ..this_host()
+            },
+            ..rebooted
+        };
+        let refused = ensure_loadable(&paths, &upgraded).unwrap_err();
+        assert!(refused.message().contains("rebooted into another kernel"));
     }
 
     #[test]
@@ -737,7 +865,7 @@ mod tests {
         let staged = StagedSnapshot::create(directory.path()).unwrap();
         std::fs::write(&staged.paths.memory_path, b"memory").unwrap();
         write_json(&staged.paths.stamp_path, &stamp()).unwrap();
-        let reaped = reap_stale_snapshots(directory.path(), &stamp().host_boot_id);
+        let reaped = reap_stale_snapshots(directory.path(), &stamp().host_boot_id, &this_host());
         assert_eq!(reaped.snapshots, 1);
         assert!(!staged.paths.directory.exists());
     }
@@ -745,10 +873,12 @@ mod tests {
     #[test]
     fn the_first_reason_a_snapshot_drifted_is_the_one_the_operator_is_told() {
         let everything_moved = SnapshotStamp {
+            firecracker_version: Some(FIRECRACKER_VERSION.to_string()),
             deployment_id: DeploymentId::parse("dep-2").unwrap(),
             guest_image_version: "another".into(),
             host_boot_id: "another".into(),
             slot: 8,
+            host: SnapshotHost::default(),
         };
         assert!(drift_from(&everything_moved, &stamp())
             .unwrap()
@@ -853,18 +983,22 @@ mod tests {
     }
 
     fn stamped_by(boot_id: &str) -> String {
+        stamped_on(boot_id, SnapshotHost::default())
+    }
+
+    fn stamped_on(boot_id: &str, host: SnapshotHost) -> String {
         serde_json::to_string(&SnapshotStamp {
             host_boot_id: boot_id.into(),
+            host,
             ..stamp()
         })
         .unwrap()
     }
 
-    // After a reboot every snapshot on the disk is of a kernel that is gone, and a wake refuses
-    // each by name — but nothing else ever removed them, and a host was found holding 9 GiB of
-    // them from the boot before.
+    // A wake refuses a snapshot this boot cannot restore by name, but nothing else ever removed
+    // one, and a host was found holding 9 GiB of them from the boot before.
     #[test]
-    fn snapshots_left_by_an_earlier_boot_are_removed_and_those_of_this_boot_are_kept() {
+    fn snapshots_this_boot_cannot_restore_are_removed_and_those_of_this_boot_are_kept() {
         let directory = tempfile::tempdir().unwrap();
         let this_boot = stamp().host_boot_id;
         let kept = asleep(directory.path(), "app-1", 100, Some(&stamped_by(&this_boot)));
@@ -878,7 +1012,7 @@ mod tests {
         let unreadable = asleep(directory.path(), "app-4", 100_000, Some("{ not a stamp"));
         std::fs::write(directory.path().join("a-file"), b"not a snapshot").unwrap();
 
-        let reaped = reap_stale_snapshots(directory.path(), &this_boot);
+        let reaped = reap_stale_snapshots(directory.path(), &this_boot, &this_host());
 
         assert_eq!(
             reaped,
@@ -915,21 +1049,113 @@ mod tests {
         let kept = asleep(directory.path(), "app-1", 100, Some(&drifted));
 
         assert_eq!(
-            reap_stale_snapshots(directory.path(), &this_boot),
+            reap_stale_snapshots(directory.path(), &this_boot, &this_host()),
             Reaped::default()
         );
         assert!(kept.join(SNAPSHOT_STAMP_FILENAME).is_file());
+    }
+
+    // A nightly reboot onto the same kernel is the common one, and cold-booting every app asleep
+    // after it is what keeping the snapshots saves.
+    #[test]
+    fn a_snapshot_an_earlier_boot_took_on_this_kernel_this_cpu_and_this_firecracker_survives_the_reboot() {
+        let directory = tempfile::tempdir().unwrap();
+        let survives = asleep(
+            directory.path(),
+            "app-1",
+            100,
+            Some(&stamped_on("the-boot-before", this_host())),
+        );
+        let other_kernel = asleep(
+            directory.path(),
+            "app-2",
+            100,
+            Some(&stamped_on(
+                "the-boot-before",
+                SnapshotHost {
+                    host_kernel: Some("6.8.0-91-generic".into()),
+                    ..this_host()
+                },
+            )),
+        );
+        let older_firecracker = asleep(
+            directory.path(),
+            "app-3",
+            100,
+            Some(
+                &serde_json::to_string(&SnapshotStamp {
+                    firecracker_version: Some("v1.15.0".into()),
+                    host_boot_id: "the-boot-before".into(),
+                    ..stamp()
+                })
+                .unwrap(),
+            ),
+        );
+
+        let reaped = reap_stale_snapshots(directory.path(), &stamp().host_boot_id, &this_host());
+
+        assert_eq!(reaped.snapshots, 2);
+        assert!(survives.join(SNAPSHOT_STAMP_FILENAME).is_file());
+        assert!(!other_kernel.exists());
+        assert!(!older_firecracker.exists());
+    }
+
+    #[test]
+    fn the_cpu_a_guest_was_given_is_named_by_its_identity_and_features_and_not_its_microcode() {
+        let cpuinfo = |microcode: &str, flags: &str| {
+            format!(
+                "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nstepping\t: 7\nmicrocode\t: {microcode}\nflags\t\t: {flags}\n\nprocessor\t: 1\nflags\t\t: other\n"
+            )
+        };
+        let before = cpu_template_from(&cpuinfo("0x5003604", "fpu vme avx512f rtm")).unwrap();
+        assert!(before.starts_with("none/"));
+        assert_eq!(
+            cpu_template_from(&cpuinfo("0x5003707", "fpu vme avx512f rtm")).unwrap(),
+            before
+        );
+        assert_ne!(
+            cpu_template_from(&cpuinfo("0x5003707", "fpu vme avx512f")).unwrap(),
+            before
+        );
+        assert_eq!(cpu_template_from(""), None);
+        assert_eq!(
+            kernel_from("6.8.0-90-generic\n", "#91-Ubuntu SMP\n"),
+            "6.8.0-90-generic #91-Ubuntu SMP"
+        );
+    }
+
+    #[test]
+    fn a_stamp_that_names_no_firecracker_is_restored_on_its_own_boot_and_refused_after_a_reboot() {
+        let unnamed = SnapshotStamp {
+            firecracker_version: None,
+            ..stamp()
+        };
+        assert_eq!(drift_from(&unnamed, &stamp()), None);
+        let rebooted = SnapshotStamp {
+            host_boot_id: "after-a-reboot".into(),
+            ..stamp()
+        };
+        assert!(drift_from(&unnamed, &rebooted)
+            .unwrap()
+            .contains("another Firecracker"));
+        let other = SnapshotStamp {
+            firecracker_version: Some("v0.0.0".into()),
+            ..stamp()
+        };
+        assert!(drift_from(&other, &stamp())
+            .unwrap()
+            .contains("another Firecracker"));
     }
 
     #[test]
     fn a_host_with_no_snapshots_yet_has_nothing_to_reap() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
-            reap_stale_snapshots(directory.path(), "boot-1"),
+            reap_stale_snapshots(directory.path(), "boot-1", &this_host()),
             Reaped::default()
         );
         assert_eq!(
-            reap_stale_snapshots(&directory.path().join("nowhere"), "boot-1"),
+            reap_stale_snapshots(&directory.path().join("nowhere"), "boot-1", &this_host()),
             Reaped::default()
         );
     }
@@ -1016,11 +1242,11 @@ mod tests {
         std::fs::write(exchange.join("app-1/memory"), b"unpublished memory").unwrap();
         std::fs::write(exchange.join(EXCHANGE_BOOT_ID_FILENAME), "boot-1").unwrap();
         assert_eq!(
-            reap_stale_snapshots(directory.path(), "boot-1"),
+            reap_stale_snapshots(directory.path(), "boot-1", &this_host()),
             Reaped::default()
         );
         assert!(exchange.join("app-1/memory").exists());
-        assert!(reap_stale_snapshots(directory.path(), "boot-2").bytes > 0);
+        assert!(reap_stale_snapshots(directory.path(), "boot-2", &this_host()).bytes > 0);
         assert!(!exchange.exists());
     }
 }
