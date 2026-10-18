@@ -270,7 +270,10 @@ struct DeferredWaker {
 
 #[async_trait::async_trait]
 impl crate::ports::Waker for DeferredWaker {
-    async fn wake(&self, app_id: &protocol::AppId) -> Result<(), crate::ports::WakeRefusal> {
+    async fn wake(
+        &self,
+        app_id: &protocol::AppId,
+    ) -> Result<crate::ports::WakeOutcome, crate::ports::WakeRefusal> {
         match self.waker.get() {
             Some(waker) => waker.wake(app_id).await,
             None => Err(crate::ports::WakeRefusal::Failed {

@@ -265,7 +265,7 @@ impl Router {
             .as_ref()
             .map(|limits| limits.acquire(&route.app_id))
             .transpose();
-        let (response, outcome) = match permit {
+        let (mut response, outcome) = match permit {
             Err(()) => {
                 let mut response = say(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -306,12 +306,13 @@ impl Router {
 
     fn logged(
         &self,
-        response: Response<ProxyBody>,
+        mut response: Response<ProxyBody>,
         outcome: Outcome,
         route: Route,
         logging: Option<(HttpRequestScope, String, hyper::Uri)>,
         started: std::time::Instant,
     ) -> (Response<ProxyBody>, Outcome, Option<Route>) {
+        let wake_micros = super::http_log::take_wake_micros(response.headers_mut());
         if let (Some(log), Some((scope, method, uri))) = (&self.http_log, logging) {
             log.record(
                 scope,
@@ -321,7 +322,8 @@ impl Router {
                     response.status().as_u16(),
                     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     route.deployment_id.clone(),
-                ),
+                )
+                .woken_for(wake_micros),
             );
         }
         (response, outcome, Some(route))
@@ -745,6 +747,55 @@ mod tests {
         assert!(record.contains("\"status\":502"), "{record}");
         assert!(record.contains("\"deploymentId\":\"dep-1\""), "{record}");
         assert!(!record.contains("private"), "{record}");
+    }
+
+    #[tokio::test]
+    async fn a_request_the_activator_held_for_a_wake_is_logged_with_it_and_the_client_never_sees_how() {
+        let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let host_port = HostPort::new(upstream.local_addr().unwrap().port()).unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = upstream.accept().await else {
+                return;
+            };
+            let service = service_fn(|_request: Request<Incoming>| async move {
+                let mut woken = say(StatusCode::OK, "woken\n");
+                woken.headers_mut().insert(
+                    super::super::http_log::wake_header(),
+                    hyper::header::HeaderValue::from(240_000u64),
+                );
+                Ok::<_, std::convert::Infallible>(woken)
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let directory = tempfile::tempdir().expect("an HTTP request log directory");
+        let http_log =
+            Arc::new(HttpRequestLog::new(directory.path().to_path_buf()).expect("HTTP request logs"));
+        let router = Router::new(Arc::new(HostMetrics::new()), Some(http_log));
+        routed_at(&router, host_port).await;
+        let port = serving(router).await;
+
+        let answered = asked(port, "GET / HTTP/1.0\r\nHost: app-1.apps.example.com\r\n\r\n").await;
+
+        assert!(answered.starts_with("HTTP/1.0 200 "), "{answered}");
+        assert!(!answered.contains("x-nibrunner-wake"), "{answered}");
+        let path = directory.path().join("app-1.http.jsonl");
+        let record = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if !content.is_empty() {
+                        break content;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the HTTP log writer flushes the routed request");
+        assert!(record.contains("\"wakeMicros\":240000"), "{record}");
     }
 
     /// A tenant that answers every request and counts the connections it was asked over. Its
