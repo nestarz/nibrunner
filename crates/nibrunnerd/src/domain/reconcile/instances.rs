@@ -754,10 +754,23 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         .copied()
         .unwrap_or(UNKNOWN_VM);
     if status.frozen {
+        let thawing = std::time::Instant::now();
         return match thaw_instance(host, desired).await {
-            Err(_) if serves(host, desired).await => {
+            Err(WakeRefusal::Failed { reason, .. }) if serves(host, desired).await => {
+                host.metrics
+                    .sleep_wake
+                    .thaw_failed(&desired.app_id, thawing.elapsed());
                 let_go_of_unthawed_guest(host, &desired.app_id).await;
-                cold_boot(host, desired).await
+                let booted = cold_boot(host, desired).await;
+                // The boot cleared what the record said; why the request was not thawed is kept.
+                if booted.is_ok() {
+                    host.state
+                        .update_record(&desired.app_id, |record| {
+                            record.message = Some(StateMessage::new(reason));
+                        })
+                        .await;
+                }
+                booted
             }
             thawed => thawed,
         };

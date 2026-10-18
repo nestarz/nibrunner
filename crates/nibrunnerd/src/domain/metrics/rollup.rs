@@ -21,6 +21,13 @@ pub struct UnitMetrics {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub wakes: u64,
+    /// Wakes by how: a frozen microVM resumed in place, a snapshot restored, a cold boot.
+    pub wakes_thawed: u64,
+    pub wakes_restored: u64,
+    pub wakes_booted: u64,
+    /// Wakes whose microVM did not come back (its resume, dial or clock sync stalled), each
+    /// answered by a cold boot instead: the fallbacks.
+    pub wakes_failed: u64,
     pub sleeps: u64,
     pub cache_hit: u64,
     pub cache_stale: u64,
@@ -45,6 +52,10 @@ impl UnitMetrics {
         self.rx_bytes += other.rx_bytes;
         self.tx_bytes += other.tx_bytes;
         self.wakes += other.wakes;
+        self.wakes_thawed += other.wakes_thawed;
+        self.wakes_restored += other.wakes_restored;
+        self.wakes_booted += other.wakes_booted;
+        self.wakes_failed += other.wakes_failed;
         self.sleeps += other.sleeps;
         self.cache_hit += other.cache_hit;
         self.cache_stale += other.cache_stale;
@@ -226,7 +237,23 @@ impl Counting {
                         Some(_) => m.tx_bytes += n,
                         None => {}
                     },
-                    "wakes_total" => m.wakes += n,
+                    "wakes_total" => match label(s, "outcome") {
+                        // The cold boot that answered it is the wake; the thaw is its failure.
+                        Some("thaw-failed") => continue,
+                        outcome => {
+                            m.wakes += n;
+                            match outcome {
+                                Some("thawed") => m.wakes_thawed += n,
+                                Some("restored") => m.wakes_restored += n,
+                                Some("cold-boot") => m.wakes_booted += n,
+                                _ => {}
+                            }
+                        }
+                    },
+                    "wake_failures_total" => match label(s, "phase") {
+                        Some("resume" | "dial" | "sync") => m.wakes_failed += n,
+                        _ => continue,
+                    },
                     "sleeps_total" => m.sleeps += n,
                     "proxy_cache_requests_total" => match label(s, "outcome") {
                         Some("hit") => m.cache_hit += n,
@@ -300,7 +327,11 @@ mod tests {
              nibrunner_app_memory_used_bytes{{app=\"site\"}} 67108864\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"rx\"}} 100\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"tx\"}} 200\n\
-             nibrunner_app_wakes_total{{app=\"site\"}} 1\n\
+             nibrunner_app_wakes_total{{app=\"site\",outcome=\"thawed\"}} {requests}\n\
+             nibrunner_app_wakes_total{{app=\"site\",outcome=\"cold-boot\"}} 1\n\
+             nibrunner_app_wakes_total{{app=\"site\",outcome=\"thaw-failed\"}} 1\n\
+             nibrunner_app_wake_failures_total{{app=\"site\",phase=\"dial\"}} {requests}\n\
+             nibrunner_app_wake_failures_total{{app=\"site\",phase=\"ready\"}} {requests}\n\
              nibrunner_proxy_requests_total{{app=\"site\",outcome=\"served\"}} {requests}\n\
              nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"hit\"}} {requests}\n\
              nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"stale\"}} 1\n\
@@ -351,6 +382,16 @@ mod tests {
             (2, 0, 4, 0)
         );
         assert_eq!((site.encoded_bytes_in, site.encoded_bytes_out), (40, 4));
+        assert_eq!(
+            (
+                site.wakes,
+                site.wakes_thawed,
+                site.wakes_booted,
+                site.wakes_failed
+            ),
+            (2, 2, 0, 2),
+            "a wake by how; a failed thaw is not a wake, and a probe that stalled is no fallback"
+        );
         assert!(
             !document.units.contains_key("build-x"),
             "a unit without labels is not charted"
@@ -418,6 +459,10 @@ mod tests {
                 rx_bytes: 100,
                 tx_bytes: 200,
                 wakes: 1,
+                wakes_thawed: 1,
+                wakes_restored: 0,
+                wakes_booted: 0,
+                wakes_failed: 0,
                 sleeps: 0,
                 cache_hit: 2,
                 cache_stale: 0,

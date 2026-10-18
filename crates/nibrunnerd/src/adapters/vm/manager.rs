@@ -1002,7 +1002,14 @@ impl VmManager {
 
     /// Resumes the microVM run under `app_id`.
     async fn thaw_vm(&self, app_id: &AppId) -> Result<(), VmError> {
-        self.api(app_id).resume().await?;
+        // No clock step: a native pause keeps kvmclock reading the host's clock (A13.5).
+        if let Err(stalled) = self.resume_within_budget(app_id, WakeOutcome::Thawed).await {
+            let stalled = self.wake_stalled(app_id, stalled);
+            let _ = self.api(app_id).pause().await;
+            return Err(VmError::WakeStalled {
+                reason: stalled.to_string(),
+            });
+        }
         self.processes
             .remember_frozen(app_id, false)
             .map_err(|error| VmError::Host(error.to_string()))
