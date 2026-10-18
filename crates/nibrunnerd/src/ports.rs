@@ -277,25 +277,97 @@ pub trait GuestMeasurements: Send + Sync {
     async fn measure(&self, app_id: &AppId) -> GuestReading;
 }
 
+/// An object's bytes as the store hands them over, so that what a layer weighs is held on disk
+/// as it arrives rather than in memory whole.
+pub type ArtifactBody = futures::stream::BoxStream<'static, Result<bytes::Bytes, ArtifactError>>;
+
 #[cfg_attr(any(test, feature = "testing"), mockall::automock)]
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
-    async fn read(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ArtifactError>;
+    async fn read(&self, object_key: &ObjectKey) -> Result<ArtifactBody, ArtifactError>;
     /// The body a URL answers with, for a layer the document says to fetch rather than to find here.
-    async fn download(&self, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError>;
+    async fn download(&self, url: &DownloadUrl) -> Result<ArtifactBody, ArtifactError>;
+}
+
+/// What a download may weigh, so that a URL cannot make the daemon fill its disk.
+pub const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What landed in a file from a body, and what it hashes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Writes a body to `destination` as it arrives, hashing it on the way. One that fails part way
+/// leaves no file behind.
+pub async fn land(body: ArtifactBody, destination: &std::path::Path) -> Result<Landed, ArtifactError> {
+    land_within(body, destination, u64::MAX).await
+}
+
+/// [`land`], refusing a body once more than `max_bytes` of it has arrived.
+pub(crate) async fn land_within(
+    mut body: ArtifactBody,
+    destination: &std::path::Path,
+    max_bytes: u64,
+) -> Result<Landed, ArtifactError> {
+    use futures::StreamExt;
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+
+    let written = async {
+        let unwritable = |error: std::io::Error| ArtifactError::Transfer(error.to_string());
+        let mut file = tokio::fs::File::create(destination).await.map_err(unwritable)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut bytes = 0u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            bytes += chunk.len() as u64;
+            if bytes > max_bytes {
+                return Err(ArtifactError::Transfer(format!(
+                    "the object is larger than an artifact may be: {bytes} bytes in, and the most is {max_bytes}"
+                )));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk).await.map_err(unwritable)?;
+        }
+        file.sync_all().await.map_err(unwritable)?;
+        Ok(Landed {
+            bytes,
+            sha256: hex::encode(hasher.finalize()),
+        })
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(destination).await;
+    }
+    written
 }
 
 #[async_trait]
 pub trait ArtifactStoreExt {
+    /// The object whole, for what is read in memory anyway, checked against its digest.
     async fn read_verified(&self, object: &StoredObject) -> Result<Vec<u8>, ArtifactError>;
+    /// The object written to `destination` as it arrives and checked against its digest on the
+    /// way: one that hashes to anything else leaves no file behind.
+    async fn land_verified(
+        &self,
+        object: &StoredObject,
+        destination: &std::path::Path,
+    ) -> Result<u64, ArtifactError>;
 }
 
 #[async_trait]
 impl<T: ArtifactStore + ?Sized> ArtifactStoreExt for T {
     async fn read_verified(&self, object: &StoredObject) -> Result<Vec<u8>, ArtifactError> {
+        use futures::StreamExt;
         use sha2::Digest;
 
-        let bytes = self.read(&object.object_key).await?;
+        let mut body = self.read(&object.object_key).await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
         let actual = hex::encode(sha2::Sha256::digest(&bytes));
         if actual != object.digest.as_str() {
             return Err(ArtifactError::DigestMismatch {
@@ -304,6 +376,22 @@ impl<T: ArtifactStore + ?Sized> ArtifactStoreExt for T {
             });
         }
         Ok(bytes)
+    }
+
+    async fn land_verified(
+        &self,
+        object: &StoredObject,
+        destination: &std::path::Path,
+    ) -> Result<u64, ArtifactError> {
+        let landed = land(self.read(&object.object_key).await?, destination).await?;
+        if landed.sha256 != object.digest.as_str() {
+            let _ = tokio::fs::remove_file(destination).await;
+            return Err(ArtifactError::DigestMismatch {
+                expected: object.digest.clone(),
+                actual: landed.sha256,
+            });
+        }
+        Ok(landed.bytes)
     }
 }
 

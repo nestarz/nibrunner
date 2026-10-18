@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,12 +64,29 @@ fn header(permissions: u16) -> NodeHeader {
 /// Builds a squashfs holding exactly these files at these absolute paths, byte-identical for the
 /// same input so an image is cached by what went into it.
 fn pack(files: &[(&str, &[u8], u16)]) -> Result<Vec<u8>, ArtifactError> {
+    let mut image = std::io::Cursor::new(Vec::new());
+    pack_into(
+        files
+            .iter()
+            .map(|(path, bytes, permissions)| (*path, Box::new(*bytes) as Box<dyn Read>, *permissions))
+            .collect(),
+        &mut image,
+    )?;
+    Ok(image.into_inner())
+}
+
+/// [`pack`], read from and written to wherever the bytes are, so that a program the size of the
+/// cap is never held in memory whole to be packed.
+fn pack_into<'a>(
+    files: Vec<(&str, Box<dyn Read + 'a>, u16)>,
+    image: &mut (impl std::io::Write + std::io::Seek),
+) -> Result<(), ArtifactError> {
     let unpackable = |error: backhand::BackhandError| ArtifactError::Unpackable(error.to_string());
     let mut writer = FilesystemWriter::default();
     writer.set_compressor(image_compressor());
     writer.set_time(FIXED_MTIME);
     writer.set_root_mode(DIRECTORY_MODE);
-    for (path, bytes, permissions) in files {
+    for (path, reader, permissions) in files {
         if let Some(parent) = Path::new(path)
             .parent()
             .filter(|parent| *parent != Path::new("/"))
@@ -79,12 +96,58 @@ fn pack(files: &[(&str, &[u8], u16)]) -> Result<Vec<u8>, ArtifactError> {
                 .map_err(unpackable)?;
         }
         writer
-            .push_file(Cursor::new(bytes.to_vec()), path, header(*permissions))
+            .push_file(reader, path, header(permissions))
             .map_err(unpackable)?;
     }
-    let mut image = Cursor::new(Vec::new());
-    writer.write(&mut image).map_err(unpackable)?;
-    Ok(image.into_inner())
+    writer.write(image).map_err(unpackable)?;
+    Ok(())
+}
+
+fn starts_as_filesystem_image(path: &Path) -> Result<bool, ArtifactError> {
+    let mut head = Vec::with_capacity(EXT4_MAGIC_OFFSET + EXT4_MAGIC.len());
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take((EXT4_MAGIC_OFFSET + EXT4_MAGIC.len()) as u64)
+                .read_to_end(&mut head)
+        })
+        .map_err(unpackable)?;
+    Ok(is_filesystem_image(&head))
+}
+
+fn unpackable(error: impl std::fmt::Display) -> ArtifactError {
+    ArtifactError::Unpackable(error.to_string())
+}
+
+/// The files a layer passes through on its way into the cache, beside where its image goes and
+/// named for this daemon, so that a rename puts the image in place whole. Whatever is left of
+/// them is removed when the fetch is done, however it went.
+struct Staged {
+    body: PathBuf,
+    program: PathBuf,
+    image: PathBuf,
+}
+
+impl Staged {
+    fn beside(image_path: &Path) -> Self {
+        let named = |suffix: &str| {
+            let mut name = image_path.as_os_str().to_owned();
+            name.push(format!(".{}.{suffix}", std::process::id()));
+            PathBuf::from(name)
+        };
+        Self {
+            body: named("body"),
+            program: named("program"),
+            image: named("tmp"),
+        }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        for path in [&self.body, &self.program, &self.image] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 pub fn is_filesystem_image(bytes: &[u8]) -> bool {
@@ -295,20 +358,39 @@ impl<'a> Within<'a> {
     }
 }
 
-fn from_zip(body: Vec<u8>, entry: &ZipEntry, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(body))
-        .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
+/// Copies at most a program's worth of `from` into `program`, hashing it on the way.
+fn copy_program(from: impl Read, program: &Path) -> Result<String, ArtifactError> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut file = std::fs::File::create(program).map_err(unpackable)?;
+    let mut limited = from.take(MAX_PROGRAM_BYTES);
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        let read = limited.read(&mut buffer).map_err(unpackable)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        std::io::Write::write_all(&mut file, &buffer[..read]).map_err(unpackable)?;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn from_zip(
+    body: &Path,
+    entry: &ZipEntry,
+    url: &DownloadUrl,
+    program: &Path,
+) -> Result<String, ArtifactError> {
+    let mut archive =
+        zip::ZipArchive::new(std::fs::File::open(body).map_err(unpackable)?).map_err(unpackable)?;
     let file = archive
         .by_name(entry.as_str())
         .map_err(|_| ArtifactError::NotInArchive {
             url: url.clone(),
             entry: entry.as_str().to_owned(),
         })?;
-    let mut program = Vec::new();
-    std::io::Read::take(file, MAX_PROGRAM_BYTES)
-        .read_to_end(&mut program)
-        .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
-    Ok(program)
+    copy_program(file, program)
 }
 
 // GNU tar run as `tar -C dir -cJf x.tar.xz .` names every entry from `./`, so the same archive is
@@ -317,9 +399,14 @@ fn names_entry(path: &[u8], entry: &TarEntry) -> bool {
     path.strip_prefix(b"./").unwrap_or(path) == entry.as_str().as_bytes()
 }
 
-fn from_tar_xz(body: Vec<u8>, entry: &TarEntry, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError> {
-    let unpackable = |error: std::io::Error| ArtifactError::Unpackable(error.to_string());
-    let decoder = lzma_rust2::XzReader::new_mem_limit(Cursor::new(body), true, XZ_DECODER_LIMIT_KIB);
+fn from_tar_xz(
+    body: &Path,
+    entry: &TarEntry,
+    url: &DownloadUrl,
+    program: &Path,
+) -> Result<String, ArtifactError> {
+    let compressed = std::io::BufReader::new(std::fs::File::open(body).map_err(unpackable)?);
+    let decoder = lzma_rust2::XzReader::new_mem_limit(compressed, true, XZ_DECODER_LIMIT_KIB);
     let mut archive = tar::Archive::new(decoder);
     for file in archive.entries().map_err(unpackable)? {
         let file = file.map_err(unpackable)?;
@@ -332,11 +419,7 @@ fn from_tar_xz(body: Vec<u8>, entry: &TarEntry, url: &DownloadUrl) -> Result<Vec
                 entry: entry.as_str().to_owned(),
             });
         }
-        let mut program = Vec::new();
-        file.take(MAX_PROGRAM_BYTES)
-            .read_to_end(&mut program)
-            .map_err(unpackable)?;
-        return Ok(program);
+        return copy_program(file, program);
     }
     Err(ArtifactError::NotInArchive {
         url: url.clone(),
@@ -344,28 +427,47 @@ fn from_tar_xz(body: Vec<u8>, entry: &TarEntry, url: &DownloadUrl) -> Result<Vec
     })
 }
 
+/// Downloads `url` beside the cache and leaves the program in it at the staged program path,
+/// checked against `digest`: the body itself, or the entry of the archive it is that the
+/// document names.
 async fn downloaded_program(
     store: &Arc<dyn ArtifactStore>,
     url: &DownloadUrl,
     digest: &Sha256Digest,
     within: Within<'_>,
-) -> Result<Vec<u8>, ArtifactError> {
-    use sha2::Digest;
-
-    let body = store.download(url).await?;
-    let program = match within {
-        Within::Body => body,
-        Within::Zip(entry) => from_zip(body, entry, url)?,
-        Within::TarXz(entry) => from_tar_xz(body, entry, url)?,
+    staged: &Staged,
+) -> Result<u64, ArtifactError> {
+    let landed = crate::ports::land_within(
+        store.download(url).await?,
+        &staged.body,
+        crate::ports::MAX_DOWNLOAD_BYTES,
+    )
+    .await?;
+    let actual = match within {
+        Within::Body => {
+            std::fs::rename(&staged.body, &staged.program).map_err(unpackable)?;
+            landed.sha256
+        }
+        Within::Zip(entry) => from_zip(&staged.body, entry, url, &staged.program)?,
+        Within::TarXz(entry) => from_tar_xz(&staged.body, entry, url, &staged.program)?,
     };
-    let actual = hex::encode(sha2::Sha256::digest(&program));
     if actual != digest.as_str() {
         return Err(ArtifactError::DigestMismatch {
             expected: digest.clone(),
             actual,
         });
     }
-    Ok(program)
+    Ok(landed.bytes)
+}
+
+/// Packs the staged program into the staged image, at the path the guest runs it from.
+fn pack_program(staged: &Staged, destination_path: &protocol::ExecutablePath) -> Result<(), ArtifactError> {
+    let program = std::fs::File::open(&staged.program).map_err(unpackable)?;
+    let mut image = std::fs::File::create(&staged.image).map_err(unpackable)?;
+    pack_into(
+        vec![(destination_path.as_str(), Box::new(program), BINARY_MODE)],
+        &mut image,
+    )
 }
 
 /// A layer's image in the cache, and what putting it there cost: nothing for one already held.
@@ -396,77 +498,80 @@ pub async fn ensure_layer_image(
         });
     }
 
-    let (bytes, fetched_bytes) = match layer {
+    let directory = image_path
+        .parent()
+        .expect("the image is one level inside the cache");
+    make_directory(directory, CACHE_DIR_MODE).map_err(unpackable)?;
+    let staged = Staged::beside(&image_path);
+    // An OCI image is flattened from the archive whole, so it is read into memory as before; a
+    // filesystem or a program is written to the cache as it arrives.
+    let fetched_bytes = match layer {
         DesiredLayer::Oci {
             source: OciSource::Registry { repository, digest },
         } => {
             let pulled = registry::pull(repository, digest).await?;
-            (pulled.archive, pulled.fetched_bytes)
+            oci::prepare(pulled.archive, image_path.clone(), commands).await?;
+            return Ok(LayerImage {
+                path: image_path,
+                fetched_bytes: pulled.fetched_bytes,
+            });
         }
         DesiredLayer::Oci {
             source: OciSource::Archive(object),
-        }
-        | DesiredLayer::Filesystem { object }
-        | DesiredLayer::Executable { object, .. } => {
+        } => {
             let bytes = store.read_verified(object).await?;
             let fetched_bytes = bytes.len() as u64;
-            (bytes, fetched_bytes)
-        }
-        DesiredLayer::DownloadedExecutable {
-            url,
-            digest,
-            zip_entry,
-            tar_entry,
-            ..
-        } => {
-            let bytes = downloaded_program(
-                store,
-                url,
-                digest,
-                Within::of(zip_entry.as_ref(), tar_entry.as_ref()),
-            )
-            .await?;
-            let fetched_bytes = bytes.len() as u64;
-            (bytes, fetched_bytes)
-        }
-    };
-    let image = match layer {
-        DesiredLayer::Oci { .. } => {
             oci::prepare(bytes, image_path.clone(), commands).await?;
             return Ok(LayerImage {
                 path: image_path,
                 fetched_bytes,
             });
         }
-        DesiredLayer::Filesystem { .. } if is_filesystem_image(&bytes) => bytes,
-        DesiredLayer::Filesystem { object } => {
-            return Err(ArtifactError::NotAnImage {
-                digest: object.digest.clone(),
-            })
+        DesiredLayer::DownloadedExecutable {
+            url,
+            digest,
+            zip_entry,
+            tar_entry,
+            destination_path,
+        } => {
+            let bytes = downloaded_program(
+                store,
+                url,
+                digest,
+                Within::of(zip_entry.as_ref(), tar_entry.as_ref()),
+                &staged,
+            )
+            .await?;
+            pack_program(&staged, destination_path)?;
+            bytes
         }
-        DesiredLayer::Executable { destination_path, .. }
-        | DesiredLayer::DownloadedExecutable { destination_path, .. } => {
-            pack(&[(destination_path.as_str(), &bytes, BINARY_MODE)])?
+        DesiredLayer::Filesystem { object } => {
+            let bytes = store.land_verified(object, &staged.image).await?;
+            if !starts_as_filesystem_image(&staged.image)? {
+                return Err(ArtifactError::NotAnImage {
+                    digest: object.digest.clone(),
+                });
+            }
+            bytes
+        }
+        DesiredLayer::Executable {
+            object,
+            destination_path,
+        } => {
+            let bytes = store.land_verified(object, &staged.program).await?;
+            pack_program(&staged, destination_path)?;
+            bytes
         }
     };
-
-    let directory = image_path
-        .parent()
-        .expect("the image is one level inside the cache");
-    make_directory(directory, CACHE_DIR_MODE)
-        .map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
-    let filename = image_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("the image has a name");
-    let staged = directory.join(format!("{filename}.{}.tmp", std::process::id()));
-    std::fs::write(&staged, &image).map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
-    std::fs::rename(&staged, &image_path).map_err(|error| ArtifactError::Unpackable(error.to_string()))?;
+    std::fs::rename(&staged.image, &image_path).map_err(unpackable)?;
     tracing::info!(
         digest = %layer.digest(),
         size_bytes = fetched_bytes,
-        image_bytes = image.len(),
-        packed = matches!(layer, DesiredLayer::Executable { .. }),
+        image_bytes = std::fs::metadata(&image_path).map(|image| image.len()).unwrap_or_default(),
+        packed = matches!(
+            layer,
+            DesiredLayer::Executable { .. } | DesiredLayer::DownloadedExecutable { .. }
+        ),
         "layer image ready"
     );
     Ok(LayerImage {
@@ -501,6 +606,7 @@ mod tests {
     use crate::test_support::{base_layer, layer, ARTIFACT_BYTES, ARTIFACT_DIGEST, BASE_LAYER_BYTES};
     use protocol::ExecutablePath;
     use sha2::Digest;
+    use std::io::Cursor;
 
     fn artifact_bytes() -> Vec<u8> {
         ARTIFACT_BYTES.to_vec()
@@ -635,6 +741,38 @@ mod tests {
         assert!(!layer_image_path(directory.path(), &layer(|_| {})).exists());
     }
 
+    #[tokio::test]
+    async fn a_layer_that_lands_wrong_leaves_nothing_beside_the_cache_and_one_that_lands_right_only_its_image(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let held = |directory: &Path| -> Vec<String> {
+            let digest = directory.join(layer(|_| {}).digest().as_str());
+            let mut names: Vec<_> = std::fs::read_dir(digest)
+                .map(|entries| {
+                    entries
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        let wrong = store(b"something else entirely\n".to_vec());
+        prepare_layer(&wrong, directory.path(), &layer(|_| {}))
+            .await
+            .unwrap_err();
+        assert!(held(directory.path()).is_empty(), "{:?}", held(directory.path()));
+
+        let image = prepare_layer(&store(artifact_bytes()), directory.path(), &layer(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(image.fetched_bytes, artifact_bytes().len() as u64);
+        assert_eq!(
+            held(directory.path()),
+            vec![image.path.file_name().unwrap().to_string_lossy().into_owned()]
+        );
+    }
+
     #[test]
     fn the_config_image_is_rebuilt_in_place_on_every_boot() {
         let directory = tempfile::tempdir().unwrap();
@@ -698,11 +836,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut store = crate::ports::MockArtifactStore::new();
         store.expect_read().returning(|key| {
-            Ok(if key == &base_layer().stored_object().unwrap().object_key {
-                BASE_LAYER_BYTES.to_vec()
-            } else {
-                ARTIFACT_BYTES.to_vec()
-            })
+            Ok(mocks::body(
+                if key == &base_layer().stored_object().unwrap().object_key {
+                    BASE_LAYER_BYTES.to_vec()
+                } else {
+                    ARTIFACT_BYTES.to_vec()
+                },
+            ))
         });
         let images = LayerImages::new(
             Arc::new(store),
@@ -822,7 +962,9 @@ mod tests {
     ) -> (DesiredLayer, Arc<dyn ArtifactStore>) {
         let served = body.to_vec();
         let mut artifacts = crate::ports::MockArtifactStore::new();
-        artifacts.expect_download().returning(move |_| Ok(served.clone()));
+        artifacts
+            .expect_download()
+            .returning(move |_| Ok(mocks::body(served.clone())));
         let layer = DesiredLayer::DownloadedExecutable {
             url: DownloadUrl::parse("https://example.test/program").unwrap(),
             digest: Sha256Digest::parse(hex::encode(sha2::Sha256::digest(artifact_bytes()))).unwrap(),
@@ -1041,11 +1183,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut store = crate::ports::MockArtifactStore::new();
         store.expect_read().returning(|key| {
-            Ok(if key == &base_layer().stored_object().unwrap().object_key {
-                BASE_LAYER_BYTES.to_vec()
-            } else {
-                ARTIFACT_BYTES.to_vec()
-            })
+            Ok(mocks::body(
+                if key == &base_layer().stored_object().unwrap().object_key {
+                    BASE_LAYER_BYTES.to_vec()
+                } else {
+                    ARTIFACT_BYTES.to_vec()
+                },
+            ))
         });
         let images = LayerImages::bounded(
             Arc::new(store),
