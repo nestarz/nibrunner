@@ -65,9 +65,10 @@ does not fit is refused the same way, and its request gets a 503. The number of 
 is logged once per pass and counted in
 `nibrunner_start_refusals_total{reason="no_room"}`.
 
-### Measured admission, observed
+### Measured admission
 
-To see what admission would decide from measurements rather than ceilings, before relying on it:
+By default a start or a wake must fit beside the ceiling of every VM that is up. To see what
+admission would decide from measurements rather than ceilings, before relying on it:
 
 ```toml
 [memory_admission]
@@ -75,12 +76,31 @@ mode = "observe"
 headroom_mib = 1024
 ```
 
-Every start and wake then logs `memory admission evaluated` with the strict shortfall it was
-decided on and the measured one beside it. Nothing it decides changes. A running VM is counted
-at its observed peak, swapped pages included, plus the greater of 25 percent or 64 MiB, up to its
-cgroup ceiling. A VM that is starting, or whose sample is missing, old or from an earlier
-process, counts at its full ceiling. Targets must fit the guest-memory budget, and expected
-growth must fit `MemAvailable` less `headroom_mib`. Restart the daemon after changing the section.
+Every start, wake and snapshot then logs `memory admission evaluated` with the strict shortfall
+it was decided on and the measured one beside it, and nothing it decides changes. Restart the
+daemon after changing the section.
+
+A running VM is counted at its observed peak, swapped pages and proportional set included, plus
+the greater of 25 percent or 64 MiB, up to its cgroup ceiling. A VM that is starting, or whose
+sample is missing, old or from an earlier process, counts at its full ceiling.
+Targets must fit the guest-memory budget, and expected growth must fit `MemAvailable` less
+`headroom_mib`. Every start and wake holds what it was admitted at until its VM is measured
+running, so two of them never fit into the same room, and a snapshot holds its VM's whole
+ceiling until it is written.
+
+### A bounded workload pool
+
+```toml
+[memory_admission.pool]
+slice = "workloads.slice"
+memory_mib = 4096
+```
+
+The operator creates the root-level slice and bounds it; its `memory.max` must be positive and
+no larger than `memory_mib`, or the daemon does not start. Every VMM's cgroup is then placed under
+`<slice>/nibrunner-jailer`, and admission also respects what is left of the slice below its
+`memory.high` (clean inactive file cache counted as free), beside the ceilings. Set `memory.high`
+below `memory.max` to start reclaim before the hard limit.
 
 ## Changing it
 

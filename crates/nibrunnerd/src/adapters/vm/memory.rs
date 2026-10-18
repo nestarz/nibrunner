@@ -1,19 +1,8 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+
+use crate::adapters::cgroup::cgroup_path;
 
 use protocol::ReportedMemory;
-
-fn cgroup_path(membership: &str) -> Option<PathBuf> {
-    let relative = membership.lines().find_map(|line| line.strip_prefix("0::/"))?;
-    let path = Path::new(relative);
-    if relative.is_empty()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(Path::new("/sys/fs/cgroup").join(path))
-}
 
 fn number(path: &Path, name: &str) -> Option<u64> {
     std::fs::read_to_string(path.join(name)).ok()?.trim().parse().ok()
@@ -75,13 +64,9 @@ fn read_cgroup(path: &Path) -> Option<ReportedMemory> {
     })
 }
 
-/// A VMM's memory as its cgroup charges it. A jailed VMM's cgroup is the one its jail names; a VMM
-/// readopted from before the jailer is found through `/proc`.
-pub(super) fn read_process(pid: i32, cgroup: Option<PathBuf>) -> Option<ReportedMemory> {
-    let cgroup = match cgroup {
-        Some(cgroup) => cgroup,
-        None => cgroup_path(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)?,
-    };
+/// A VMM's memory as its cgroup charges it, wherever the process says that cgroup is.
+pub(super) fn read_process(pid: i32) -> Option<ReportedMemory> {
+    let cgroup = cgroup_path(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)?;
     let mut memory = read_cgroup(&cgroup)?;
     if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
         memory.proportional_set_bytes = proportional_set_bytes(&text);
@@ -106,17 +91,6 @@ fn mapping_bytes(text: &str, field: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_a_named_unified_cgroup_can_be_measured() {
-        assert_eq!(
-            cgroup_path("0::/system.slice/run-test.scope\n"),
-            Some(PathBuf::from("/sys/fs/cgroup/system.slice/run-test.scope"))
-        );
-        for invalid in ["0::/", "0::/../outside", "2:memory:/legacy", "0::/./relative"] {
-            assert!(cgroup_path(invalid).is_none(), "{invalid}");
-        }
-    }
 
     #[test]
     fn proportional_memory_reads_only_the_total_with_known_units() {
