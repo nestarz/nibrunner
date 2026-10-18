@@ -102,6 +102,21 @@ no larger than `memory_mib`, or the daemon does not start. Every VMM's cgroup is
 `memory.high` (clean inactive file cache counted as free), beside the ceilings. Set `memory.high`
 below `memory.max` to start reclaim before the hard limit.
 
+### Reclaiming quiet apps
+
+```toml
+[memory_admission]
+reclaim = true
+```
+
+Before a start or a wake is refused for memory, and whenever `MemAvailable` drops under
+`headroom_mib`, the pool nears its `memory.high`, or the kernel reports memory stalls, quiet
+`on-request` apps with a `traffic-idle` policy are put to sleep one at a time: `build` first,
+then `preview`, `standard` and `production` (the `limits.memory.priority` of each), the longest
+quiet first within each. An app with a request open, a raw port, activity in the last 30 seconds
+or a start in the last minute is left up, and a deployment never puts a `production` app to sleep
+to make room. Reclaim stops once the host is back above `headroom_mib` plus a quarter.
+
 ## Changing it
 
 1. Edit `max_apps`.

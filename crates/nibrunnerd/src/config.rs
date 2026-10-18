@@ -116,6 +116,10 @@ pub struct MemoryAdmission {
     /// placed under it, and admission respects what is left of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<WorkloadPool>,
+    /// Put quiet on-request apps to sleep before refusing a start or a wake, and while the host or
+    /// the pool is short of memory.
+    #[serde(default)]
+    pub reclaim: bool,
     /// Physical memory held back for the host and bursts; swap never increases this capacity.
     pub headroom_mib: std::num::NonZeroU32,
 }
@@ -1050,6 +1054,7 @@ impl HostConfig {
             memory_admission: Some(MemoryAdmission {
                 mode: MemoryAdmissionMode::Observe,
                 pool: None,
+                reclaim: false,
                 headroom_mib: std::num::NonZeroU32::new(1024).expect("positive headroom"),
             }),
             logs: LogsConfig::default(),
@@ -1627,12 +1632,13 @@ denied_egress_addresses_v6 = []
     fn workload_pool_names_are_root_level_slices_and_its_limit_is_nonzero() {
         let section = |slice: &str, memory_mib: u32| {
             format!(
-                "{WHOLE}\n[memory_admission]\nmode = \"observe\"\nheadroom_mib = 1024\n\n[memory_admission.pool]\nslice = {slice:?}\nmemory_mib = {memory_mib}\n"
+                "{WHOLE}\n[memory_admission]\nmode = \"observe\"\nheadroom_mib = 1024\nreclaim = true\n\n[memory_admission.pool]\nslice = {slice:?}\nmemory_mib = {memory_mib}\n"
             )
         };
         let config = parsed(&section("workloads.slice", 4096));
         let policy = config.memory_admission.as_ref().unwrap();
         assert_eq!(policy.mode, MemoryAdmissionMode::Observe);
+        assert!(policy.reclaim);
         assert_eq!(policy.pool.as_ref().unwrap().membership(), "/workloads.slice");
         assert_eq!(parsed(&config.to_toml()), config);
         for slice in [
