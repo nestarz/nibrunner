@@ -253,3 +253,23 @@ async fn a_memory_limit_kill_is_reported_and_restarted_without_interrupting_anot
     assert_eq!(host.get(&app, "/read?path=kept").await.unwrap().body, "survived");
     host.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guests_memory_is_backed_by_transparent_huge_pages() {
+    let Some(host) = crate::host().await else {
+        return;
+    };
+    let app = host.tenant(1);
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Running).await;
+    assert_eq!(host.get(&app, "/allocate?mib=64").await.unwrap().status, 200);
+    let pid = processes(&host).read_record(&app.app_id).unwrap().pid;
+    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).unwrap();
+    let huge_kib: u64 = rollup
+        .lines()
+        .find_map(|line| line.strip_prefix("AnonHugePages:"))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap();
+    assert!(huge_kib > 0, "the VMM holds no huge pages:\n{rollup}");
+    host.stop().await;
+}

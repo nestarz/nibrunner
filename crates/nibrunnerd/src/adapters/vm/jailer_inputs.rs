@@ -54,6 +54,7 @@ mod tests {
                 rootfs_path: "/guest/rootfs".into(),
                 instance_config_image_path: "/vm/config".into(),
                 data_device_path: "/dev/nbd0".into(),
+                data_block_bytes: None,
                 layer_image_paths: vec!["/cache/layer".into()],
             },
             &VmNetwork {

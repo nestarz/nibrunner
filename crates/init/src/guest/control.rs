@@ -13,7 +13,9 @@ const TENANT_EVENTS: &str = "/sys/fs/cgroup/tenant/cgroup.events";
 
 const MAX_HOLD: Duration = Duration::from_secs(900);
 
-// kvmclock is restored without advancing, so time spent paused cannot expire this lease.
+// A restore advances kvmclock by the time the snapshot spent on disk (`clock_realtime`), so a
+// lease taken before a snapshot has run out when its guest wakes: the tenant is released then,
+// with the clock already right, and the host's WAKE finds it released.
 const TENANT_LEASE: Duration = Duration::from_millis(guest_contract::control::TENANT_FREEZE_LEASE_MS);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(guest_contract::control::TENANT_CONTROL_TIMEOUT_MS);
 

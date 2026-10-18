@@ -147,6 +147,7 @@ impl VmManager {
                     .to_string(),
                 instance_config_image_path: config_image.display().to_string(),
                 data_device_path: request.data_device_path.clone(),
+                data_block_bytes: crate::adapters::volumes::filesystem_block_bytes(&request.data_device_path),
                 layer_image_paths: request
                     .payload
                     .layer_image_paths

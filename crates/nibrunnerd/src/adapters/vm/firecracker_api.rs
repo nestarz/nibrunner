@@ -175,7 +175,9 @@ impl FirecrackerApi {
                     backend_type: "File",
                     backend_path: &memory_path.display().to_string(),
                 },
-                clock_realtime: false,
+                // kvmclock advanced by the time the snapshot spent on disk, so the guest wakes
+                // with its clock already right.
+                clock_realtime: true,
             },
         )
         .await
@@ -290,7 +292,7 @@ mod tests {
         assert!(!calls[1].2.contains("mem_file_path"));
         assert_eq!(
             calls[1].2,
-            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":false}"#
+            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":true}"#
         );
     }
 

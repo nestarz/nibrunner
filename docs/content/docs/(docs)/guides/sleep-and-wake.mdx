@@ -61,16 +61,21 @@ not a refused connection.
 
 ## Snapshot integrity
 
-Before resuming a restored app, the host sets the guest's wall clock to the current host time.
-The app stays frozen until that succeeds. If the guest cannot synchronize its clock, the host
-starts it from cold instead.
+A restored guest's clock is advanced by Firecracker in the load itself (`clock_realtime`), by the
+time the snapshot spent on disk. The host then releases the tenant, setting the wall clock to its
+own time once more; if the guest does not answer that, the host starts the app from cold instead.
+
+A snapshot names the Firecracker that took it. After an upgrade of Firecracker, a sleeping app's
+snapshot is refused by that name, and its next request boots it from cold, once, instead of
+restoring; it is never an error.
 
 Guests started before a host and guest-image upgrade keep running. If their init does not
 support the freeze protocol, the host refuses sleep and retries after its normal backoff.
 Redeploy the app to start it with the new guest image.
 
 The host commits a snapshot only after its state, memory and integrity record have been synced
-to disk. It verifies both files' sizes and SHA-256 hashes before restoring. A missing, damaged or
+to disk: Firecracker syncs the state and memory files before it answers the snapshot request,
+and the host syncs the integrity record and the directories that publish it. It verifies both files' sizes and SHA-256 hashes before restoring. A missing, damaged or
 older snapshot without integrity records is discarded; the request starts the app from cold
 instead. Files on its volume survive, but in-memory state does not.
 

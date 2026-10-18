@@ -135,6 +135,7 @@ mod tests {
             vcpu_count,
             mem_size_mib,
             smt: false,
+            huge_pages: guest_contract::firecracker::HugePages::Transparent,
         }
     }
 
