@@ -8,10 +8,94 @@ const BYTES_PER_MIB: u64 = 1_048_576;
 const MAX_SAMPLE_AGE_MS: i64 = 5_000;
 const MIN_MARGIN_BYTES: u64 = 64 * BYTES_PER_MIB;
 
+pub type MemoryProfiles = BTreeMap<(AppId, protocol::DeploymentId), MemoryProfile>;
+const MAX_PROFILES: usize = 1024;
+const PROFILE_REFRESH_MS: i64 = 60 * 60 * 1000;
+const PROFILE_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The highest working set one deployment was measured at, under the resources it ran with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryProfile {
+    pub app_id: AppId,
+    pub deployment_id: protocol::DeploymentId,
+    pub resources: InstanceResources,
+    pub peak_bytes: u64,
+    pub observed_at_ms: i64,
+}
+
+impl MemoryProfile {
+    pub(crate) fn peak_for(&self, resources: InstanceResources, now_ms: i64) -> Option<u64> {
+        (self.resources == resources
+            && (0..PROFILE_LIFETIME_MS).contains(&now_ms.saturating_sub(self.observed_at_ms)))
+        .then_some(self.peak_bytes)
+    }
+}
+
+pub(crate) fn prune_profiles(profiles: &mut MemoryProfiles, now_ms: i64) {
+    profiles.retain(|_, p| (0..PROFILE_LIFETIME_MS).contains(&now_ms.saturating_sub(p.observed_at_ms)));
+    while profiles.len() > MAX_PROFILES {
+        let Some(key) = profiles
+            .iter()
+            .min_by_key(|(_, p)| p.observed_at_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        profiles.remove(&key);
+    }
+}
+
+pub(crate) fn remember_profile(profiles: &mut MemoryProfiles, record: &InstanceRecord, now_ms: i64) {
+    if let Some(peak_bytes) = record.memory_peak_bytes.filter(|peak| *peak > 0) {
+        let key = (record.app_id.clone(), record.deployment_id.clone());
+        if profiles.get(&key).is_some_and(|p| {
+            p.resources == record.resources
+                && p.peak_bytes >= peak_bytes
+                && (0..PROFILE_REFRESH_MS).contains(&now_ms.saturating_sub(p.observed_at_ms))
+        }) {
+            prune_profiles(profiles, now_ms);
+            return;
+        }
+        let peak_bytes = profiles
+            .get(&key)
+            .filter(|p| p.resources == record.resources)
+            .map_or(peak_bytes, |p| p.peak_bytes.max(peak_bytes));
+        profiles.insert(
+            key,
+            MemoryProfile {
+                app_id: record.app_id.clone(),
+                deployment_id: record.deployment_id.clone(),
+                resources: record.resources,
+                peak_bytes,
+                observed_at_ms: now_ms,
+            },
+        );
+    }
+    prune_profiles(profiles, now_ms);
+}
+
+pub(crate) fn restore_profile(profiles: &MemoryProfiles, record: &mut InstanceRecord, now_ms: i64) {
+    if let Some(profile) = profiles
+        .get(&(record.app_id.clone(), record.deployment_id.clone()))
+        .filter(|p| {
+            p.resources == record.resources
+                && (0..PROFILE_LIFETIME_MS).contains(&now_ms.saturating_sub(p.observed_at_ms))
+        })
+    {
+        record.memory_peak_bytes = Some(record.memory_peak_bytes.unwrap_or(0).max(profile.peak_bytes));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryOperation {
     Start,
     Snapshot,
+}
+
+pub(crate) struct StartupMemory {
+    pub deployment_id: protocol::DeploymentId,
+    pub resources: InstanceResources,
+    pub peak_bytes: Option<u64>,
 }
 
 pub(crate) fn target_from_peak(ceiling: u64, peak: u64) -> u64 {
@@ -19,6 +103,7 @@ pub(crate) fn target_from_peak(ceiling: u64, peak: u64) -> u64 {
 }
 
 pub(crate) struct MemoryReadings {
+    pub startup: Option<StartupMemory>,
     pub reservation_generation: u64,
     pub available_bytes: u64,
     pub headroom_bytes: u64,
@@ -28,15 +113,21 @@ pub(crate) struct MemoryReadings {
 }
 
 pub(crate) struct PoolMemory {
+    pub membership: String,
     pub current_bytes: u64,
     pub reclaimable_file_bytes: u64,
     pub high_bytes: u64,
     pub max_bytes: u64,
+    pub all_workloads_contained: bool,
 }
 
 impl PoolMemory {
     pub(crate) fn working_set_bytes(&self) -> u64 {
         self.current_bytes.saturating_sub(self.reclaimable_file_bytes)
+    }
+
+    pub(crate) fn contains(&self, membership: &str) -> bool {
+        std::path::Path::new(membership).starts_with(&self.membership) && membership != self.membership
     }
 }
 
@@ -110,7 +201,12 @@ impl MemoryReadings {
                 .and_then(|limits| limits.max_bytes)
                 .unwrap_or(0),
         );
-        let Some(peak) = self.observed_peak_bytes(record) else {
+        let Some(peak) = self
+            .observed_peak_bytes(record)
+            .into_iter()
+            .chain(record.memory_peak_bytes)
+            .max()
+        else {
             return ceiling;
         };
         target_from_peak(ceiling, peak)
@@ -119,6 +215,9 @@ impl MemoryReadings {
     fn growth_bytes(&self, record: &InstanceRecord) -> u64 {
         let ceiling = self.ceiling(&record.app_id, record.resources);
         let Some(memory) = self.resident_memory(record) else {
+            if record.state == InstanceState::Starting && record.memory_peak_bytes.is_some() {
+                return self.wake_target_bytes(record);
+            }
             return ceiling;
         };
         self.wake_target_bytes(record)
@@ -186,6 +285,7 @@ mod tests {
 
     fn readings() -> MemoryReadings {
         MemoryReadings {
+            startup: None,
             pool: None,
             reservation_generation: 0,
             available_bytes: 2048 * BYTES_PER_MIB,
@@ -225,11 +325,38 @@ mod tests {
 
     fn pool(current_mib: u64) -> PoolMemory {
         PoolMemory {
+            membership: "/workloads.slice".into(),
             current_bytes: current_mib * BYTES_PER_MIB,
             reclaimable_file_bytes: 0,
             high_bytes: 1800 * BYTES_PER_MIB,
             max_bytes: 2048 * BYTES_PER_MIB,
+            all_workloads_contained: true,
         }
+    }
+
+    #[test]
+    fn startup_history_expires_is_bounded_and_never_crosses_resource_changes() {
+        let now = PROFILE_LIFETIME_MS * 2;
+        let mut profiles = MemoryProfiles::new();
+        for index in 0..MAX_PROFILES + 5 {
+            let record = crate::test_support::instance_record(|r| {
+                r.app_id = AppId::parse(format!("app-{index}")).unwrap();
+                r.memory_peak_bytes = Some(128 * BYTES_PER_MIB);
+            });
+            remember_profile(&mut profiles, &record, now + index as i64);
+        }
+        assert_eq!(profiles.len(), MAX_PROFILES);
+        let mut record = crate::test_support::instance_record(|r| {
+            r.app_id = AppId::parse(format!("app-{}", MAX_PROFILES)).unwrap();
+        });
+        restore_profile(&profiles, &mut record, now + MAX_PROFILES as i64);
+        assert_eq!(record.memory_peak_bytes, Some(128 * BYTES_PER_MIB));
+        record.memory_peak_bytes = None;
+        record.resources.memory_mib += 1;
+        restore_profile(&profiles, &mut record, now + MAX_PROFILES as i64);
+        assert_eq!(record.memory_peak_bytes, None);
+        prune_profiles(&mut profiles, now + PROFILE_LIFETIME_MS + 2048);
+        assert!(profiles.is_empty());
     }
 
     #[test]
@@ -292,6 +419,15 @@ mod tests {
     }
 
     #[test]
+    fn containment_requires_a_child_group_and_checks_path_components() {
+        let pool = pool(0);
+        assert!(pool.contains("/workloads.slice/build.slice/compile.service"));
+        assert!(!pool.contains("/workloads.slice"));
+        assert!(!pool.contains("/workloads.slice-other/app.scope"));
+        assert!(!pool.contains("/system.slice/app.scope"));
+    }
+
+    #[test]
     fn resident_build_memory_reduces_future_growth_but_not_the_reserved_budget() {
         let observed = readings();
         assert_eq!(
@@ -342,6 +478,28 @@ mod tests {
         assert_eq!(
             observed.shortfall_mib(8192, &[running()], 512 * BYTES_PER_MIB, 0, 512 * BYTES_PER_MIB),
             704
+        );
+    }
+
+    #[test]
+    fn a_known_boot_keeps_its_startup_target_until_fresh_running_measurements_arrive() {
+        let mut observed = readings();
+        observed.available_bytes = 8192 * BYTES_PER_MIB;
+        observed.pool = Some(pool(300));
+        let mut record = running();
+        record.state = InstanceState::Starting;
+        record.memory_peak_bytes = Some(512 * BYTES_PER_MIB);
+        assert_eq!(observed.growth_bytes(&record), 640 * BYTES_PER_MIB);
+        assert_eq!(observed.anonymous_resident_bytes(&record), 0);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record.clone()], 640 * BYTES_PER_MIB, 0, 0),
+            0
+        );
+        record.memory_peak_bytes = None;
+        assert_eq!(observed.growth_bytes(&record), 2048 * BYTES_PER_MIB);
+        assert_eq!(
+            observed.shortfall_mib(8192, &[record], 640 * BYTES_PER_MIB, 0, 0),
+            1188
         );
     }
 

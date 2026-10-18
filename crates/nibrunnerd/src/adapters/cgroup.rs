@@ -43,10 +43,12 @@ fn read_pool_at(
         return Err(io::Error::other("workload pool changed during observation"));
     }
     Ok(crate::domain::memory_admission::PoolMemory {
+        membership: pool.membership(),
         current_bytes,
         reclaimable_file_bytes,
         high_bytes,
         max_bytes,
+        all_workloads_contained: false,
     })
 }
 
@@ -127,6 +129,7 @@ mod tests {
         assert_eq!(observed.current_bytes, 512);
         assert_eq!(observed.reclaimable_file_bytes, 0);
         assert_eq!(observed.high_bytes, observed.max_bytes);
+        assert!(!observed.all_workloads_contained);
         std::fs::write(
             directory.path().join("memory.stat"),
             "file 1024\ninactive_file 1024\nshmem 0\nfile_dirty 0\nfile_writeback 0\n",

@@ -337,10 +337,12 @@ mod tests {
             stalls: Some((0.0, 0.0)),
             pool: Some(
                 crate::domain::memory_admission::PoolMemory {
+                    membership: "/workloads.slice".into(),
                     current_bytes: current_mib * BYTES_PER_MIB,
                     reclaimable_file_bytes: 0,
                     high_bytes: 1800 * BYTES_PER_MIB,
                     max_bytes: 2048 * BYTES_PER_MIB,
+                    all_workloads_contained: true,
                 }
                 .into(),
             ),
@@ -355,10 +357,12 @@ mod tests {
     fn clean_inactive_cache_does_not_suspend_apps_but_actual_stalls_still_do() {
         let mut state = PressureState::default();
         let pool = crate::domain::memory_admission::PoolMemory {
+            membership: "/workloads.slice".into(),
             current_bytes: 2000 * BYTES_PER_MIB,
             reclaimable_file_bytes: 600 * BYTES_PER_MIB,
             high_bytes: 1800 * BYTES_PER_MIB,
             max_bytes: 2048 * BYTES_PER_MIB,
+            all_workloads_contained: true,
         };
         let reading = Reading {
             available_bytes: 4096 * BYTES_PER_MIB,

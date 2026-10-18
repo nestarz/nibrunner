@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from memory_profiles",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "83a10b8e1270514e50990d06a7784d4323232b75ef0d48b0a41f6f137ba6b7f2"
+}
