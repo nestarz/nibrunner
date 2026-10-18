@@ -218,6 +218,14 @@
     "name": "nibrunner_wake_refusals_total"
   },
   {
+    "help": "Wakes that did not complete a stretch inside its budget, by the stretch: the VMM resuming the microVM, dialling the guest's control port, setting its clock and releasing its tenant, or the app answering its probe. A wake that fell back to a cold boot is also counted under nibrunner_wake_phase_seconds as the cold boot it became.",
+    "kind": "counter",
+    "labels": [
+      "phase"
+    ],
+    "name": "nibrunner_wake_failures_total"
+  },
+  {
     "help": "What the HTTP activator answered requests for on-request apps with. The proxy counts every one of these as served, because serving it is what it did.",
     "kind": "counter",
     "labels": [
@@ -251,6 +259,15 @@
       "outcome"
     ],
     "name": "nibrunner_app_wakes_total"
+  },
+  {
+    "help": "Wakes of an on-request app that did not complete a stretch inside its budget, by the stretch.",
+    "kind": "counter",
+    "labels": [
+      "app",
+      "phase"
+    ],
+    "name": "nibrunner_app_wake_failures_total"
   },
   {
     "help": "What the last wake of an on-request app took. Absent until it has been woken.",

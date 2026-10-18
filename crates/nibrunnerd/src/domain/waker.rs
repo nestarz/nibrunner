@@ -148,6 +148,10 @@ impl AppWaker {
                 break;
             }
             if Instant::now() >= deadline {
+                self.host
+                    .metrics
+                    .sleep_wake
+                    .wake_failed(app_id, crate::domain::metrics::sleep_wake::WakePhase::Ready);
                 return Err(WakeRefusal::Failed {
                     kind: WakeFailure::NeverAnswered,
                     reason: format!("nothing answered on port {} inside the guest", record.http_port),
@@ -670,6 +674,12 @@ mod tests {
                 .await
                 .contains("nibrunner_wake_refusals_total{reason=\"never_answered\"} 1\n"),
             "the refusal is counted under its reason"
+        );
+        assert!(
+            page(&host)
+                .await
+                .contains("nibrunner_wake_failures_total{phase=\"ready\"} 1\n"),
+            "and as a wake that stalled in its probe"
         );
     }
 

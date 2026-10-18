@@ -598,13 +598,30 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
             host.state.probe_at_once(&desired.app_id).await;
             Ok(WakeOutcome::Restored)
         }
-        Err(VmError::SnapshotUnusable { reason }) => {
-            tracing::info!(app_id = %desired.app_id, reason, "nothing to wake this app from; booting it instead");
+        Err(error @ (VmError::SnapshotUnusable { .. } | VmError::WakeStalled { .. })) => {
+            let stalled = match error {
+                VmError::WakeStalled { reason } => {
+                    tracing::warn!(app_id = %desired.app_id, reason, "a restored microVM did not come back; booting the app afresh");
+                    Some(reason)
+                }
+                error => {
+                    tracing::info!(app_id = %desired.app_id, reason = error.message(), "nothing to wake this app from; booting it instead");
+                    None
+                }
+            };
             start_instance(host, desired).await;
             let record = host.state.record(&desired.app_id).await;
             if record.as_ref().is_some_and(|record| {
                 matches!(record.state, InstanceState::Starting | InstanceState::Running)
             }) {
+                // The boot cleared what the record said; what the request was spared is kept.
+                if let Some(reason) = stalled {
+                    host.state
+                        .update_record(&desired.app_id, |record| {
+                            record.message = Some(StateMessage::new(reason));
+                        })
+                        .await;
+                }
                 Ok(WakeOutcome::ColdBoot)
             } else {
                 let reason = record.and_then(|record| record.message).map_or_else(
@@ -972,6 +989,23 @@ mod tests {
         assert_eq!(
             host.state.record(&app_id()).await.unwrap().state,
             InstanceState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_stalled_is_booted_afresh_and_the_instance_says_which_stretch_stalled() {
+        let host = test_host().await;
+        host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
+        host.vms.refuse_wake(VmError::WakeStalled {
+            reason: "dial did not complete: CONNECT 51001 had no answer within 1000 ms".into(),
+        });
+        let result = resume_instance(&host, &desired_instance(|_| {})).await;
+        assert_eq!(result, Ok(WakeOutcome::ColdBoot));
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Starting);
+        assert_eq!(
+            record.message.as_ref().map(StateMessage::as_str),
+            Some("dial did not complete: CONNECT 51001 had no answer within 1000 ms")
         );
     }
 
