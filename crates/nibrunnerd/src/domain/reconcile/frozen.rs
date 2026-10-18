@@ -453,6 +453,8 @@ mod tests {
             .unwrap();
         let port = protocol::HttpPort::new(listener.local_addr().unwrap().port()).unwrap();
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        renamed_while_frozen(&host).await;
+        // After the passes, which set the port the document names: the guest answers on ours.
         host.state
             .update_record(&app_id(), |record| {
                 record.guest_ipv4 = Some(crate::domain::health::probe::loopback());
@@ -460,10 +462,10 @@ mod tests {
                 record.health_check = protocol::HealthCheck::BootCompleted;
             })
             .await;
-        renamed_while_frozen(&host).await;
 
         let waker = crate::domain::waker::AppWaker::new(host.arc().clone());
-        assert!(crate::ports::Waker::wake(waker.as_ref(), &app_id()).await.is_ok());
+        let woke = crate::ports::Waker::wake(waker.as_ref(), &app_id()).await;
+        assert!(woke.is_ok(), "{woke:?}");
         assert_eq!(host.vms.calls(), vec![VmCall::Freeze, VmCall::Thaw]);
         assert_eq!(
             host.state.record(&app_id()).await.unwrap().state,
