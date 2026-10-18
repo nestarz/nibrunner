@@ -24,9 +24,7 @@ impl VmLimits {
             ));
         }
         let guest_bytes = u64::from(machine.mem_size_mib) * BYTES_PER_MIB;
-        // The memory controller charges VMM allocations and KVM page tables alongside guest RAM.
-        let memory_max_bytes =
-            guest_bytes + VMM_OVERHEAD_MIB * BYTES_PER_MIB + guest_bytes / MEMORY_OVERHEAD_DIVISOR;
+        let memory_max_bytes = memory_max_bytes(machine.mem_size_mib);
         Ok(Self {
             cpu_quota_us: u64::from(machine.vcpu_count) * CPU_PERIOD_US,
             memory_max_bytes,
@@ -70,6 +68,13 @@ impl VmLimits {
             restored: false,
         }))
     }
+}
+
+/// What the memory controller lets a VM of `mem_size_mib` charge: it counts VMM allocations and KVM
+/// page tables alongside guest RAM.
+pub(crate) fn memory_max_bytes(mem_size_mib: u32) -> u64 {
+    let guest_bytes = u64::from(mem_size_mib) * BYTES_PER_MIB;
+    guest_bytes + VMM_OVERHEAD_MIB * BYTES_PER_MIB + guest_bytes / MEMORY_OVERHEAD_DIVISOR
 }
 
 pub(crate) fn cgroup_path(app_id: &protocol::AppId) -> std::path::PathBuf {

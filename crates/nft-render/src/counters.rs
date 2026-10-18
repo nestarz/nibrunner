@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use protocol::AppId;
 
-use crate::firewall::{APP_RECEIVED_COUNTER_PREFIX, APP_SENT_COUNTER_PREFIX};
+use crate::firewall::{APP_ACTIVITY_COUNTER_PREFIX, APP_RECEIVED_COUNTER_PREFIX, APP_SENT_COUNTER_PREFIX};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counted {
@@ -10,12 +10,12 @@ pub struct Counted {
     pub bytes: u64,
 }
 
-/// What has crossed an app's tap, counted apart by which way it went. `received` is what reached
-/// the guest — a request somebody made of it — and `sent` is what the guest put back on the wire.
+/// Total network usage and the subset initiated towards the guest, excluding replies to its egress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppTraffic {
     pub received: Counted,
     pub sent: Counted,
+    pub activity: Counted,
 }
 
 pub fn parse_app_traffic(json: &str) -> BTreeMap<AppId, AppTraffic> {
@@ -42,6 +42,8 @@ pub fn parse_app_traffic(json: &str) -> BTreeMap<AppId, AppTraffic> {
             traffic.entry(app_id).or_default().received = counted;
         } else if let Some(app_id) = app_id_after(APP_SENT_COUNTER_PREFIX, name) {
             traffic.entry(app_id).or_default().sent = counted;
+        } else if let Some(app_id) = app_id_after(APP_ACTIVITY_COUNTER_PREFIX, name) {
+            traffic.entry(app_id).or_default().activity = counted;
         }
     }
     traffic
@@ -81,6 +83,7 @@ mod tests {
                     bytes: 512
                 },
                 sent: Counted::default(),
+                activity: Counted::default(),
             })
         );
         assert_eq!(traffic.get(&other).map(|t| t.received.bytes), Some(1024));
@@ -107,6 +110,17 @@ mod tests {
         let held = traffic.get(&app).copied().unwrap_or_default();
         assert_eq!(held.sent.bytes, 4096);
         assert_eq!(held.received, Counted::default());
+    }
+
+    #[test]
+    fn background_replies_are_bandwidth_but_not_activity() {
+        let app = AppId::parse("app-1").unwrap();
+        let traffic = parse_app_traffic(&counters(&[
+            (&app_received_counter_name(&app), 4096),
+            (&crate::firewall::app_activity_counter_name(&app), 128),
+        ]));
+        assert_eq!(traffic[&app].received.bytes, 4096);
+        assert_eq!(traffic[&app].activity.bytes, 128);
     }
 
     #[test]

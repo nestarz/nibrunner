@@ -643,6 +643,8 @@ pub struct ReportedInstance {
     pub deployment_id: DeploymentId,
     pub state: InstanceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<ReportedMemory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_port: Option<HostPort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_ipv4: Option<Ipv4Address>,
@@ -674,6 +676,44 @@ pub struct ReportedInstance {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedMemory {
+    pub measured_at: Timestamp,
+    /// The cgroup measured, relative to the unified hierarchy's root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
+    /// Resident mappings, with shared pages divided among their users. Snapshot pages may be
+    /// charged to the process that wrote them rather than this VM's cgroup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proportional_set_bytes: Option<u64>,
+    /// Resident anonymous mappings, excluding file cache and swapped pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous_set_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ReportedMemoryLimits>,
+    pub current_bytes: u64,
+    pub peak_bytes: Option<u64>,
+    pub swap_bytes: u64,
+    pub high_events: u64,
+    pub oom_kills: u64,
+    pub pressure_some_us: u64,
+    pub pressure_full_us: u64,
+}
+
+/// The cgroup's own memory controls, as the kernel enforces them when the sample was taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedMemoryLimits {
+    pub low_bytes: u64,
+    /// Null means the kernel imposes no limit.
+    pub high_bytes: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub swap_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
