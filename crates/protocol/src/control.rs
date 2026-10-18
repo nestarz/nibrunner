@@ -1,5 +1,6 @@
 #[cfg(feature = "schema")]
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 #[cfg(feature = "schema")]
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -370,6 +371,104 @@ impl Scratch {
     }
 }
 
+pub const MAX_INSTANCE_LABELS: usize = 8;
+const MAX_LABEL_KEY_LENGTH: usize = 32;
+const MAX_LABEL_VALUE_LENGTH: usize = 128;
+#[cfg(feature = "schema")]
+const LABEL_KEY_PATTERN: &str = "^[a-z][a-z0-9_-]{0,31}$";
+#[cfg(feature = "schema")]
+const LABEL_VALUE_PATTERN: &str = "^[A-Za-z0-9._:/@+-]{1,128}$";
+
+fn is_label_key(value: &str) -> bool {
+    value.len() <= MAX_LABEL_KEY_LENGTH
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+// No spaces, quotes or `=`: a label is written into each line of the app's text log as
+// `label.<key>=<value>`, and has to read back as one token there.
+fn is_label_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_LABEL_VALUE_LENGTH
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'@' | b'+' | b'-'))
+}
+
+validated_string!(
+    LabelKey,
+    "label key",
+    "a lowercase letter, then at most 31 lowercase letters, digits, `_` or `-`",
+    is_label_key,
+    { "pattern": LABEL_KEY_PATTERN, "maxLength": MAX_LABEL_KEY_LENGTH }
+);
+
+validated_string!(
+    LabelValue,
+    "label value",
+    "1 to 128 ASCII letters, digits or any of `._:/@+-`",
+    is_label_value,
+    { "pattern": LABEL_VALUE_PATTERN, "maxLength": MAX_LABEL_VALUE_LENGTH }
+);
+
+/// What the control plane calls an instance, in its own words. The host reads none of it: it is
+/// echoed in the report and on every log line and request record the instance produces, so a
+/// reader of either can group them without a lookup of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    try_from = "BTreeMap<LabelKey, LabelValue>",
+    into = "BTreeMap<LabelKey, LabelValue>"
+)]
+pub struct InstanceLabels(BTreeMap<LabelKey, LabelValue>);
+
+impl InstanceLabels {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&LabelKey, &LabelValue)> {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<BTreeMap<LabelKey, LabelValue>> for InstanceLabels {
+    type Error = InvalidValue;
+
+    fn try_from(labels: BTreeMap<LabelKey, LabelValue>) -> Result<Self, Self::Error> {
+        if labels.len() > MAX_INSTANCE_LABELS {
+            return Err(InvalidValue::new_public(&format!(
+                "an instance carries at most {MAX_INSTANCE_LABELS} labels"
+            )));
+        }
+        Ok(Self(labels))
+    }
+}
+
+impl From<InstanceLabels> for BTreeMap<LabelKey, LabelValue> {
+    fn from(labels: InstanceLabels) -> Self {
+        labels.0
+    }
+}
+
+#[cfg(feature = "schema")]
+impl JsonSchema for InstanceLabels {
+    fn schema_name() -> Cow<'static, str> {
+        "InstanceLabels".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "At most 8 opaque labels, echoed in the report and on every log line and request record.",
+            "maxProperties": MAX_INSTANCE_LABELS,
+            "propertyNames": generator.subschema_for::<LabelKey>(),
+            "additionalProperties": generator.subschema_for::<LabelValue>(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(!try_from, transform = desired_instance_rules))]
@@ -408,6 +507,11 @@ pub struct DesiredInstance {
     /// What the HTTP proxy routes to this app's `httpPort`. Empty for an app nothing outside needs
     /// to reach by name.
     pub hostnames: Vec<AppHostname>,
+    /// What the control plane calls this instance: at most 8 opaque pairs, echoed in the report
+    /// and on every log line and request record it writes. Taken up without replacing the
+    /// deployment.
+    #[serde(default, skip_serializing_if = "InstanceLabels::is_empty")]
+    pub labels: InstanceLabels,
 }
 
 impl DesiredInstance {
@@ -456,6 +560,8 @@ struct DesiredInstanceFields {
     layers: Vec<DesiredLayer>,
     config: AppConfig,
     hostnames: Vec<AppHostname>,
+    #[serde(default)]
+    labels: InstanceLabels,
 }
 
 impl TryFrom<DesiredInstanceFields> for DesiredInstance {
@@ -529,6 +635,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             layers: fields.layers,
             config: fields.config,
             hostnames: fields.hostnames,
+            labels: fields.labels,
         })
     }
 }
@@ -745,6 +852,9 @@ pub struct ReportedInstance {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+    /// The document's `labels` for this instance, as last taken up.
+    #[serde(default, skip_serializing_if = "InstanceLabels::is_empty")]
+    pub labels: InstanceLabels,
     /// How this app's last new deployment went when it asked for a cut-over and did not get a
     /// clean one. Absent after a clean cut-over, and for an instance that never asked for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

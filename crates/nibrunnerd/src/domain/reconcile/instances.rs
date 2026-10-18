@@ -68,6 +68,7 @@ pub(super) fn record_fields(desired: &DesiredInstance, slot: &nft_render::AppSlo
         desired_running: desired.desired_state != DesiredInstanceState::Stopped,
         on_request: desired.desired_state == DesiredInstanceState::OnRequest,
         expiry: desired.expiry.clone(),
+        labels: desired.labels.clone(),
     }
 }
 
@@ -95,6 +96,7 @@ fn record_fields_without_slot(desired: &DesiredInstance) -> RecordFields {
         desired_running: desired.desired_state != DesiredInstanceState::Stopped,
         on_request: desired.desired_state == DesiredInstanceState::OnRequest,
         expiry: desired.expiry.clone(),
+        labels: desired.labels.clone(),
     }
 }
 

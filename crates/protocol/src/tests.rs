@@ -247,6 +247,45 @@ fn a_document_that_names_no_max_apps_leaves_the_host_to_its_configuration_and_wr
 }
 
 #[test]
+fn an_instance_without_labels_says_nothing_about_them_and_one_with_them_keeps_them() {
+    let parsed: DesiredInstance = serde_json::from_value(instance_json()).expect("parses");
+    assert!(parsed.labels.is_empty());
+    assert!(serde_json::to_value(&parsed).unwrap().get("labels").is_none());
+    let labelled: DesiredInstance = serde_json::from_value(instance_with(|instance| {
+        instance["labels"] = serde_json::json!({ "rev": "r-12", "app": "shop" });
+    }))
+    .expect("parses");
+    assert_eq!(
+        serde_json::to_value(&labelled).unwrap()["labels"],
+        serde_json::json!({ "app": "shop", "rev": "r-12" })
+    );
+}
+
+#[test]
+fn an_instance_carries_at_most_eight_labels() {
+    let refused = read(instance_with(|instance| {
+        instance["labels"] = (0..=MAX_INSTANCE_LABELS)
+            .map(|index| (format!("k{index}"), serde_json::json!("v")))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+    }))
+    .expect_err("nine labels");
+    assert!(refused.to_string().contains("at most 8 labels"), "{refused}");
+}
+
+#[test]
+fn a_label_must_read_back_as_one_token_of_a_log_line() {
+    for value in ["has space", "a=b", "quote\"", "", "tab\t"] {
+        assert!(LabelValue::parse(value).is_err(), "{value:?}");
+    }
+    for key in ["App", "1st", "", "dotted.key", &"k".repeat(33)] {
+        assert!(LabelKey::parse(key).is_err(), "{key:?}");
+    }
+    assert!(LabelValue::parse("ghcr.io/acme/shop:1.2+build@sha_x-y").is_ok());
+    assert!(LabelKey::parse("time_line-2").is_ok());
+}
+
+#[test]
 fn a_volume_that_starts_empty_says_nothing_about_it() {
     let mut document = desired_json();
     document["volumes"][0]
@@ -488,9 +527,11 @@ fn a_report_omits_what_it_does_not_know() {
         last_exit_code: Some(0),
         message: None,
         cutover: None,
+        labels: InstanceLabels::default(),
     };
     let written = serde_json::to_value(&instance).unwrap();
     assert_eq!(written["lastExitCode"], 0);
+    assert!(written.get("labels").is_none());
     assert!(written.get("startedAt").is_none());
     assert!(written.get("convergedAt").is_none());
     assert!(written.get("lastActiveAt").is_none());
@@ -1005,6 +1046,7 @@ mod schema {
                 last_exit_code: Some(0),
                 message: Some(StateMessage::new("healthy")),
                 cutover: None,
+                labels: serde_json::from_value(serde_json::json!({ "app": "shop", "rev": "r-12" })).unwrap(),
             }],
             checkpoints: vec![ReportedCheckpoint {
                 checkpoint_id: CheckpointId::parse("ckpt-1").unwrap(),
@@ -1216,6 +1258,38 @@ mod schema {
             serde_json::from_value::<HostDesiredState>(document.clone()).unwrap();
             let errors: Vec<String> = validator.iter_errors(&document).map(|e| e.to_string()).collect();
             assert!(errors.is_empty(), "{errors:#?}");
+        }
+    }
+
+    #[test]
+    fn the_schema_holds_labels_to_the_parsers_bounds() {
+        let validator = validator(crate::schema::desired_state());
+        let labelled = |labels: serde_json::Value| with(desired_json(), "/instances/0/labels", labels);
+        let eight: serde_json::Map<_, _> = (0..MAX_INSTANCE_LABELS)
+            .map(|index| (format!("k{index}"), serde_json::json!("v")))
+            .collect();
+        let mut nine = eight.clone();
+        nine.insert("k8".into(), serde_json::json!("v"));
+        for document in [
+            labelled(serde_json::json!({ "app": "shop", "rev": "r-12", "context": "production" })),
+            labelled(serde_json::Value::Object(eight)),
+        ] {
+            serde_json::from_value::<HostDesiredState>(document.clone()).unwrap();
+            assert!(validator.is_valid(&document), "the schema refused {document}");
+        }
+        for document in [
+            labelled(serde_json::Value::Object(nine)),
+            labelled(serde_json::json!({ "App": "shop" })),
+            labelled(serde_json::json!({ "app": "has space" })),
+            labelled(serde_json::json!({ "app": "" })),
+            labelled(serde_json::json!({ "app": "x".repeat(129) })),
+            labelled(serde_json::json!({ "app": 7 })),
+        ] {
+            assert!(
+                serde_json::from_value::<HostDesiredState>(document.clone()).is_err(),
+                "the parser took {document}"
+            );
+            assert!(!validator.is_valid(&document), "the schema took {document}");
         }
     }
 

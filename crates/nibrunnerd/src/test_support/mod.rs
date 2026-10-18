@@ -157,6 +157,7 @@ pub fn desired_instance(edit: impl FnOnce(&mut DesiredInstance)) -> DesiredInsta
         layers: vec![layer(|_| {})],
         config: app_config(|_| {}),
         hostnames: vec![],
+        labels: protocol::InstanceLabels::default(),
     };
     edit(&mut value);
     value
@@ -227,6 +228,7 @@ pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedIn
         last_exit_code: None,
         message: None,
         cutover: None,
+        labels: protocol::InstanceLabels::default(),
     };
     edit(&mut value);
     value
@@ -359,6 +361,7 @@ pub fn record_fields() -> RecordFields {
         desired_running: true,
         on_request: false,
         expiry: None,
+        labels: protocol::InstanceLabels::default(),
     }
 }
 

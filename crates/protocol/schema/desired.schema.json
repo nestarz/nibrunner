@@ -305,6 +305,10 @@
             }
           ]
         },
+        "labels": {
+          "description": "What the control plane calls this instance: at most 8 opaque pairs, echoed in the report\nand on every log line and request record it writes. Taken up without replacing the\ndeployment.",
+          "$ref": "#/$defs/InstanceLabels"
+        },
         "layers": {
           "description": "The root filesystem, bottom layer first. At least one; at most `MAX_LAYERS`.",
           "type": "array",
@@ -865,6 +869,17 @@
         "destinationPath"
       ]
     },
+    "InstanceLabels": {
+      "description": "At most 8 opaque labels, echoed in the report and on every log line and request record.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/LabelValue"
+      },
+      "maxProperties": 8,
+      "propertyNames": {
+        "$ref": "#/$defs/LabelKey"
+      }
+    },
     "InstanceLimits": {
       "description": "What the host enforces on an instance beyond what `resources` gives it. Every field is optional\nand applied live, without replacing the deployment: a running microVM's cgroup is rewritten and\nthe proxy's limit takes the next request.",
       "type": "object",
@@ -936,6 +951,18 @@
         "vcpuCount",
         "memoryMib"
       ]
+    },
+    "LabelKey": {
+      "description": "a lowercase letter, then at most 31 lowercase letters, digits, `_` or `-`",
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "LabelValue": {
+      "description": "1 to 128 ASCII letters, digits or any of `._:/@+-`",
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:/@+-]{1,128}$"
     },
     "MaxLifetimeMs": {
       "type": "integer",

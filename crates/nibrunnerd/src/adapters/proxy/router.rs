@@ -10,7 +10,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use protocol::{AppId, DeploymentId, HostPort};
+use protocol::{AppId, DeploymentId, HostPort, InstanceLabels};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::domain::metrics::{HostMetrics, Outcome};
@@ -40,6 +40,7 @@ pub struct Route {
     pub app_id: AppId,
     pub deployment_id: DeploymentId,
     pub host_port: HostPort,
+    pub labels: InstanceLabels,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,6 +61,7 @@ impl RouteTable {
                                 app_id: target.app_id.clone(),
                                 deployment_id: target.deployment_id.clone(),
                                 host_port: target.host_port,
+                                labels: target.labels.clone(),
                             },
                         )
                     })
@@ -323,7 +325,8 @@ impl Router {
                     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     route.deployment_id.clone(),
                 )
-                .woken_for(wake_micros),
+                .woken_for(wake_micros)
+                .labelled(route.labels.clone()),
             );
         }
         (response, outcome, Some(route))

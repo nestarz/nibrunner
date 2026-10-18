@@ -16,7 +16,7 @@ use tokio::sync::{
 };
 
 use hyper::Uri;
-use protocol::{AppId, DeploymentId, Timestamp};
+use protocol::{AppId, DeploymentId, InstanceLabels, Timestamp};
 use serde::Serialize;
 
 use crate::json_store::make_directory;
@@ -34,6 +34,8 @@ pub struct HttpRequestRecord {
     status: u16,
     duration_micros: u64,
     deployment_id: DeploymentId,
+    #[serde(skip_serializing_if = "InstanceLabels::is_empty")]
+    labels: InstanceLabels,
     #[serde(skip_serializing_if = "Option::is_none")]
     wake_micros: Option<u64>,
 }
@@ -72,6 +74,7 @@ impl HttpRequestRecord {
             status,
             duration_micros,
             deployment_id,
+            labels: InstanceLabels::default(),
             wake_micros: None,
         }
     }
@@ -79,6 +82,11 @@ impl HttpRequestRecord {
     /// The part of `duration_micros` the request spent held for a restore or a cold boot.
     pub fn woken_for(mut self, wake_micros: Option<u64>) -> Self {
         self.wake_micros = wake_micros;
+        self
+    }
+
+    pub fn labelled(mut self, labels: InstanceLabels) -> Self {
+        self.labels = labels;
         self
     }
 }
@@ -320,6 +328,25 @@ mod tests {
             None,
             "a name a guest could guess is not it"
         );
+    }
+
+    #[test]
+    fn a_record_carries_its_instances_labels_only_when_the_document_gave_some() {
+        let uri: Uri = "/".parse().expect("a request URI");
+        let record = |labels| {
+            serde_json::to_value(
+                HttpRequestRecord::new("GET", &uri, 200, 1, crate::test_support::deployment_id())
+                    .labelled(labels),
+            )
+            .expect("a record")
+        };
+        let labels: InstanceLabels =
+            serde_json::from_value(serde_json::json!({ "app": "shop", "rev": "r-12" })).expect("labels");
+        assert_eq!(
+            record(labels)["labels"],
+            serde_json::json!({ "app": "shop", "rev": "r-12" })
+        );
+        assert!(record(InstanceLabels::default()).get("labels").is_none());
     }
 
     #[tokio::test]
