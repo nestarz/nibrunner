@@ -175,9 +175,11 @@ impl FirecrackerApi {
                     backend_type: "File",
                     backend_path: &memory_path.display().to_string(),
                 },
-                // kvmclock advanced by the time the snapshot spent on disk, so the guest wakes
-                // with its clock already right.
-                clock_realtime: true,
+                // Firecracker can advance kvmclock by the time on disk only when the host's own
+                // clock let KVM save the real time in the snapshot (a TSC clocksource); on a
+                // virtual machine's kvm-clock the load is refused ("clock_realtime requested but
+                // not present in the snapshot"). The host's release sets the guest's clock instead.
+                clock_realtime: false,
             },
         )
         .await
@@ -292,7 +294,7 @@ mod tests {
         assert!(!calls[1].2.contains("mem_file_path"));
         assert_eq!(
             calls[1].2,
-            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":true}"#
+            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":false}"#
         );
     }
 

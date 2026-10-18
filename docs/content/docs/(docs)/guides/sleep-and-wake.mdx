@@ -61,9 +61,11 @@ not a refused connection.
 
 ## Snapshot integrity
 
-A restored guest's clock is advanced by Firecracker in the load itself (`clock_realtime`), by the
-time the snapshot spent on disk. The host then releases the tenant, setting the wall clock to its
-own time once more; if the guest does not answer that, the host starts the app from cold instead.
+Before resuming a restored app, the host sets the guest's wall clock to the current host time and
+releases its tenant. The app stays frozen until that succeeds. If the guest cannot synchronize its
+clock, the host starts it from cold instead. (Firecracker's `clock_realtime` load option is not
+used: it needs a host whose own clocksource let KVM save the real time, which a virtual machine's
+`kvm-clock` does not, and Firecracker then refuses the load.)
 
 A snapshot names the Firecracker that took it. After an upgrade of Firecracker, a sleeping app's
 snapshot is refused by that name, and its next request boots it from cold, once, instead of

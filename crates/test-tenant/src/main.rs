@@ -320,6 +320,11 @@ fn fill_file(target: &str, data_dir: &Path) -> (&'static str, String) {
         return ("400 Bad Request", "that is not a path".to_string());
     };
     let mib: usize = query(target, "mib").and_then(|n| n.parse().ok()).unwrap_or(0);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return ("500 Internal Server Error", error.to_string());
+        }
+    }
     let mut chunk = vec![0u8; 1024 * 1024];
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let written = std::fs::File::create(&path).and_then(|mut file| {
