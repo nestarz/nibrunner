@@ -30,7 +30,7 @@ async fn concurrent_requests_restore_one_guest_and_every_caller_is_answered() {
     assert_eq!(host.get(&app, "/remember").await.expect("an answer").body, "1");
     host.let_sleep(&app).await;
 
-    let [restores_before, _, cold_boots_before, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [restores_before, _, cold_boots_before, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     let barrier = tokio::sync::Barrier::new(CALLERS as usize);
     let requests = (0..CALLERS).map(|_| async {
         barrier.wait().await;
@@ -54,7 +54,7 @@ async fn concurrent_requests_restore_one_guest_and_every_caller_is_answered() {
         (2..=CALLERS + 1).collect::<Vec<_>>(),
         "the restored guest lost or duplicated state"
     );
-    let [restores_after, _, cold_boots_after, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [restores_after, _, cold_boots_after, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     assert_eq!(
         restores_after - restores_before,
         1,
@@ -179,12 +179,12 @@ async fn a_corrupt_snapshot_cold_boots_the_app_and_still_answers_the_request() {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&byte).unwrap();
         drop(file);
-        let [restored_before, cold_before, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+        let [restored_before, cold_before, _, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
 
         let answer = host.get(&app, "/remember").await.expect("the cold boot answers");
         assert_eq!(answer.status, 200, "{answer:?}");
         assert_eq!(answer.body, "1", "the corrupted snapshot was restored");
-        let [restored_after, cold_after, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+        let [restored_after, cold_after, _, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
         assert_eq!(restored_after, restored_before);
         assert_eq!(cold_after, cold_before + 1);
         assert!(!paths.directory.exists());
@@ -358,7 +358,7 @@ async fn a_unit_frozen_past_the_snapshot_lease_with_production_limits_thaws_in_p
         TENANT_FREEZE_LEASE_MS + TENANT_CONTROL_TIMEOUT_MS,
     ))
     .await;
-    let [_, cold_boots, _, thawed] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [_, cold_boots, _, thawed, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
 
     let asked = Instant::now();
     let answer = host.get(&app, "/remember").await.unwrap();
@@ -369,9 +369,16 @@ async fn a_unit_frozen_past_the_snapshot_lease_with_production_limits_thaws_in_p
     // on a pause of over half a minute: 331 ms on a 2-vCPU VPS, under 300 ms without the cap.
     assert!(took < Duration::from_millis(500), "the thaw took {took:?}");
     assert_eq!(pid(&host), before, "thawed in place, not booted again");
-    let [_, cold_boots_after, _, thawed_after] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [_, cold_boots_after, _, thawed_after, thaw_failed] =
+        host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     assert_eq!(thawed_after, thawed + 1, "the wake was a thaw");
     assert_eq!(cold_boots_after, cold_boots, "nothing fell back to a cold boot");
+    assert_eq!(thaw_failed, 0);
+    assert_eq!(
+        host.host.metrics.sleep_wake.of(&app.app_id).wake_failures,
+        [0; 4],
+        "no stretch of the wake stalled"
+    );
     let (sent, guest_time, answered) = (
         nibrunnerd::clock::now_ms(),
         host.get(&app, "/time")

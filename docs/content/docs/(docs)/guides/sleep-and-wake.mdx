@@ -84,7 +84,12 @@ nothing new; requests still resume those already frozen.
 Freezing pauses the VMM alone: a paused guest runs nothing, so its tenant is not held, and no
 lease can release it under a host that still holds it frozen. A frozen VM that will not resume is
 not left paused for the next request to find the same way: the host stops it and boots the app
-from cold, and the request waits for that boot. One whose deployment is being replaced is left to the
+from cold, and the request waits for that boot. The resume has a budget of its own (200 ms), so a
+thaw that stalls is named: on the instance's `message` once the cold boot has started, on
+`nibrunner_wake_failures_total{phase="resume"}` and its app's `nibrunner_app_wake_failures_total`,
+and as the wake outcome `thaw-failed` beside the `cold-boot` that answered the request. The
+guest's console is kept as `vm-<id>.wake-failed.console` in the runtime directory before the VM is
+let go of. One whose deployment is being replaced is left to the
 replacement instead, and the request waits for the new deployment to answer.
 
 ## Revision retention

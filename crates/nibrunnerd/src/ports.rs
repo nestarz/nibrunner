@@ -180,6 +180,9 @@ pub enum WakeOutcome {
     ColdBoot,
     /// A frozen microVM resumed in place.
     Thawed,
+    /// A frozen microVM that did not come back; the request was answered by a cold boot instead,
+    /// counted as its own wake.
+    ThawFailed,
 }
 
 impl WakeOutcome {
@@ -195,6 +198,7 @@ impl WakeOutcome {
             WakeOutcome::AlreadyRunning => "already-running",
             WakeOutcome::ColdBoot => "cold-boot",
             WakeOutcome::Thawed => "thawed",
+            WakeOutcome::ThawFailed => "thaw-failed",
         }
     }
 }

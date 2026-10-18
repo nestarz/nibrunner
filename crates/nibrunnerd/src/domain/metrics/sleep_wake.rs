@@ -137,11 +137,12 @@ const FAILING_PHASES: [WakePhase; 4] = [
     WakePhase::Sync,
     WakePhase::Ready,
 ];
-const WAKE_OUTCOMES: [WakeOutcome; 4] = [
+const WAKE_OUTCOMES: [WakeOutcome; 5] = [
     WakeOutcome::Restored,
     WakeOutcome::ColdBoot,
     WakeOutcome::AlreadyRunning,
     WakeOutcome::Thawed,
+    WakeOutcome::ThawFailed,
 ];
 const REFUSALS: [&str; 9] = [
     "no_room",
@@ -263,6 +264,14 @@ impl SleepWakeMetrics {
         let index = position(&FAILING_PHASES, &phase);
         self.failures[index].fetch_add(1, Ordering::Relaxed);
         self.app(app_id, |app| app.wake_failures[index] += 1);
+    }
+
+    /// A thaw that did not come back after `took`, before the cold boot that replaced it.
+    pub fn thaw_failed(&self, app_id: &AppId, took: Duration) {
+        self.wake(WakePhase::Total, WakeOutcome::ThawFailed).observe(took);
+        self.app(app_id, |app| {
+            app.wakes[position(&WAKE_OUTCOMES, &WakeOutcome::ThawFailed)] += 1;
+        });
     }
 
     pub fn snapshotted(&self, took: Duration) {
@@ -751,6 +760,7 @@ mod tests {
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"cold-boot\"} 0",
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"already-running\"} 0",
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"thawed\"} 0",
+                "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"thaw-failed\"} 0",
             ]
         );
         assert_eq!(
