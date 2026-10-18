@@ -1001,7 +1001,7 @@ impl HostConfig {
             allowed_egress_endpoints: network
                 .allowed_egress_endpoints
                 .as_deref()
-                .map(|endpoints| host_tcp_endpoints("network.allowed_egress_endpoints", endpoints))
+                .map(allowed_egress_endpoints)
                 .transpose()?
                 .unwrap_or_default(),
             denied_egress_addresses_v4: cidrs(
@@ -1702,6 +1702,28 @@ fn host_tcp_endpoints(field: &str, values: &[String]) -> Result<Vec<SocketAddr>,
     Ok(endpoints)
 }
 
+/// A guest's packets to loopback or to the guest network never take the forward chain past the
+/// guest-to-guest deny, so such an endpoint would render a rule that opens nothing; it is refused.
+/// Guests have no IPv6 network of their own, so loopback is the one IPv6 refusal.
+fn allowed_egress_endpoints(values: &[String]) -> Result<Vec<SocketAddr>, ConfigError> {
+    const FIELD: &str = "network.allowed_egress_endpoints";
+    let endpoints = host_tcp_endpoints(FIELD, values)?;
+    for endpoint in &endpoints {
+        let refusal = match endpoint.ip().to_canonical() {
+            ip if ip.is_loopback() => "loopback (127.0.0.0/8, ::1)".to_string(),
+            IpAddr::V4(ip) if nft_render::in_guest_network(ip) => {
+                format!("the guest network ({})", nft_render::GUEST_NETWORK_CIDR)
+            }
+            _ => continue,
+        };
+        return Err(ConfigError::invalid(
+            FIELD,
+            format_args!("a list of private endpoints a guest can reach: {endpoint} is in {refusal}"),
+        ));
+    }
+    Ok(endpoints)
+}
+
 fn cidrs(field: &str, values: &[String], family: Family) -> Result<Vec<String>, ConfigError> {
     values
         .iter()
@@ -1910,7 +1932,7 @@ denied_egress_addresses_v6 = []
     fn allowed_egress_endpoints_are_optional_exact_pairs() {
         assert!(parsed(WHOLE).allowed_egress_endpoints.is_empty());
         let config = parsed(&format!(
-            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.5:9000\", \"[fd00::5]:9000\"]\n"
+            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.5:9000\", \"[fd00::5]:9000\", \"10.0.0.5:9000\"]\n"
         ));
         assert_eq!(
             config.allowed_egress_endpoints,
@@ -1919,10 +1941,64 @@ denied_egress_addresses_v6 = []
                 "[fd00::5]:9000".parse().unwrap()
             ]
         );
-        assert!(refused(&format!(
-            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.0/8:9000\"]\n"
+        assert_eq!(parsed(&config.to_toml()), config);
+        for invalid in [
+            "10.0.0.0/8:9000",
+            "storage.internal:9000",
+            "10.0.0.5:0",
+            "[ff02::1]:9000",
+        ] {
+            assert!(
+                refused(&format!("{WHOLE}allowed_egress_endpoints = [\"{invalid}\"]\n"))
+                    .contains("network.allowed_egress_endpoints is not IP:port pairs"),
+                "{invalid}"
+            );
+        }
+    }
+
+    fn egress_refusal(endpoint: &str) -> String {
+        refused(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.0.0.5:9000\", \"{endpoint}\"]\n"
         ))
-        .contains("network.allowed_egress_endpoints"));
+    }
+
+    #[test]
+    fn an_allowed_egress_endpoint_on_loopback_is_refused() {
+        for endpoint in [
+            "127.0.0.1:9000",
+            "127.255.0.9:9000",
+            "[::1]:9000",
+            "[::ffff:127.0.0.1]:9000",
+        ] {
+            let message = egress_refusal(endpoint);
+            assert!(
+                message.starts_with("network.allowed_egress_endpoints is not"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("{endpoint} is in loopback (127.0.0.0/8, ::1)")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_allowed_egress_endpoint_in_the_guest_network_is_refused() {
+        for endpoint in [
+            "10.201.0.2:3000",
+            "10.201.255.254:9000",
+            "[::ffff:10.201.0.1]:9000",
+        ] {
+            let message = egress_refusal(endpoint);
+            assert!(
+                message.contains(&format!("{endpoint} is in the guest network (10.201.0.0/16)")),
+                "{message}"
+            );
+        }
+        assert!(HostConfig::from_toml(&format!(
+            "{WHOLE}allowed_egress_endpoints = [\"10.200.0.2:3000\", \"10.202.0.2:3000\"]\n"
+        ))
+        .is_ok());
     }
 
     /// A key as the refusals name it: `section.key`, or the bare key above the first section.

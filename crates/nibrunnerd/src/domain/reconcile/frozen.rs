@@ -267,6 +267,9 @@ mod tests {
             state.instances = vec![desired_instance(|instance| {
                 instance.desired_state = protocol::DesiredInstanceState::OnRequest;
                 instance.activation = Some(ActivationPolicy {
+                    cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                 });
             })]
@@ -343,6 +346,9 @@ mod tests {
             state.instances = vec![desired_instance(|instance| {
                 instance.desired_state = protocol::DesiredInstanceState::OnRequest;
                 instance.activation = Some(ActivationPolicy {
+                    cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                 });
             })];

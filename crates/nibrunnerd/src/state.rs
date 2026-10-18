@@ -336,18 +336,6 @@ impl HostState {
         }
     }
 
-    pub(crate) fn try_transition(&self, app_id: &AppId) -> Option<OwnedMutexGuard<()>> {
-        let lock = {
-            let mut transitions = self
-                .transitions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            transitions.retain(|_, lock| Arc::strong_count(lock) > 1);
-            transitions.entry(app_id.clone()).or_default().clone()
-        };
-        lock.try_lock_owned().ok()
-    }
-
     /// The lock a sleep or a wake of this app holds for as long as it is moving the microVM.
     /// One transition of an app at a time, so that neither finds the other half way through a
     /// snapshot; and each app's own, so that the sleeps a pass runs side by side wait on nothing

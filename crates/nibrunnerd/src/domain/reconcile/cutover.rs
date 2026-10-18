@@ -37,6 +37,7 @@ fn staged_instance(desired: &DesiredInstance, staging: &AppId) -> DesiredInstanc
         desired_state: DesiredInstanceState::Running,
         idle_timeout_ms: None,
         activation: None,
+        expiry: None,
         ..desired.clone()
     }
 }
@@ -107,6 +108,30 @@ async fn stage(host: &Arc<Host>, desired: &DesiredInstance, timeout_ms: u64) {
     if !host.state.snapshot().await.isolated {
         return;
     }
+    // Both deployments are held at once until the cut-over, so the new one's memory is
+    // reserved as any start's is; a host with no room for it leaves it waiting to its deadline.
+    let _reservation = match host
+        .reserve_memory(
+            &staging,
+            staged.config.resources,
+            super::pressure::ReclaimPurpose::Deployment,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(shortfall_mib) => {
+            waiting(
+                host,
+                &staged,
+                owner,
+                StateMessage::new(format!(
+                    "waiting to be started: its host is {shortfall_mib} MiB short of the memory it needs"
+                )),
+            )
+            .await;
+            return;
+        }
+    };
     if !waiting(
         host,
         &staged,
@@ -148,6 +173,7 @@ async fn promote(host: &Arc<Host>, desired: &DesiredInstance) {
         return;
     };
     let (old_deployment, new_deployment) = (old.deployment_id.clone(), new.deployment_id.clone());
+    let now = now_ms();
     if let Err(error) = host.vms.exchange(owner, &staging).await {
         tracing::error!(app_id = %owner, error = %error.message(), "the new deployment could not take its app over");
         return;
@@ -169,6 +195,7 @@ async fn promote(host: &Arc<Host>, desired: &DesiredInstance) {
             new.hostnames = desired.hostnames.clone();
             new.desired_running = desired.desired_state != DesiredInstanceState::Stopped;
             new.on_request = desired.desired_state == DesiredInstanceState::OnRequest;
+            new.apply_expiry(desired.expiry.clone(), &desired.deployment_id, now);
             old.app_id = staging.clone();
             old.staging_for = Some(owner.clone());
             old.cutover = None;
@@ -395,12 +422,12 @@ mod tests {
         assert_eq!(owner.deployment_id, deployment_id());
         assert!(owner.cutover.as_ref().unwrap().abandoned);
         assert_eq!(
-            to_reported_instance(&owner).cutover,
+            to_reported_instance(&owner, None).cutover,
             Some(protocol::CutoverOutcome::Abandoned {
                 deployment_id: new_deployment()
             })
         );
-        let said = to_reported_instance(&owner).message.unwrap();
+        let said = to_reported_instance(&owner, None).message.unwrap();
         assert!(
             said.as_str().starts_with("cutover_abandoned: deployment dep-2"),
             "{said:?}"
@@ -430,7 +457,7 @@ mod tests {
         )
         .await;
 
-        let reported = to_reported_instance(&host.state.record(&app_id()).await.unwrap());
+        let reported = to_reported_instance(&host.state.record(&app_id()).await.unwrap(), None);
         assert_eq!(
             reported.cutover,
             Some(protocol::CutoverOutcome::Fallback {
@@ -448,6 +475,8 @@ mod tests {
                 *instance = wanted();
                 instance.deployment_id = deployment;
                 instance.activation = Some(protocol::ActivationPolicy {
+                    snapshot_ttl_ms: None,
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: protocol::SleepPolicy::Never,
                     cutover_timeout_ms: Some(protocol::CutoverTimeoutMs::try_from(600_000).unwrap()),
                 });
@@ -463,6 +492,7 @@ mod tests {
         let hostname = app_hostname().hostname;
         super::super::reconcile(host.arc(), &document(deployment_id()), Trigger::Change).await;
         host.vms.set_status(crate::adapters::vm::VmStatus {
+            frozen: false,
             loaded: true,
             active: true,
             failed: false,

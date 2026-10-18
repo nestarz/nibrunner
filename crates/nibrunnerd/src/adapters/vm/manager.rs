@@ -388,13 +388,10 @@ impl VmManager {
         outcome
     }
 
-    /// Resumes a paused microVM and hands its tenant back its clock, timing each stretch under
-    /// `outcome`. A stretch that does not complete inside its budget is counted, and the guest's
-    /// console is kept, before the caller lets go of the microVM.
-    async fn resume_paused_guest(&self, app_id: &AppId, outcome: WakeOutcome) -> Result<(), WakeStalled> {
-        let metrics = &self.metrics.sleep_wake;
+    /// Resumes a paused microVM within [`RESUME_BUDGET`], timing it under `outcome`.
+    async fn resume_within_budget(&self, app_id: &AppId, outcome: WakeOutcome) -> Result<(), WakeStalled> {
         let resuming = std::time::Instant::now();
-        let resumed = match tokio::time::timeout(RESUME_BUDGET, self.api(app_id).resume()).await {
+        match tokio::time::timeout(RESUME_BUDGET, self.api(app_id).resume()).await {
             Err(_) => Err(WakeStalled::new(
                 WakePhase::Resume,
                 format!(
@@ -403,40 +400,48 @@ impl VmManager {
                 ),
             )),
             Ok(answered) => answered.map_err(|error| WakeStalled::new(WakePhase::Resume, error.message())),
-        };
-        let synced = match resumed {
-            Ok(()) => {
-                metrics.phase(WakePhase::Resume, outcome, resuming.elapsed());
-                let control = self
-                    .working_dir_for(app_id)
-                    .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
-                time_sync::wake(&control).await
-            }
-            Err(stalled) => Err(stalled),
-        };
-        match synced {
-            Ok(synced) => {
-                metrics.phase(WakePhase::Dial, outcome, synced.dial);
-                metrics.phase(WakePhase::Sync, outcome, synced.sync);
-                Ok(())
-            }
-            Err(stalled) => {
-                metrics.wake_failed(app_id, stalled.phase);
-                let kept = self.processes.keep_console_of_failed_wake(app_id);
-                tracing::warn!(
-                    %app_id,
-                    phase = stalled.phase.as_str(),
-                    reason = %stalled.reason,
-                    console = %kept.as_deref().map_or_else(|| "none".into(), |path| path.display().to_string()),
-                    "a wake did not complete"
-                );
-                Err(stalled)
-            }
+        }?;
+        self.metrics
+            .sleep_wake
+            .phase(WakePhase::Resume, outcome, resuming.elapsed());
+        Ok(())
+    }
+
+    /// A wake that did not complete: counted by its stretch, the guest's console kept before the
+    /// caller lets go of the microVM.
+    fn wake_stalled(&self, app_id: &AppId, stalled: WakeStalled) -> WakeStalled {
+        self.metrics.sleep_wake.wake_failed(app_id, stalled.phase);
+        let kept = self.processes.keep_console_of_failed_wake(app_id);
+        tracing::warn!(
+            %app_id,
+            phase = stalled.phase.as_str(),
+            reason = %stalled.reason,
+            console = %kept.as_deref().map_or_else(|| "none".into(), |path| path.display().to_string()),
+            "a wake did not complete"
+        );
+        stalled
+    }
+
+    /// Resumes a restored microVM and hands its tenant back its clock: the resume, then the
+    /// guest exchange (its dial and its sync), each within its own budget.
+    async fn resume_restored_guest(&self, app_id: &AppId) -> Result<(), WakeStalled> {
+        let resumed = async {
+            self.resume_within_budget(app_id, WakeOutcome::Restored).await?;
+            let control = self
+                .working_dir_for(app_id)
+                .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+            time_sync::wake(&control).await
         }
+        .await;
+        let synced = resumed.map_err(|stalled| self.wake_stalled(app_id, stalled))?;
+        let metrics = &self.metrics.sleep_wake;
+        metrics.phase(WakePhase::Dial, WakeOutcome::Restored, synced.dial);
+        metrics.phase(WakePhase::Sync, WakeOutcome::Restored, synced.sync);
+        Ok(())
     }
 
     async fn resume_restored_tenant(&self, request: &SuspendRequest) -> Result<(), VmError> {
-        self.resume_paused_guest(&request.app_id, WakeOutcome::Restored)
+        self.resume_restored_guest(&request.app_id)
             .await
             .map_err(|stalled| VmError::WakeStalled {
                 reason: stalled.to_string(),
@@ -454,7 +459,7 @@ impl VmManager {
     async fn resume_frozen_tenant(&self, app_id: &AppId, control: &Path) {
         let recovered = async {
             self.api(app_id).resume().await?;
-            time_sync::wake(control)
+            time_sync::release_after_refused_sleep(control)
                 .await
                 .map(drop)
                 .map_err(|stalled| VmError::Host(stalled.to_string()))
@@ -688,8 +693,8 @@ impl Vmm for VmManager {
         let control = self
             .working_dir_for(&request.app_id)
             .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
-        if let Err(error) = time_sync::freeze_tenant(&control, time_sync::Hold::Leased).await {
-            if let Err(recovery) = time_sync::wake(&control).await {
+        if let Err(error) = time_sync::freeze_tenant(&control).await {
+            if let Err(recovery) = time_sync::release_after_refused_sleep(&control).await {
                 tracing::warn!(app_id = %request.app_id, error = %recovery, "guest clock recovery failed after sleep refusal");
             }
             return Err(error);

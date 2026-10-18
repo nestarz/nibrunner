@@ -141,6 +141,18 @@ impl VmProcesses {
         self.runtime_dir.join(format!("vm-{app_id}.console"))
     }
 
+    /// Where the console of the last wake of `app_id` that did not complete is kept: the next
+    /// boot truncates the console, and letting go of the microVM deletes it.
+    pub fn failed_wake_console_path(&self, app_id: &AppId) -> PathBuf {
+        self.runtime_dir.join(format!("vm-{app_id}.wake-failed.console"))
+    }
+
+    pub fn keep_console_of_failed_wake(&self, app_id: &AppId) -> Option<PathBuf> {
+        let kept = self.failed_wake_console_path(app_id);
+        std::fs::copy(self.console_path(app_id), &kept).ok()?;
+        Some(kept)
+    }
+
     pub fn read_record(&self, app_id: &AppId) -> Option<VmRecord> {
         read_json(&self.record_path(app_id)).ok().flatten()
     }

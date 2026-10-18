@@ -317,6 +317,9 @@ mod tests {
 
     fn idle() -> ActivationPolicy {
         ActivationPolicy {
+            cutover_timeout_ms: None,
+            snapshot_ttl_ms: None,
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: SleepPolicy::TrafficIdle {
                 timeout_ms: 300_000.try_into().unwrap(),
             },
@@ -490,6 +493,9 @@ mod tests {
         assert!(!eligible(
             &running(),
             &ActivationPolicy {
+                cutover_timeout_ms: None,
+                snapshot_ttl_ms: None,
+                first_boot: protocol::FirstBoot::Eager,
                 sleep_when: SleepPolicy::Never
             },
             &quiet(),

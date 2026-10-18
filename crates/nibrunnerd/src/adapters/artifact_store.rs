@@ -7,9 +7,6 @@ use protocol::{DownloadUrl, ObjectKey};
 
 use crate::ports::{ArtifactBody, ArtifactError, ArtifactStore};
 
-/// A program is held whole in memory to be checked, so a URL cannot make the daemon hold more.
-const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
-
 pub struct ObjectArtifactStore {
     store: Arc<dyn ObjectStore>,
     prefix: Option<String>,
@@ -64,24 +61,14 @@ impl ArtifactStore for ObjectArtifactStore {
         Ok(result.into_stream().map_err(transferred).boxed())
     }
 
-    async fn download(&self, url: &DownloadUrl) -> Result<Vec<u8>, ArtifactError> {
+    async fn download(&self, url: &DownloadUrl) -> Result<ArtifactBody, ArtifactError> {
         crate::install_crypto_provider();
         let transferred = |error: reqwest::Error| ArtifactError::Transfer(error.to_string());
-        let mut response = reqwest::get(url.as_str())
+        let response = reqwest::get(url.as_str())
             .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(transferred)?;
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transferred)? {
-            if body.len() + chunk.len() > MAX_DOWNLOAD_BYTES {
-                return Err(ArtifactError::Transfer(format!(
-                    "{url} is larger than the {MAX_DOWNLOAD_BYTES} bytes a downloaded layer may be",
-                    url = url.as_str()
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
+        Ok(response.bytes_stream().map_err(transferred).boxed())
     }
 }
 
