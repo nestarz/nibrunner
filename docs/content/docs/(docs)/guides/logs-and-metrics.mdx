@@ -68,6 +68,8 @@ transfer of the response body.
 A request the proxy held while its app was restored from a snapshot or booted also has
 `wakeMicros`, the part of `durationMicros` it waited for that. The field is absent for every other
 request, one held only while the host was already booting a `running` app included.
+On a host with [`[proxy.http.encode]`](/docs/guides/response-cache), a line also has
+`encoding`.
 The proxy keeps at most 1 MiB in this file and 1 MiB in `.http.jsonl.1` for each app. When
 proxy traffic outruns the bounded writer queue, it drops HTTP request records and warns in the daemon
 journal. An app's HTTP request logs go when `desired.json` stops naming it.

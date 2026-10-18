@@ -407,6 +407,10 @@
           "description": "Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.",
           "$ref": "#/$defs/proxy.http.concurrency"
         },
+        "encode": {
+          "description": "Absent compresses nothing. Changes require `nibrunnerd start`.",
+          "$ref": "#/$defs/proxy.http.encode"
+        },
         "listen_address": {
           "description": "An IP address to bind.",
           "type": "string"
@@ -459,6 +463,39 @@
       "required": [
         "host_concurrent",
         "app_concurrent"
+      ]
+    },
+    "proxy.http.encode": {
+      "description": "Compression of responses on their way out, negotiated from the visitor's `Accept-Encoding`,\nonce per response. Absent passes every body on as the app sent it.",
+      "type": "object",
+      "properties": {
+        "encodings": {
+          "description": "The codings offered, in this host's order of preference when a visitor accepts several\nequally. Empty offers none.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/proxy.http.encode.encoding"
+          },
+          "uniqueItems": true
+        },
+        "min_kib": {
+          "description": "A body whose `Content-Length` says it is smaller than this, in KiB, is not worth compressing\nand is passed on as it is.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "encodings",
+        "min_kib"
+      ]
+    },
+    "proxy.http.encode.encoding": {
+      "description": "A content coding the proxy may compress a response into.",
+      "type": "string",
+      "enum": [
+        "br",
+        "gzip"
       ]
     },
     "proxy.http.tls": {

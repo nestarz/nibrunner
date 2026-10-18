@@ -2,6 +2,7 @@ pub mod activator;
 pub mod certificate;
 pub(crate) mod concurrency;
 pub mod datagram_activator;
+pub(crate) mod encode;
 pub mod forward;
 pub mod http_log;
 pub mod pem;

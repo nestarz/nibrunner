@@ -1,0 +1,43 @@
+---
+title: Compression
+description: Compress what leaves the proxy.
+---
+
+The HTTP proxy can compress responses on their way out. It is a section under `[proxy.http]`, and
+it is off while the section is absent.
+
+```toml
+[proxy.http.encode]
+encodings = ["br", "gzip"]
+min_kib = 1
+```
+
+| Key | Meaning |
+| --- | --- |
+| [`encode.encodings`](/docs/reference/config#proxyhttpencode-encodings) | The codings offered, in order of preference when a visitor accepts several equally. Empty offers none. |
+| [`encode.min_kib`](/docs/reference/config#proxyhttpencode-min_kib) | A body whose `Content-Length` is smaller is sent as it is. |
+
+Changing the section takes `nibrunnerd start`.
+
+## Compression
+
+The proxy negotiates one coding from the visitor's `Accept-Encoding`: `br` or `gzip` as
+`encodings` allows, the visitor's highest `q` first, `*` counting as `gzip`, `identity` when the
+visitor accepts neither. The app is asked with that one coding in `Accept-Encoding`.
+
+A response is compressed when its status is `200`, `203`, `404` or `410`, it has no
+`Content-Encoding` or `Content-Range`, it does not say `Cache-Control: no-transform`, and its type
+is text: `text/*`, JSON, JavaScript, XML, RSS, Atom, web manifests, `application/wasm`, SVG,
+`font/ttf` and `font/otf`. Images, video, archives and `font/woff2` are sent as they are. A
+compressed response gets `Vary: Accept-Encoding`, and a strong `ETag` becomes weak (`"v1"` becomes
+`W/"v1"`); `If-None-Match` still matches it.
+
+## What to watch
+
+Each line of `<appId>.http.jsonl` gains `encoding` (`br`, `gzip` or `identity`, the coding the
+body was sent in) on a host with `[proxy.http.encode]`. The metric is in the
+[reference](/docs/reference/metrics):
+
+| Metric | Labels |
+| --- | --- |
+| `nibrunner_proxy_encode_bytes_total` | `app`, `encoding`, `direction` |
