@@ -130,7 +130,17 @@ impl AppWaker {
                 return Err(refusal);
             }
         };
-        let outcome = crate::domain::reconcile::instances::resume_instance(&self.host, &wanted).await?;
+        let frozen_on_its_way_out = self.host.state.record(app_id).await.is_some_and(|record| {
+            record.state == InstanceState::Frozen && record.deployment_id != wanted.deployment_id
+        });
+        let outcome = match crate::domain::reconcile::instances::resume_instance(&self.host, &wanted).await {
+            Err(_) if frozen_on_its_way_out => {
+                drop(reservation);
+                drop(transition);
+                return self.await_replacement(app_id, &wanted).await;
+            }
+            resumed => resumed?,
+        };
         drop(reservation);
         drop(transition);
 
@@ -261,6 +271,44 @@ impl AppWaker {
             }
             tokio::time::sleep(PROBE_INTERVAL).await;
         }
+    }
+
+    /// A frozen guest of the deployment being replaced that would not resume is the pass's to take
+    /// down: it is bringing the deployment the document names up in its place, beside it or after
+    /// it. The request waits for that one, the transition let go so the pass can take it over, as
+    /// long as a boot of it is given to answer.
+    async fn await_replacement(&self, app_id: &AppId, wanted: &DesiredInstance) -> Outcome {
+        let arrived = Instant::now();
+        let grace = Duration::from_millis(wanted.config.health_check.probe().grace_period_ms);
+        loop {
+            let replaced = self.host.state.record(app_id).await.filter(|record| {
+                record.deployment_id == wanted.deployment_id
+                    && record.started_at.is_some()
+                    && !record.stop_requested
+            });
+            if let Some(record) = replaced {
+                if answers(&record).await {
+                    return Ok(());
+                }
+            }
+            if arrived.elapsed() >= grace {
+                return Err(WakeRefusal::Failed {
+                    kind: WakeFailure::WouldNotStart,
+                    reason: "its frozen guest would not thaw, and the deployment replacing it did not come up in time"
+                        .into(),
+                });
+            }
+            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+    }
+}
+
+async fn answers(record: &crate::domain::report::InstanceRecord) -> bool {
+    match record.guest_ipv4.as_ref() {
+        Some(guest_ipv4) => probe_instance(guest_ipv4, record.http_port, &record.health_check)
+            .await
+            .is_ok(),
+        None => false,
     }
 }
 
@@ -1166,6 +1214,71 @@ mod tests {
                 kind: WakeFailure::NotOnRequest,
                 reason: "it is stopped".into()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_to_a_frozen_deployment_that_will_not_thaw_waits_for_the_one_replacing_it() {
+        use crate::ports::VmCall;
+
+        let host = test_host().await;
+        host.state.modify(|snapshot| snapshot.isolated = true).await;
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.on_request = true;
+                record.state = InstanceState::Frozen;
+            }))
+            .await;
+        host.vms.set_status(crate::adapters::vm::VmStatus {
+            active: true,
+            frozen: true,
+            ..Default::default()
+        });
+        host.vms.refuse_thaw(crate::ports::VmError::Host(
+            "guest clock synchronization timed out".into(),
+        ));
+        let replacing = protocol::DeploymentId::parse("dep-2").unwrap();
+        let redeployed = desired_instance(|instance| {
+            instance.desired_state = DesiredInstanceState::OnRequest;
+            instance.deployment_id = replacing.clone();
+        });
+        host.cache
+            .lock()
+            .await
+            .accept(desired_state(|state| state.instances = vec![redeployed]));
+
+        let waker = AppWaker::new(host.arc().clone());
+        let asked_for = app_id();
+        let mut woken = std::pin::pin!(waker.wake(&asked_for));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut woken)
+                .await
+                .is_err(),
+            "the request was answered before anything could serve it"
+        );
+        let listening = listening().await;
+        let _replacement = tokio::time::timeout(Duration::from_secs(2), host.state.transition(&app_id()))
+            .await
+            .expect("the waiting request let go of the app for the pass to replace it");
+        host.state
+            .update_record(&app_id(), |record| {
+                record.deployment_id = replacing;
+                record.state = InstanceState::Starting;
+                record.started_at = Some(protocol::Timestamp::now());
+                record.health_check = protocol::HealthCheck::BootCompleted;
+                record.guest_ipv4 = Some(crate::domain::health::probe::loopback());
+                record.http_port = listening;
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), woken)
+            .await
+            .expect("the request waited past the replacement answering")
+            .expect("the replacement serves the request");
+        assert_eq!(
+            host.vms.calls(),
+            vec![VmCall::Thaw],
+            "the waker booted nothing over the pass's replacement"
         );
     }
 }

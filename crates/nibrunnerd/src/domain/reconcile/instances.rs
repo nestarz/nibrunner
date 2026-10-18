@@ -572,8 +572,6 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
 async fn thaw_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
     host.state.mark_active(&desired.app_id, now_ms()).await;
     if let Err(error) = host.vms.thaw(&desired.app_id).await {
-        // Left frozen: its memory is intact, and the next request or pass tries again rather than
-        // booting a second guest over it.
         let reason = error.message();
         tracing::warn!(app_id = %desired.app_id, reason, "a frozen microVM would not thaw");
         return Err(WakeRefusal::Failed {
@@ -593,6 +591,54 @@ async fn thaw_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOut
     Ok(WakeOutcome::Thawed)
 }
 
+/// Whether the record is of the deployment the document names: a frozen guest of an earlier one
+/// is the pass's to replace, and a boot here would race it.
+async fn serves(host: &Host, desired: &DesiredInstance) -> bool {
+    host.state
+        .record(&desired.app_id)
+        .await
+        .is_some_and(|record| record.deployment_id == desired.deployment_id)
+}
+
+/// A frozen guest that would not resume answers nothing, and left paused it would refuse every
+/// request after this one the same way, so it is taken down for a fresh boot. What it held in
+/// memory goes with it, as a restart's would.
+async fn let_go_of_unthawed_guest(host: &Host, app_id: &AppId) {
+    host.router.close_connections_to(app_id).await;
+    host.activator.close_connections_to(app_id).await;
+    if let Err(error) = host.vms.stop(app_id).await {
+        tracing::warn!(%app_id, error = %error.message(), "a frozen microVM that would not thaw would not stop");
+    }
+    let _ = host.vms.discard(app_id).await;
+    host.state
+        .update_record(app_id, |record| {
+            record.state = InstanceState::Stopped;
+            record.stop_requested = true;
+            record.start_attempts = NO_START_ATTEMPTS;
+        })
+        .await;
+    tracing::warn!(%app_id, "a frozen microVM that would not thaw was let go of; booting the app afresh");
+}
+
+async fn cold_boot(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
+    start_instance(host, desired).await;
+    let record = host.state.record(&desired.app_id).await;
+    if record
+        .as_ref()
+        .is_some_and(|record| matches!(record.state, InstanceState::Starting | InstanceState::Running))
+    {
+        return Ok(WakeOutcome::ColdBoot);
+    }
+    let reason = record.and_then(|record| record.message).map_or_else(
+        || "the cold boot did not start".to_string(),
+        |message| message.as_str().to_string(),
+    );
+    Err(WakeRefusal::Failed {
+        kind: WakeFailure::WouldNotStart,
+        reason,
+    })
+}
+
 pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
     let would_not_start = |reason: String| WakeRefusal::Failed {
         kind: WakeFailure::WouldNotStart,
@@ -610,7 +656,13 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         .copied()
         .unwrap_or(UNKNOWN_VM);
     if status.frozen {
-        return thaw_instance(host, desired).await;
+        return match thaw_instance(host, desired).await {
+            Err(_) if serves(host, desired).await => {
+                let_go_of_unthawed_guest(host, &desired.app_id).await;
+                cold_boot(host, desired).await
+            }
+            thawed => thawed,
+        };
     }
     if status.active {
         return Ok(WakeOutcome::AlreadyRunning);
@@ -661,19 +713,7 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         }
         Err(VmError::SnapshotUnusable { reason }) => {
             tracing::info!(app_id = %desired.app_id, reason, "nothing to wake this app from; booting it instead");
-            start_instance(host, desired).await;
-            let record = host.state.record(&desired.app_id).await;
-            if record.as_ref().is_some_and(|record| {
-                matches!(record.state, InstanceState::Starting | InstanceState::Running)
-            }) {
-                Ok(WakeOutcome::ColdBoot)
-            } else {
-                let reason = record.and_then(|record| record.message).map_or_else(
-                    || "the cold boot did not start".to_string(),
-                    |message| message.as_str().to_string(),
-                );
-                Err(would_not_start(reason))
-            }
+            cold_boot(host, desired).await
         }
         Err(error) => {
             let reason = error.message();
