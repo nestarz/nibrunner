@@ -85,6 +85,7 @@ max_ports_per_guest = 1
 [metrics]
 port = 9100
 listen_address = "127.0.0.1"
+sink = "s3://telemetry-example/fleets/apps-example-com"
 
 [filesystem]
 socket = "/run/nibrunner/filesystem.sock"

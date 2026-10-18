@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use protocol::{AppId, DeploymentId, HostDesiredState, InstanceLabels, TenantLogStream};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -140,6 +140,14 @@ impl Bucket {
     ) -> Result<bool, TelemetryError> {
         let aad = format!("{}/{key}", self.fleet);
         self.put(key, seal.seal(&aad, plain), create).await
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TelemetryError> {
+        match self.store.get(&self.path(key)).await {
+            Ok(got) => Ok(Some(got.bytes().await?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -335,16 +343,22 @@ struct Shipping {
 }
 
 pub struct ObjectSink {
-    logs: (Bucket, SealKey),
+    logs: Option<(Bucket, SealKey)>,
+    metrics: Option<Bucket>,
     state: Mutex<Shipping>,
 }
 
 impl ObjectSink {
-    pub fn new(logs: (Bucket, SealKey)) -> Arc<Self> {
+    pub fn new(logs: Option<(Bucket, SealKey)>, metrics: Option<Bucket>) -> Arc<Self> {
         Arc::new(Self {
             logs,
+            metrics,
             state: Mutex::default(),
         })
+    }
+
+    pub fn metrics(&self) -> Option<&Bucket> {
+        self.metrics.as_ref()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shipping> {
@@ -367,8 +381,18 @@ impl ObjectSink {
         }
     }
 
+    /// The host name and every labelled unit's app.
+    pub fn units(&self) -> (String, BTreeMap<String, String>) {
+        let state = self.lock();
+        let newest = state
+            .units
+            .iter()
+            .filter_map(|(id, d)| Some((id.to_string(), d.first()?.1.app.clone())));
+        (state.host.clone(), newest.collect())
+    }
+
     fn push(&self, app_id: &AppId, unit: Option<Unit>, micros: i64, line: impl FnOnce(LogLine) -> LogLine) {
-        let Some(unit) = unit else {
+        let (Some(_), Some(unit)) = (&self.logs, unit) else {
             return;
         };
         let mut state = self.lock();
@@ -477,7 +501,9 @@ impl ObjectSink {
     }
 
     async fn flush(&self, app: &str, pending: bool, now: i64) -> Result<(), TelemetryError> {
-        let (bucket, seal) = &self.logs;
+        let Some((bucket, seal)) = &self.logs else {
+            return Ok(());
+        };
         loop {
             let (host, lines) = {
                 let mut state = self.lock();
@@ -496,7 +522,9 @@ impl ObjectSink {
 
     /// `app`'s last [`LIVE_WINDOW_S`], at most [`LIVE_MAX_BYTES`] compressed, oldest lines first out.
     async fn write_live(&self, app: &str, now: i64) -> Result<(), TelemetryError> {
-        let (bucket, seal) = &self.logs;
+        let Some((bucket, seal)) = &self.logs else {
+            return Ok(());
+        };
         let (host, mut lines) = {
             let mut state = self.lock();
             let host = state.host.clone();
@@ -561,7 +589,6 @@ mod tests {
     use super::*;
     use crate::test_support::{app_id, deployment_id, desired_instance, desired_state};
     use object_store::memory::InMemory;
-    use object_store::ObjectStoreExt;
 
     const NOW: i64 = 1_792_152_300; // 2026-10-16T12:05:00Z
 
@@ -653,7 +680,7 @@ mod tests {
     fn sink() -> (Arc<ObjectSink>, Arc<InMemory>) {
         let store = Arc::new(InMemory::new());
         let bucket = Bucket::new(store.clone(), Some("fleets/acme".into()), "acme");
-        let sink = ObjectSink::new((bucket, SealKey([7; 32])));
+        let sink = ObjectSink::new(Some((bucket, SealKey([7; 32]))), None);
         sink.learn(&desired_state(|state| {
             state.host_id = protocol::HostId::parse("ovh-1").unwrap();
             state.instances = vec![desired_instance(|instance| {
@@ -725,6 +752,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chunk.len(), 1);
+        assert!(sink.units().1.is_empty());
     }
 
     #[tokio::test]

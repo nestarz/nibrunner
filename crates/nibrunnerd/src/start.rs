@@ -563,6 +563,7 @@ mod tests {
         config.metrics = Some(crate::config::MetricsConfig {
             port: 9100,
             listen_address: "127.0.0.1".parse().unwrap(),
+            sink: None,
         });
 
         let error = refuse_unstartable(&config, &directory.path().join("host.env")).unwrap_err();
