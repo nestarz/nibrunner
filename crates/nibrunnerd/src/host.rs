@@ -63,8 +63,6 @@ pub struct Host {
 
 /// Quiet apps put to sleep for one start or wake before it is refused anyway.
 const MAX_RECLAIMED_FOR_ONE_START: usize = 4;
-/// What an external lease leaves the host when no `[memory_admission]` names a headroom.
-const DEFAULT_HEADROOM_MIB: u32 = 1024;
 
 impl Host {
     /// A start's or a wake's memory, held until its record accounts for it. With `reclaim`, quiet
@@ -143,25 +141,23 @@ impl Host {
         crate::config::MemoryAdmissionMode,
         crate::domain::memory_admission::MemoryReadings,
     )> {
-        let policy = self.config.memory_admission.as_ref();
+        let policy = self.config.memory_admission.as_ref()?;
         let reservation_generation = self.state.memory_generation();
         let records = self.state.records().await;
         let ids: Vec<_> = records.iter().map(|record| record.app_id.clone()).collect();
         let apps = self.vms.memory(&ids).await;
-        let external_resident_bytes = self.state.external_resident_memory();
-        let pool = match policy.and_then(|policy| policy.pool.as_ref()) {
+        let pool = match &policy.pool {
             None => None,
             Some(configuration) => {
                 let mut pool = crate::adapters::cgroup::read_pool(configuration).ok()?;
-                pool.all_workloads_contained = self.state.external_groups_within(&pool)
-                    && records
-                        .iter()
-                        .filter(|record| crate::domain::report::capacity::holds_something(record))
-                        .all(|record| {
-                            apps.get(&record.app_id)
-                                .and_then(|memory| memory.cgroup.as_deref())
-                                .is_some_and(|group| pool.contains(group))
-                        });
+                pool.all_workloads_contained = records
+                    .iter()
+                    .filter(|record| crate::domain::report::capacity::holds_something(record))
+                    .all(|record| {
+                        apps.get(&record.app_id)
+                            .and_then(|memory| memory.cgroup.as_deref())
+                            .is_some_and(|group| pool.contains(group))
+                    });
                 Some(pool)
             }
         };
@@ -181,19 +177,14 @@ impl Host {
             }
             None => None,
         };
-        let mode = policy.map_or(crate::config::MemoryAdmissionMode::Observe, |policy| policy.mode);
-        let mut readings = crate::domain::memory_admission::MemoryReadings {
+        let readings = crate::domain::memory_admission::MemoryReadings {
             startup,
             pool,
             reservation_generation,
             available_bytes: crate::domain::report::capacity::read_memory_available_bytes()?,
-            headroom_bytes: u64::from(
-                policy.map_or(DEFAULT_HEADROOM_MIB, |policy| policy.headroom_mib.get()),
-            ) * 1_048_576,
-            production_wake_bytes: 0,
+            headroom_bytes: u64::from(policy.headroom_mib.get()) * 1_048_576,
             measured_at_ms: crate::clock::now_ms(),
             apps,
-            external_resident_bytes,
         };
         for record in &records {
             if let Some(peak) = readings.observed_peak_bytes(record) {
@@ -206,25 +197,7 @@ impl Host {
                     .await;
             }
         }
-        readings.production_wake_bytes = records
-            .iter()
-            .filter(|record| {
-                record.on_request
-                    && matches!(
-                        record.state,
-                        protocol::InstanceState::Idle | protocol::InstanceState::Frozen
-                    )
-                    && record
-                        .limits
-                        .and_then(|limits| limits.memory)
-                        .is_some_and(|memory| memory.priority == protocol::MemoryPriority::Production)
-            })
-            .map(|record| {
-                readings.wake_headroom_bytes(record, mode == crate::config::MemoryAdmissionMode::Adaptive)
-            })
-            .max()
-            .unwrap_or(0);
-        Some((mode, readings))
+        Some((policy.mode, readings))
     }
 
     /// Takes up every instance's `limits` without a new deployment: the proxy's per-instance
@@ -555,13 +528,6 @@ mod tests {
             activity: Arc::new(activity),
             meters: Arc::new(quiet_meters()),
             memory_profiles: Arc::new(quiet_memory_profiles()),
-            memory_leases: Arc::new({
-                let mut leases =
-                    crate::repositories::memory_leases_repository::MockMemoryLeaseRepository::new();
-                leases.expect_all().returning(|| Ok(Vec::new()));
-                leases.expect_replace_all().returning(|_| Ok(()));
-                leases
-            }),
             deleted_volumes: Arc::new(deleted_volumes),
             identity: Arc::new(identity),
             accepted_document: Arc::new(quiet_accepted_document()),

@@ -22,11 +22,15 @@ const SLEEP_BOUNDS_SECONDS: [f64; 13] = [
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0, 60.0, 120.0,
 ];
 
-/// A stretch of a wake as the waker sees it: waiting for what `readyWhen` names once the microVM
-/// is back, and the whole of it. Bringing the microVM back is the difference, and the VMM times
-/// its own part of that on `nibrunner_vm_restore_duration_seconds`.
+/// A stretch of a wake. Bringing a paused microVM back is three, each with a budget of its own:
+/// the VMM resuming it, dialling the guest's control port, and setting its clock and releasing its
+/// tenant. Then the waker waits for what `readyWhen` names (the probe), and times the whole. The
+/// VMM times its own part of a restore on `nibrunner_vm_restore_duration_seconds`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakePhase {
+    Resume,
+    Dial,
+    Sync,
     Ready,
     Total,
 }
@@ -34,6 +38,9 @@ pub enum WakePhase {
 impl WakePhase {
     pub fn as_str(self) -> &'static str {
         match self {
+            WakePhase::Resume => "resume",
+            WakePhase::Dial => "dial",
+            WakePhase::Sync => "sync",
             WakePhase::Ready => "ready",
             WakePhase::Total => "total",
         }
@@ -116,12 +123,26 @@ pub fn refusal_str(refusal: &WakeRefusal) -> &'static str {
     }
 }
 
-const WAKE_PHASES: [WakePhase; 2] = [WakePhase::Ready, WakePhase::Total];
-const WAKE_OUTCOMES: [WakeOutcome; 4] = [
+const WAKE_PHASES: [WakePhase; 5] = [
+    WakePhase::Resume,
+    WakePhase::Dial,
+    WakePhase::Sync,
+    WakePhase::Ready,
+    WakePhase::Total,
+];
+/// The stretches a wake can fail in; the whole is not one of them.
+const FAILING_PHASES: [WakePhase; 4] = [
+    WakePhase::Resume,
+    WakePhase::Dial,
+    WakePhase::Sync,
+    WakePhase::Ready,
+];
+const WAKE_OUTCOMES: [WakeOutcome; 5] = [
     WakeOutcome::Restored,
     WakeOutcome::ColdBoot,
     WakeOutcome::AlreadyRunning,
     WakeOutcome::Thawed,
+    WakeOutcome::ThawFailed,
 ];
 const REFUSALS: [&str; 9] = [
     "no_room",
@@ -146,6 +167,7 @@ const SLEEP_OUTCOMES: [SleepOutcome; 3] = [SleepOutcome::Slept, SleepOutcome::Re
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AppSleepWake {
     pub wakes: [u64; WAKE_OUTCOMES.len()],
+    pub wake_failures: [u64; FAILING_PHASES.len()],
     pub last_wake_ms: Option<u64>,
     pub sleeps: [u64; SLEEP_OUTCOMES.len()],
     pub last_sleep_ms: Option<u64>,
@@ -169,6 +191,7 @@ pub struct SleepWakeMetrics {
     first_response: Histogram,
     coalesced: AtomicU64,
     refusals: Vec<AtomicU64>,
+    failures: [AtomicU64; FAILING_PHASES.len()],
     answers: [AtomicU64; ANSWERS.len()],
     sleep: Vec<Histogram>,
     sleep_outcomes: Vec<AtomicU64>,
@@ -187,6 +210,7 @@ impl Default for SleepWakeMetrics {
             first_response: Histogram::over(&WAKE_BOUNDS_SECONDS),
             coalesced: AtomicU64::new(0),
             refusals: REFUSALS.iter().map(|_| AtomicU64::new(0)).collect(),
+            failures: Default::default(),
             answers: Default::default(),
             sleep: (0..SLEEP_PHASES.len() * SLEEP_REASONS.len())
                 .map(|_| Histogram::over(&SLEEP_BOUNDS_SECONDS))
@@ -226,6 +250,27 @@ impl SleepWakeMetrics {
         self.app(app_id, |app| {
             app.wakes[position(&WAKE_OUTCOMES, &outcome)] += 1;
             app.last_wake_ms = Some(total.as_millis() as u64);
+        });
+    }
+
+    /// One stretch of bringing a microVM back, timed where it ran.
+    pub fn phase(&self, phase: WakePhase, outcome: WakeOutcome, took: Duration) {
+        self.wake(phase, outcome).observe(took);
+    }
+
+    /// A wake that did not complete `phase` inside its budget. What the request got instead, if
+    /// anything, is counted as its own wake.
+    pub fn wake_failed(&self, app_id: &AppId, phase: WakePhase) {
+        let index = position(&FAILING_PHASES, &phase);
+        self.failures[index].fetch_add(1, Ordering::Relaxed);
+        self.app(app_id, |app| app.wake_failures[index] += 1);
+    }
+
+    /// A thaw that did not come back after `took`, before the cold boot that replaced it.
+    pub fn thaw_failed(&self, app_id: &AppId, took: Duration) {
+        self.wake(WakePhase::Total, WakeOutcome::ThawFailed).observe(took);
+        self.app(app_id, |app| {
+            app.wakes[position(&WAKE_OUTCOMES, &WakeOutcome::ThawFailed)] += 1;
         });
     }
 
@@ -350,6 +395,13 @@ static WAKE_REFUSALS_TOTAL: Metric = Metric {
     labels: &["reason"],
 };
 
+static WAKE_FAILURES_TOTAL: Metric = Metric {
+    name: "nibrunner_wake_failures_total",
+    help: "Wakes that did not complete a stretch inside its budget, by the stretch: the VMM resuming the microVM, dialling the guest's control port, setting its clock and releasing its tenant, or the app answering its probe. A wake that fell back to a cold boot is also counted under nibrunner_wake_phase_seconds as the cold boot it became.",
+    kind: Kind::Counter,
+    labels: &["phase"],
+};
+
 static ACTIVATOR_RESPONSES_TOTAL: Metric = Metric {
     name: "nibrunner_activator_responses_total",
     help: "What the HTTP activator answered requests for on-request apps with. The proxy counts every one of these as served, because serving it is what it did.",
@@ -376,6 +428,13 @@ static APP_WAKES_TOTAL: Metric = Metric {
     help: "Times an on-request app was woken by a request, by how.",
     kind: Kind::Counter,
     labels: &["app", "outcome"],
+};
+
+static APP_WAKE_FAILURES_TOTAL: Metric = Metric {
+    name: "nibrunner_app_wake_failures_total",
+    help: "Wakes of an on-request app that did not complete a stretch inside its budget, by the stretch.",
+    kind: Kind::Counter,
+    labels: &["app", "phase"],
 };
 
 static APP_LAST_WAKE_SECONDS: Metric = Metric {
@@ -407,10 +466,12 @@ pub(super) static DECLARED: &[&Metric] = &[
     &WAKE_REQUESTS_COALESCED_TOTAL,
     &WAKE_FIRST_RESPONSE_SECONDS,
     &WAKE_REFUSALS_TOTAL,
+    &WAKE_FAILURES_TOTAL,
     &ACTIVATOR_RESPONSES_TOTAL,
     &SLEEP_PHASE_SECONDS,
     &SLEEP_OUTCOMES_TOTAL,
     &APP_WAKES_TOTAL,
+    &APP_WAKE_FAILURES_TOTAL,
     &APP_LAST_WAKE_SECONDS,
     &APP_SLEEPS_TOTAL,
     &APP_LAST_SLEEP_SECONDS,
@@ -453,6 +514,15 @@ pub(super) fn render(page: &mut Page, metrics: &SleepWakeMetrics, snapshot: &Hos
             &WAKE_REFUSALS_TOTAL,
             &[("reason", reason)],
             metrics.refusals[index].load(Ordering::Relaxed),
+        );
+    }
+
+    page.declare(&WAKE_FAILURES_TOTAL);
+    for (index, phase) in FAILING_PHASES.iter().enumerate() {
+        page.value(
+            &WAKE_FAILURES_TOTAL,
+            &[("phase", phase.as_str())],
+            metrics.failures[index].load(Ordering::Relaxed),
         );
     }
 
@@ -502,6 +572,18 @@ pub(super) fn render(page: &mut Page, metrics: &SleepWakeMetrics, snapshot: &Hos
                 &APP_WAKES_TOTAL,
                 &[("app", app_id.as_str()), ("outcome", outcome.as_str())],
                 app.wakes[index],
+            );
+        }
+    }
+
+    page.declare(&APP_WAKE_FAILURES_TOTAL);
+    for app_id in &on_request {
+        let app = metrics.of(app_id);
+        for (index, phase) in FAILING_PHASES.iter().enumerate() {
+            page.value(
+                &APP_WAKE_FAILURES_TOTAL,
+                &[("app", app_id.as_str()), ("phase", phase.as_str())],
+                app.wake_failures[index],
             );
         }
     }
@@ -580,6 +662,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wake_that_stalls_is_counted_by_the_stretch_it_stalled_in_on_the_host_and_on_its_app() {
+        let host = test_host().await;
+        host.state
+            .put_record(instance_record(|record| record.on_request = true))
+            .await;
+        let metrics = &host.metrics.sleep_wake;
+        metrics.wake_failed(&app_id(), WakePhase::Dial);
+        metrics.wake_failed(&app_id(), WakePhase::Dial);
+        metrics.wake_failed(&app_id(), WakePhase::Sync);
+        metrics.phase(WakePhase::Resume, WakeOutcome::Restored, Duration::from_millis(1));
+
+        let page = page(
+            &crate::domain::metrics::tests::report(),
+            &host.metrics,
+            &host.state.snapshot().await,
+            0,
+        );
+        assert_eq!(
+            lines_for(&page, "nibrunner_wake_failures_total"),
+            vec![
+                "nibrunner_wake_failures_total{phase=\"resume\"} 0",
+                "nibrunner_wake_failures_total{phase=\"dial\"} 2",
+                "nibrunner_wake_failures_total{phase=\"sync\"} 1",
+                "nibrunner_wake_failures_total{phase=\"ready\"} 0",
+            ]
+        );
+        assert_eq!(
+            lines_for(&page, "nibrunner_app_wake_failures_total"),
+            vec![
+                "nibrunner_app_wake_failures_total{app=\"app-1\",phase=\"resume\"} 0",
+                "nibrunner_app_wake_failures_total{app=\"app-1\",phase=\"dial\"} 2",
+                "nibrunner_app_wake_failures_total{app=\"app-1\",phase=\"sync\"} 1",
+                "nibrunner_app_wake_failures_total{app=\"app-1\",phase=\"ready\"} 0",
+            ]
+        );
+        assert!(
+            page.contains("nibrunner_wake_phase_seconds_count{phase=\"resume\",outcome=\"restored\"} 1\n")
+        );
+    }
+
+    #[tokio::test]
     async fn what_an_on_request_app_has_been_through_is_on_its_own_series_and_a_running_apps_is_not() {
         let host = test_host().await;
         let other = AppId::parse("app-2").unwrap();
@@ -637,6 +760,7 @@ mod tests {
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"cold-boot\"} 0",
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"already-running\"} 0",
                 "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"thawed\"} 0",
+                "nibrunner_app_wakes_total{app=\"app-1\",outcome=\"thaw-failed\"} 0",
             ]
         );
         assert_eq!(

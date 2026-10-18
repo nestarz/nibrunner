@@ -86,6 +86,11 @@ storage_prefix = "host-1"
 ```
 
 Volumes are sparse files under `paths.state_dir`. There is nothing else to configure. A
+volume gives disk back as its app frees it: the guest mounts it with online discard, and
+Firecracker punches the freed blocks out of the file, so a file only ever holds what the app
+keeps. Volumes are formatted with 4 KiB blocks on a drive of 4 KiB sectors, the host's own block
+size; one formatted by an earlier release with smaller blocks keeps 512-byte sectors and still
+discards. A
 `[volumes.zerofs]` section on this backend is an error, not ignored. This is the installer's
 default.
 

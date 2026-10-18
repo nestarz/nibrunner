@@ -14,10 +14,13 @@ use crate::adapters::vm::snapshot::{
     SleepSubject, SnapshotHost, SnapshotStamp, SnapshotsInFlight, StagedSnapshot,
 };
 use crate::adapters::vm::status::VmStatus;
-use crate::adapters::vm::time_sync;
+use crate::adapters::vm::time_sync::{self, WakeStalled};
 use crate::adapters::volumes::VolumeBackend;
+use crate::domain::metrics::sleep_wake::WakePhase;
 use crate::json_store::{make_directory, write_json};
-use crate::ports::{BootRequest, CommandRunner, LogSink, SuspendRequest, VmError, Vmm, Writable};
+use crate::ports::{
+    BootRequest, CommandRunner, LogSink, SuspendRequest, VmError, Vmm, WakeOutcome, Writable,
+};
 use crate::state::SharedState;
 use guest_contract::firecracker::{render_firecracker_config, VmNetwork, VmPaths, VmVsock};
 use guest_contract::instance_env::{render_instance_env, InstanceEnvContent};
@@ -33,6 +36,8 @@ pub const GUEST_MANIFEST_FILENAME: &str = "manifest.json";
 
 const VM_DIR_MODE: u32 = 0o700;
 const FIRST_GUEST_CID: u32 = 3;
+// Firecracker answers PATCH /vm in about a millisecond; a fifth of a second is a VMM that will not.
+const RESUME_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
 pub struct VmManager {
     pub start_permits: tokio::sync::Semaphore,
@@ -207,6 +212,9 @@ impl VmManager {
                     .display()
                     .to_string(),
                 instance_config_image_path: config_image.display().to_string(),
+                data_block_bytes: data_device_path
+                    .as_deref()
+                    .and_then(crate::adapters::volumes::filesystem_block_bytes),
                 data_device_path,
                 layer_image_paths: request
                     .payload
@@ -380,15 +388,63 @@ impl VmManager {
         outcome
     }
 
+    /// Resumes a paused microVM within [`RESUME_BUDGET`], timing it under `outcome`.
+    async fn resume_within_budget(&self, app_id: &AppId, outcome: WakeOutcome) -> Result<(), WakeStalled> {
+        let resuming = std::time::Instant::now();
+        match tokio::time::timeout(RESUME_BUDGET, self.api(app_id).resume()).await {
+            Err(_) => Err(WakeStalled::new(
+                WakePhase::Resume,
+                format!(
+                    "PATCH /vm Resumed had no answer within {} ms",
+                    RESUME_BUDGET.as_millis()
+                ),
+            )),
+            Ok(answered) => answered.map_err(|error| WakeStalled::new(WakePhase::Resume, error.message())),
+        }?;
+        self.metrics
+            .sleep_wake
+            .phase(WakePhase::Resume, outcome, resuming.elapsed());
+        Ok(())
+    }
+
+    /// A wake that did not complete: counted by its stretch, the guest's console kept before the
+    /// caller lets go of the microVM.
+    fn wake_stalled(&self, app_id: &AppId, stalled: WakeStalled) -> WakeStalled {
+        self.metrics.sleep_wake.wake_failed(app_id, stalled.phase);
+        let kept = self.processes.keep_console_of_failed_wake(app_id);
+        tracing::warn!(
+            %app_id,
+            phase = stalled.phase.as_str(),
+            reason = %stalled.reason,
+            console = %kept.as_deref().map_or_else(|| "none".into(), |path| path.display().to_string()),
+            "a wake did not complete"
+        );
+        stalled
+    }
+
+    /// Resumes a restored microVM and hands its tenant back its clock: the resume, then the
+    /// guest exchange (its dial and its sync), each within its own budget.
+    async fn resume_restored_guest(&self, app_id: &AppId) -> Result<(), WakeStalled> {
+        let resumed = async {
+            self.resume_within_budget(app_id, WakeOutcome::Restored).await?;
+            let control = self
+                .working_dir_for(app_id)
+                .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
+            time_sync::wake(&control).await
+        }
+        .await;
+        let synced = resumed.map_err(|stalled| self.wake_stalled(app_id, stalled))?;
+        let metrics = &self.metrics.sleep_wake;
+        metrics.phase(WakePhase::Dial, WakeOutcome::Restored, synced.dial);
+        metrics.phase(WakePhase::Sync, WakeOutcome::Restored, synced.sync);
+        Ok(())
+    }
+
     async fn resume_restored_tenant(&self, request: &SuspendRequest) -> Result<(), VmError> {
-        self.api(&request.app_id).resume().await?;
-        let control = self
-            .working_dir_for(&request.app_id)
-            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
-        time_sync::wake(&control)
+        self.resume_restored_guest(&request.app_id)
             .await
-            .map_err(|error| VmError::SnapshotUnusable {
-                reason: error.message(),
+            .map_err(|stalled| VmError::WakeStalled {
+                reason: stalled.to_string(),
             })?;
         self.network
             .refresh_neighbour(&Neighbour {
@@ -403,7 +459,10 @@ impl VmManager {
     async fn resume_frozen_tenant(&self, app_id: &AppId, control: &Path) {
         let recovered = async {
             self.api(app_id).resume().await?;
-            time_sync::wake(control).await
+            time_sync::release_after_refused_sleep(control)
+                .await
+                .map(drop)
+                .map_err(|stalled| VmError::Host(stalled.to_string()))
         }
         .await;
         if let Err(error) = recovered {
@@ -635,8 +694,8 @@ impl Vmm for VmManager {
             .working_dir_for(&request.app_id)
             .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
         if let Err(error) = time_sync::freeze_tenant(&control).await {
-            if let Err(recovery) = time_sync::wake(&control).await {
-                tracing::warn!(app_id = %request.app_id, error = %recovery.message(), "guest clock recovery failed after sleep refusal");
+            if let Err(recovery) = time_sync::release_after_refused_sleep(&control).await {
+                tracing::warn!(app_id = %request.app_id, error = %recovery, "guest clock recovery failed after sleep refusal");
             }
             return Err(error);
         }
@@ -922,20 +981,14 @@ impl VmManager {
                 "only a running jailed microVM can be frozen".into(),
             ));
         }
-        let control = self
-            .working_dir_for(app_id)
-            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
         // Recorded first, so a daemon that dies half way readopts a guest it must not route to.
         self.processes
             .remember_frozen(app_id, true)
             .map_err(|error| VmError::Host(error.to_string()))?;
-        let paused = async {
-            time_sync::freeze_tenant(&control).await?;
-            self.api(app_id).pause().await
-        }
-        .await;
-        if let Err(error) = paused {
-            self.resume_frozen_tenant(app_id, &control).await;
+        // The VMM alone is paused: a paused guest runs nothing, so its tenant needs no hold, and
+        // kvmclock reads the host's clock again on the guest's first instruction after the
+        // resume, so the thaw needs no clock step either.
+        if let Err(error) = self.api(app_id).pause().await {
             let _ = self.processes.remember_frozen(app_id, false);
             return Err(error);
         }
@@ -949,13 +1002,13 @@ impl VmManager {
 
     /// Resumes the microVM run under `app_id`.
     async fn thaw_vm(&self, app_id: &AppId) -> Result<(), VmError> {
-        let control = self
-            .working_dir_for(app_id)
-            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
-        self.api(app_id).resume().await?;
-        if let Err(error) = time_sync::wake(&control).await {
+        // No clock step: a native pause keeps kvmclock reading the host's clock (A13.5).
+        if let Err(stalled) = self.resume_within_budget(app_id, WakeOutcome::Thawed).await {
+            let stalled = self.wake_stalled(app_id, stalled);
             let _ = self.api(app_id).pause().await;
-            return Err(error);
+            return Err(VmError::WakeStalled {
+                reason: stalled.to_string(),
+            });
         }
         self.processes
             .remember_frozen(app_id, false)
@@ -1315,7 +1368,9 @@ mod tests {
                     wire.get_mut().write_all(b"READY\n").await.unwrap();
                     line.clear();
                     wire.read_line(&mut line).await.unwrap();
-                    assert_eq!(line.trim(), guest_contract::control::TENANT_FREEZE_COMMIT);
+                    assert!(line
+                        .trim()
+                        .starts_with(guest_contract::control::TENANT_FREEZE_COMMIT));
                     calls.lock().unwrap().push(line.trim().into());
                     wire.get_mut().write_all(b"OK\n").await.unwrap();
                 } else if request.starts_with(guest_contract::control::TENANT_CLOCK_REQUEST) {
@@ -1492,7 +1547,19 @@ mod tests {
             .resume_restored_tenant(&suspend_request())
             .await
             .unwrap_err();
-        assert!(matches!(error, VmError::SnapshotUnusable { .. }));
+        let VmError::WakeStalled { reason } = &error else {
+            panic!("{error}");
+        };
+        assert!(reason.starts_with("sync did not complete: "), "{reason}");
+        assert_eq!(
+            fixture.manager.metrics.sleep_wake.of(&app_id()).wake_failures,
+            [0, 0, 1, 0]
+        );
+        assert!(fixture
+            .manager
+            .processes
+            .failed_wake_console_path(&app_id())
+            .exists());
         assert!(fixture.network.neighbours().is_empty());
         fixture.manager.processes.stop(&app_id()).await;
     }

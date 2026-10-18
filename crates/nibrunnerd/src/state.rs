@@ -82,16 +82,6 @@ impl Drop for CronActivity {
 struct ReservedMemory {
     resources: protocol::InstanceResources,
     bytes: u64,
-    /// The cgroup an external lease's work runs in, once it is known.
-    group: Option<crate::adapters::cgroup::MemoryGroup>,
-}
-
-/// Who holds a reservation: an app starting, waking or snapshotting, or work outside the
-/// microVMs that leased memory through `memory.sock`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum ReservationOwner {
-    App(AppId),
-    External(String),
 }
 
 #[derive(Default)]
@@ -99,36 +89,25 @@ struct MemoryReservations {
     // Moves with every reservation taken or given back, so that readings taken before one cannot
     // discount what it holds.
     generation: u64,
-    held: BTreeMap<ReservationOwner, ReservedMemory>,
+    held: BTreeMap<AppId, ReservedMemory>,
 }
 
 type SharedReservations = Arc<Mutex<MemoryReservations>>;
 
-/// Memory a start, a wake, a snapshot or an external lease holds until whatever it is for
-/// accounts for it. Two of them never admit against the same room.
+/// Memory a start, a wake or a snapshot holds until its instance record accounts for it. Two of
+/// them never admit against the same room.
 pub(crate) struct MemoryReservation {
-    owner: Option<ReservationOwner>,
+    app_id: AppId,
     reservations: SharedReservations,
-}
-
-impl MemoryReservation {
-    /// Keeps the reservation held after this guard is gone: a lease outlives the request that
-    /// took it and is given back only once its work has verifiably exited.
-    pub(crate) fn retain(mut self) {
-        self.owner = None;
-    }
 }
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
-        let Some(owner) = &self.owner else {
-            return;
-        };
         let mut reservations = self
             .reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        reservations.held.remove(owner);
+        reservations.held.remove(&self.app_id);
         reservations.generation = reservations.generation.wrapping_add(1);
     }
 }
@@ -183,7 +162,7 @@ impl HostState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .held
             .keys()
-            .any(|owner| matches!(owner, ReservationOwner::App(held) if held != app))
+            .any(|held| held != app)
     }
 
     /// Called under the app's transition lock. Admits `wanted` beside every record that holds memory
@@ -201,145 +180,8 @@ impl HostState {
             crate::domain::memory_admission::MemoryReadings,
         )>,
     ) -> Result<MemoryReservation, u64> {
-        self.reserve_for_owner(
-            capacity_mib,
-            ReservationOwner::App(app_id.clone()),
-            wanted,
-            operation,
-            measured,
-        )
-        .await
-    }
-
-    /// Admits an external lease. It always measures, whatever the mode: work outside the microVMs
-    /// has no ceiling of this host's to be strict about, only the room the host has now. It also
-    /// leaves room for the largest production app asleep to wake.
-    pub(crate) async fn reserve_external(
-        &self,
-        capacity_mib: u64,
-        id: &str,
-        memory_mib: std::num::NonZeroU32,
-        measured: (
-            crate::config::MemoryAdmissionMode,
-            crate::domain::memory_admission::MemoryReadings,
-        ),
-    ) -> Result<MemoryReservation, u64> {
-        self.reserve_for_owner(
-            capacity_mib,
-            ReservationOwner::External(id.into()),
-            protocol::InstanceResources {
-                memory_mib: memory_mib.get(),
-                vcpu_count: 0,
-            },
-            crate::domain::memory_admission::MemoryOperation::Start,
-            Some(measured),
-        )
-        .await
-    }
-
-    /// A lease the ledger held when the daemon stopped, held again before anything is admitted.
-    pub(crate) fn restore_external(&self, id: &str, memory_mib: std::num::NonZeroU32) {
-        let mut reservations = self
-            .memory_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        reservations.held.insert(
-            ReservationOwner::External(id.into()),
-            ReservedMemory {
-                resources: protocol::InstanceResources {
-                    memory_mib: memory_mib.get(),
-                    vcpu_count: 0,
-                },
-                bytes: u64::from(memory_mib.get()) * 1_048_576,
-                group: None,
-            },
-        );
-        reservations.generation = reservations.generation.wrapping_add(1);
-    }
-
-    pub(crate) fn release_external(&self, id: &str) {
-        let mut reservations = self
-            .memory_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if reservations
-            .held
-            .remove(&ReservationOwner::External(id.into()))
-            .is_some()
-        {
-            reservations.generation = reservations.generation.wrapping_add(1);
-        }
-    }
-
-    pub(crate) fn track_external_group(&self, id: &str, group: crate::adapters::cgroup::MemoryGroup) {
-        let mut reservations = self
-            .memory_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(held) = reservations.held.get_mut(&ReservationOwner::External(id.into())) {
-            held.group = Some(group);
-            reservations.generation = reservations.generation.wrapping_add(1);
-        }
-    }
-
-    /// What each external lease's work is resident at now, for leases whose cgroup is known, still
-    /// the one they were granted for, bounded by the grant and shared with no other lease.
-    pub(crate) fn external_resident_memory(&self) -> BTreeMap<String, u64> {
-        let held = self
-            .memory_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .held
-            .clone();
-        held.iter()
-            .filter_map(|(owner, reservation)| {
-                let ReservationOwner::External(id) = owner else {
-                    return None;
-                };
-                let group = reservation.group.as_ref()?;
-                if held.iter().any(|(other, reservation)| {
-                    other != owner
-                        && reservation
-                            .group
-                            .as_ref()
-                            .is_some_and(|other| group.overlaps(other))
-                }) {
-                    return None;
-                }
-                Some((id.clone(), group.resident_bytes(reservation.bytes)?))
-            })
-            .collect()
-    }
-
-    pub(crate) fn external_groups_within(&self, pool: &crate::domain::memory_admission::PoolMemory) -> bool {
-        self.memory_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .held
-            .iter()
-            .all(|(owner, held)| {
-                !matches!(owner, ReservationOwner::External(_))
-                    || held.group.as_ref().is_some_and(|group| group.within(pool))
-            })
-    }
-
-    async fn reserve_for_owner(
-        &self,
-        capacity_mib: u64,
-        owner: ReservationOwner,
-        wanted: protocol::InstanceResources,
-        operation: crate::domain::memory_admission::MemoryOperation,
-        measured: Option<(
-            crate::config::MemoryAdmissionMode,
-            crate::domain::memory_admission::MemoryReadings,
-        )>,
-    ) -> Result<MemoryReservation, u64> {
         use crate::config::MemoryAdmissionMode;
         use crate::domain::memory_admission::MemoryOperation;
-        let app_id = match &owner {
-            ReservationOwner::App(app) => Some(app),
-            ReservationOwner::External(_) => None,
-        };
         let snapshot = self.snapshot.read().await;
         let mut reservations = self
             .memory_reservations
@@ -348,12 +190,7 @@ impl HostState {
         let records: Vec<_> = snapshot
             .records
             .values()
-            .filter(|record| {
-                Some(&record.app_id) != app_id
-                    && !reservations
-                        .held
-                        .contains_key(&ReservationOwner::App(record.app_id.clone()))
-            })
+            .filter(|record| &record.app_id != app_id && !reservations.held.contains_key(&record.app_id))
             .cloned()
             .collect();
         let mut committed = crate::domain::report::capacity::committed_resources(&records);
@@ -366,12 +203,9 @@ impl HostState {
             MemoryOperation::Snapshot => 0,
         };
         let mut shortfall = strict_shortfall;
-        let mut bytes = match app_id {
-            Some(_) => crate::adapters::vm::limits::memory_max_bytes(wanted.memory_mib),
-            None => u64::from(wanted.memory_mib) * 1_048_576,
-        };
+        let mut bytes = crate::adapters::vm::limits::memory_max_bytes(wanted.memory_mib);
         if measured.as_ref().is_some_and(|(mode, readings)| {
-            (*mode == MemoryAdmissionMode::Adaptive || app_id.is_none() || readings.pool.is_some())
+            (*mode == MemoryAdmissionMode::Adaptive || readings.pool.is_some())
                 && !readings.is_fresh(crate::clock::now_ms())
         }) {
             // A reading that waited this long for the lock may no longer describe the host.
@@ -382,27 +216,23 @@ impl HostState {
                 // A reservation taken or given back since the reading: its working sets no longer
                 // stand for what is held.
                 readings.apps.clear();
-                readings.external_resident_bytes.clear();
                 if let Some(pool) = &mut readings.pool {
                     pool.all_workloads_contained = false;
                 }
             }
-            if let Some(app) = app_id {
-                bytes = readings.ceiling(app, wanted);
-            }
+            bytes = readings.ceiling(app_id, wanted);
             let adaptive = mode == MemoryAdmissionMode::Adaptive
                 && readings
                     .pool
                     .as_ref()
                     .is_none_or(|pool| pool.all_workloads_contained);
-            if let Some(app) = app_id.filter(|_| {
-                adaptive
-                    && readings.reservation_generation == reservations.generation
-                    && operation == MemoryOperation::Start
-            }) {
+            if adaptive
+                && readings.reservation_generation == reservations.generation
+                && operation == MemoryOperation::Start
+            {
                 let current = snapshot
                     .records
-                    .get(app)
+                    .get(app_id)
                     .filter(|record| {
                         record.resources == wanted
                             && readings.startup.as_ref().is_none_or(|startup| {
@@ -413,7 +243,6 @@ impl HostState {
                                 protocol::InstanceState::Pending
                                     | protocol::InstanceState::Starting
                                     | protocol::InstanceState::Idle
-                                    | protocol::InstanceState::Frozen
                                     | protocol::InstanceState::Running
                             )
                     })
@@ -424,7 +253,10 @@ impl HostState {
                     .filter(|startup| startup.resources == wanted)
                     .and_then(|startup| startup.peak_bytes)
                     .map(|peak| {
-                        crate::domain::memory_admission::target_from_peak(readings.ceiling(app, wanted), peak)
+                        crate::domain::memory_admission::target_from_peak(
+                            readings.ceiling(app_id, wanted),
+                            peak,
+                        )
                     });
                 bytes = current.into_iter().chain(historical).max().unwrap_or(bytes);
             }
@@ -432,41 +264,31 @@ impl HostState {
                 .held
                 .values()
                 .fold(0u64, |total, held| total.saturating_add(held.bytes));
-            let resident_reserved_bytes = reservations.held.iter().fold(0u64, |total, (held_by, held)| {
-                let resident = match held_by {
-                    ReservationOwner::External(id) => {
-                        readings.external_resident_bytes.get(id).copied().unwrap_or(0)
-                    }
-                    ReservationOwner::App(app) => snapshot
-                        .records
-                        .get(app)
-                        .map_or(0, |record| readings.anonymous_resident_bytes(record)),
-                };
-                total.saturating_add(resident.min(held.bytes))
+            let resident_reserved_bytes = reservations.held.iter().fold(0u64, |total, (held_app, held)| {
+                let resident = snapshot
+                    .records
+                    .get(held_app)
+                    .map_or(0, |record| readings.anonymous_resident_bytes(record))
+                    .min(held.bytes);
+                total.saturating_add(resident)
             });
-            let wanted_resident_bytes = app_id
-                .and_then(|app| snapshot.records.get(app))
+            let wanted_resident_bytes = snapshot
+                .records
+                .get(app_id)
                 .map_or(0, |record| readings.anonymous_resident_bytes(record))
                 .min(bytes);
-            // An external lease leaves room for the largest production app asleep to wake.
-            let wake_headroom = if app_id.is_none() {
-                readings.production_wake_bytes
-            } else {
-                0
-            };
             let measured_shortfall = readings.shortfall_mib(
                 capacity_mib,
                 &records,
-                reserved_bytes.saturating_add(bytes).saturating_add(wake_headroom),
+                reserved_bytes.saturating_add(bytes),
                 resident_reserved_bytes.saturating_add(wanted_resident_bytes),
                 0,
             );
             tracing::info!(
-                ?owner,
+                %app_id,
                 ?mode,
                 adaptive,
                 reservation_mib = bytes.div_ceil(1_048_576),
-                production_wake_headroom_mib = wake_headroom.div_ceil(1_048_576),
                 strict_shortfall_mib = strict_shortfall,
                 measured_shortfall_mib = measured_shortfall,
                 "memory admission evaluated"
@@ -477,24 +299,21 @@ impl HostState {
                 shortfall = strict_shortfall
                     .max(measured_shortfall)
                     .max(readings.strict_pool_shortfall_mib(&records, reserved_bytes, bytes));
-            } else if app_id.is_none() {
-                shortfall = strict_shortfall.max(measured_shortfall);
             }
         }
         if shortfall > 0 {
             return Err(shortfall);
         }
         reservations.held.insert(
-            owner.clone(),
+            app_id.clone(),
             ReservedMemory {
                 resources: wanted,
                 bytes,
-                group: None,
             },
         );
         reservations.generation = reservations.generation.wrapping_add(1);
         Ok(MemoryReservation {
-            owner: Some(owner),
+            app_id: app_id.clone(),
             reservations: self.memory_reservations.clone(),
         })
     }
@@ -740,10 +559,8 @@ mod tests {
                 reservation_generation: 0,
                 available_bytes: available_mib * 1_048_576,
                 headroom_bytes: 1024 * 1_048_576,
-                production_wake_bytes: 0,
                 measured_at_ms: crate::clock::now_ms(),
                 apps: BTreeMap::new(),
-                external_resident_bytes: BTreeMap::new(),
             },
         ))
     }
@@ -774,9 +591,7 @@ mod tests {
             reservation_generation: state.memory_generation(),
             available_bytes: 1500 * 1_048_576,
             headroom_bytes: 1024 * 1_048_576,
-            production_wake_bytes: 0,
             measured_at_ms: crate::clock::now_ms(),
-            external_resident_bytes: BTreeMap::new(),
             apps: BTreeMap::from([(
                 app_id(),
                 ReportedMemory {
@@ -1044,94 +859,6 @@ mod tests {
         assert!(reserve(&state, 8192, &other, readings(&state)).await.is_err());
         drop(snapshot);
         assert!(reserve(&state, 8192, &other, readings(&state)).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn builds_and_apps_cannot_reserve_the_same_capacity_or_replace_each_other() {
-        for mode in [Observe, Adaptive] {
-            let state = HostState::shared();
-            let build = state
-                .reserve_external(
-                    512,
-                    app_id().as_str(),
-                    512.try_into().unwrap(),
-                    measured(mode, 8192).unwrap(),
-                )
-                .await
-                .unwrap();
-            assert!(reserve(&state, 512, &app_id(), measured(mode, 8192))
-                .await
-                .is_err());
-            drop(build);
-            let app = reserve(&state, 512, &app_id(), None).await.unwrap();
-            assert!(state
-                .reserve_external(
-                    512,
-                    app_id().as_str(),
-                    512.try_into().unwrap(),
-                    measured(mode, 8192).unwrap()
-                )
-                .await
-                .is_err());
-            drop(app);
-        }
-    }
-
-    #[tokio::test]
-    async fn builds_need_physical_headroom_even_when_app_admission_only_observes() {
-        let state = HostState::shared();
-        let memory = 512.try_into().unwrap();
-        assert!(state
-            .reserve_external(8192, "build", memory, measured(Observe, 1200).unwrap())
-            .await
-            .is_err());
-        let mut stale = measured(Observe, 8192).unwrap();
-        stale.1.measured_at_ms = crate::clock::now_ms() - 5001;
-        assert!(state
-            .reserve_external(8192, "build", memory, stale)
-            .await
-            .is_err());
-        assert!(state
-            .reserve_external(8192, "build", memory, measured(Observe, 8192).unwrap())
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn stale_or_unrelated_build_samples_cannot_discount_held_capacity() {
-        let wanted_mib = u64::from(protocol::DEFAULT_INSTANCE_RESOURCES.memory_mib);
-        for case in 0..4 {
-            let state = HostState::shared();
-            state.restore_external("build", 1536.try_into().unwrap());
-            let mut readings = measured(Adaptive, 1024 + 1536 - 1024 + wanted_mib + 200).unwrap();
-            readings.1.reservation_generation = state.memory_generation();
-            readings
-                .1
-                .external_resident_bytes
-                .insert(if case == 1 { "other" } else { "build" }.into(), 1024 * 1_048_576);
-            if case == 2 {
-                readings.1.reservation_generation = 0;
-            }
-            if case == 3 {
-                readings.1.measured_at_ms -= 5001;
-            }
-            let granted = reserve(&state, 8192, &app_id(), Some(readings)).await;
-            assert_eq!(granted.is_ok(), case == 0, "case {case}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_build_leaves_room_for_a_production_wake_before_it_starts() {
-        let state = HostState::shared();
-        for (grant, admitted) in [(2500, false), (2000, true)] {
-            let (mode, mut readings) = measured(Adaptive, 4096).unwrap();
-            readings.reservation_generation = state.memory_generation();
-            readings.production_wake_bytes = 1024 * 1_048_576;
-            let reservation = state
-                .reserve_external(8192, "build", grant.try_into().unwrap(), (mode, readings))
-                .await;
-            assert_eq!(reservation.is_ok(), admitted, "{grant} MiB");
-        }
     }
 
     #[tokio::test]

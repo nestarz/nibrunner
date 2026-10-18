@@ -175,6 +175,10 @@ impl FirecrackerApi {
                     backend_type: "File",
                     backend_path: &memory_path.display().to_string(),
                 },
+                // Firecracker can advance kvmclock by the time on disk only when the host's own
+                // clock let KVM save the real time in the snapshot (a TSC clocksource); on a
+                // virtual machine's kvm-clock the load is refused ("clock_realtime requested but
+                // not present in the snapshot"). The host's release sets the guest's clock instead.
                 clock_realtime: false,
             },
         )

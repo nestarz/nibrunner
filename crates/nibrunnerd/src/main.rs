@@ -165,24 +165,8 @@ async fn serve(config: HostConfig) -> std::process::ExitCode {
         "nibrunnerd starting"
     );
 
-    // Before the lifecycle starts: a build an earlier daemon granted memory to may still run.
-    let memory = match nibrunnerd::memory_service::MemoryService::restore(host.clone()).await {
-        Ok(memory) => memory,
-        Err(error) => {
-            tracing::error!(%error, "memory reservations could not be recovered");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
     let lifecycle = LifecycleController::new(host.clone(), run::host_versions(&host));
     lifecycle.start().await;
-    let memory = match memory.serve().await {
-        Ok(task) => task,
-        Err(error) => {
-            tracing::error!(%error, "memory admission could not be served");
-            lifecycle.stop().await;
-            return std::process::ExitCode::FAILURE;
-        }
-    };
     let running: Vec<_> = lifecycle
         .controllers()
         .into_iter()
@@ -196,7 +180,6 @@ async fn serve(config: HostConfig) -> std::process::ExitCode {
         Ok(task) => task,
         Err(error) => {
             tracing::error!(%error, "host configuration could not be served");
-            memory.abort();
             lifecycle.stop().await;
             return std::process::ExitCode::FAILURE;
         }
@@ -204,7 +187,6 @@ async fn serve(config: HostConfig) -> std::process::ExitCode {
 
     ready();
     shutdown().await;
-    memory.abort();
     reloading.abort();
     tracing::info!("nibrunnerd stopping; every microVM on this host keeps running");
     host.cron_runs.shutdown().await;

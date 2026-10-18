@@ -1793,41 +1793,6 @@ fn instance_limits_refuse_zero_unknown_and_removed_fields() {
 }
 
 #[test]
-fn memory_frames_are_tagged_and_refuse_what_they_do_not_name() {
-    use crate::memory::{Reply, Request};
-    let acquire: Request = serde_json::from_value(serde_json::json!({
-        "operation": "acquire",
-        "id": "03ae9139-c7fc-4ad4-a94b-6e3c81d3b406",
-        "unit": "build-1.service",
-        "memory_mib": 2048,
-        "minimum_mib": 512
-    }))
-    .unwrap();
-    assert!(matches!(
-        acquire,
-        Request::Acquire {
-            minimum_mib: Some(_),
-            ..
-        }
-    ));
-    assert!(serde_json::from_value::<Request>(serde_json::json!({
-        "operation": "acquire", "id": "x", "unit": "u.service", "memory_mib": 0
-    }))
-    .is_err());
-    assert!(serde_json::from_value::<Request>(serde_json::json!({
-        "operation": "release", "id": "x", "extra": 1
-    }))
-    .is_err());
-    assert_eq!(
-        serde_json::to_value(Reply::Granted {
-            memory_mib: 1536.try_into().unwrap()
-        })
-        .unwrap(),
-        serde_json::json!({"status": "granted", "memory_mib": 1536})
-    );
-}
-
-#[test]
 fn a_snapshot_ttl_round_trips_in_activation_and_is_absent_unless_named() {
     let named = read(instance_with(|document| {
         document["activation"] = serde_json::json!({
@@ -1924,4 +1889,19 @@ fn a_cutover_outcome_is_reported_by_kind() {
         .unwrap(),
         serde_json::json!({ "kind": "abandoned", "deploymentId": "dep-2" })
     );
+}
+
+#[test]
+fn guest_memory_is_a_whole_number_of_2_mib_huge_pages() {
+    let even = serde_json::json!({"vcpuCount": 1, "memoryMib": 256});
+    assert_eq!(
+        serde_json::from_value::<InstanceResources>(even).unwrap(),
+        InstanceResources {
+            vcpu_count: 1,
+            memory_mib: 256
+        }
+    );
+    let odd = serde_json::json!({"vcpuCount": 1, "memoryMib": 257});
+    let error = serde_json::from_value::<InstanceResources>(odd).unwrap_err();
+    assert!(error.to_string().contains("multiple of 2"), "{error}");
 }

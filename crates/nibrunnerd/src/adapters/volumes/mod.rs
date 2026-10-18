@@ -115,6 +115,26 @@ pub const FILESYSTEM_UUID_BYTES: usize = 16;
 
 pub type FilesystemUuid = [u8; FILESYSTEM_UUID_BYTES];
 
+/// `s_log_block_size`, at 0x18 into the superblock: the block size is 1024 shifted by it.
+const SUPERBLOCK_LOG_BLOCK_SIZE_OFFSET: u64 = 1048;
+
+/// The block size of the ext filesystem on a device, or `None` when it holds none.
+pub fn filesystem_block_bytes(path: &str) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(SUPERBLOCK_MAGIC_OFFSET)).ok()?;
+    let mut magic = [0u8; 2];
+    file.read_exact(&mut magic).ok()?;
+    if !has_ext_magic(&magic) {
+        return None;
+    }
+    file.seek(SeekFrom::Start(SUPERBLOCK_LOG_BLOCK_SIZE_OFFSET))
+        .ok()?;
+    let mut log = [0u8; 4];
+    file.read_exact(&mut log).ok()?;
+    1024u32.checked_shl(u32::from_le_bytes(log))
+}
+
 /// The uuid mke2fs gave the filesystem, read from a device or from the image an export is served
 /// from. `None` for anything that cannot name a filesystem apart from another: bytes that are not
 /// an ext filesystem at all, and the all-zero uuid, which is what a filesystem made by something
@@ -147,7 +167,9 @@ pub(crate) fn format_request(
     contents: Option<&StagedRoot>,
     regular_file: bool,
 ) -> CommandRequest {
-    let mut command = vec!["mke2fs", "-q", "-t", "ext4"];
+    // 4 KiB blocks whatever the size (mke2fs gives a small filesystem 1 KiB ones), to match the
+    // drive's sectors; discard, so a fresh file starts with every block a hole.
+    let mut command = vec!["mke2fs", "-q", "-t", "ext4", "-b", "4096", "-E", "discard"];
     if regular_file {
         command.push("-F");
     }
@@ -242,6 +264,20 @@ pub(crate) mod tests {
             )),
             Some([9u8; FILESYSTEM_UUID_BYTES])
         );
+    }
+
+    #[test]
+    fn a_filesystem_block_size_is_read_from_its_superblock_and_nothing_else_has_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = image(directory.path(), "one", true, [7u8; FILESYSTEM_UUID_BYTES]);
+        for (log, bytes) in [(0u32, 1024), (2, 4096)] {
+            let mut image = std::fs::read(&path).unwrap();
+            image[1048..1052].copy_from_slice(&log.to_le_bytes());
+            std::fs::write(&path, image).unwrap();
+            assert_eq!(filesystem_block_bytes(&path), Some(bytes));
+        }
+        let blank = image(directory.path(), "blank", false, [7u8; FILESYSTEM_UUID_BYTES]);
+        assert_eq!(filesystem_block_bytes(&blank), None);
     }
 
     #[test]
@@ -357,7 +393,19 @@ pub(crate) mod tests {
         let plain = format_request("/dev/nbd0", None, false);
         assert_eq!(
             plain.command,
-            ["mke2fs", "-q", "-t", "ext4", "-L", FILESYSTEM_LABEL, "/dev/nbd0"]
+            [
+                "mke2fs",
+                "-q",
+                "-t",
+                "ext4",
+                "-b",
+                "4096",
+                "-E",
+                "discard",
+                "-L",
+                FILESYSTEM_LABEL,
+                "/dev/nbd0"
+            ]
         );
         assert_eq!(plain.timeout, CommandRequest::new(&[]).timeout);
 
@@ -378,6 +426,10 @@ pub(crate) mod tests {
                 "-q",
                 "-t",
                 "ext4",
+                "-b",
+                "4096",
+                "-E",
+                "discard",
                 "-F",
                 "-L",
                 FILESYSTEM_LABEL,

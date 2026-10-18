@@ -366,15 +366,17 @@ mod tests {
         let host = quiet_host().await;
         apply(&host).await;
         let _transition = host.state.transition(&app_id()).await;
-        host.vms.refuse_thaw(crate::ports::VmError::Host(
-            "guest clock synchronization timed out".into(),
-        ));
+        host.vms.refuse_thaw(crate::ports::VmError::WakeStalled {
+            reason: "dial did not complete: CONNECT 51001 had no answer within 1000 ms".into(),
+        });
         assert_eq!(
             super::super::instances::resume_instance(&host, &on_request())
                 .await
                 .unwrap(),
             WakeOutcome::ColdBoot
         );
+        let [.., thaw_failed] = host.metrics.sleep_wake.of(&app_id()).wakes;
+        assert_eq!(thaw_failed, 1, "the failed thaw is counted as its own outcome");
         assert_eq!(
             host.vms.calls(),
             vec![
@@ -389,6 +391,11 @@ mod tests {
         let record = host.state.record(&app_id()).await.unwrap();
         assert_eq!(record.state, InstanceState::Starting);
         assert!(!record.stop_requested);
+        assert_eq!(
+            record.message.as_ref().map(protocol::StateMessage::as_str),
+            Some("dial did not complete: CONNECT 51001 had no answer within 1000 ms"),
+            "the instance says why the request was not thawed"
+        );
     }
 
     #[tokio::test]

@@ -149,6 +149,10 @@ pub enum VmError {
     StartBusy,
     #[error("the saved microVM state cannot be restored: {reason}")]
     SnapshotUnusable { reason: String },
+    /// A microVM brought back to the point of running whose wake then did not complete a stretch
+    /// inside its budget; the reason names the stretch.
+    #[error("{reason}")]
+    WakeStalled { reason: String },
     #[error("this microVM must not be snapshotted: {reason}")]
     SleepRefused { reason: String },
     #[error("no microVM answered {socket_path}: {reason}")]
@@ -176,6 +180,9 @@ pub enum WakeOutcome {
     ColdBoot,
     /// A frozen microVM resumed in place.
     Thawed,
+    /// A frozen microVM that did not come back; the request was answered by a cold boot instead,
+    /// counted as its own wake.
+    ThawFailed,
 }
 
 impl WakeOutcome {
@@ -191,6 +198,7 @@ impl WakeOutcome {
             WakeOutcome::AlreadyRunning => "already-running",
             WakeOutcome::ColdBoot => "cold-boot",
             WakeOutcome::Thawed => "thawed",
+            WakeOutcome::ThawFailed => "thaw-failed",
         }
     }
 }
