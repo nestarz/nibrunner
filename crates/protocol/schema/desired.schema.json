@@ -283,6 +283,17 @@
           "maxItems": 8,
           "minItems": 1
         },
+        "limits": {
+          "description": "What the host enforces beyond `config.resources`, applied without a new deployment.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "scratch": {
           "description": "What the instance writes to when it has no volume.",
           "anyOf": [
@@ -812,6 +823,43 @@
         "destinationPath"
       ]
     },
+    "InstanceLimits": {
+      "description": "What the host enforces on an instance beyond what `resources` gives it. Every field is optional\nand applied live, without replacing the deployment: a running microVM's cgroup is rewritten and\nthe proxy's limit takes the next request.",
+      "type": "object",
+      "properties": {
+        "concurrent": {
+          "description": "Requests the proxy carries to this instance at once, in place of the host's\n`proxy.http.concurrency.app_concurrent`. Its host-wide limit still applies.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "cpuPercent": {
+          "description": "Host CPU time in percent of one core, enforced as a `cpu.max` quota that only ever tightens\nthe `vcpuCount` cores `resources` gives: `25` is a quarter of a core, and a value above\n`vcpuCount × 100` changes nothing.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "InstancePort": {
       "description": "A port a guest answers on beside its HTTP one, carried to it unread.\n\nIt carries whatever arrives, tcp or udp: a port is a port, the relay in front of a host\nforwards both for every one in its range, and a guest that listens on only one of them\nanswers the other with a port-unreachable the way any host would.",
       "type": "object",
@@ -851,6 +899,43 @@
       "type": "integer",
       "maximum": 604800000,
       "minimum": 60000
+    },
+    "MemoryPolicy": {
+      "description": "How the kernel treats this instance's memory when the host runs short. None of it changes the\nguest's RAM or the cgroup's hard ceiling, which `resources` decides.",
+      "type": "object",
+      "properties": {
+        "priority": {
+          "$ref": "#/$defs/MemoryPriority"
+        },
+        "swapMib": {
+          "description": "Maximum uncompressed bytes allowed in host swap, in MiB. Zero disables swap.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "targetMib": {
+          "description": "Working-set target, capped by the hard memory budget. Does not resize guest RAM.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "targetMib",
+        "swapMib",
+        "priority"
+      ]
+    },
+    "MemoryPriority": {
+      "description": "`production` keeps its target resident (`memory.low`) and is the last the OOM killer picks;\n`preview` and `build` are throttled at their target (`memory.high`) and picked first.",
+      "type": "string",
+      "enum": [
+        "production",
+        "standard",
+        "preview",
+        "build"
+      ]
     },
     "ObjectKey": {
       "description": "between 1 and 1024 characters",

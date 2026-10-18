@@ -215,6 +215,16 @@ impl Jail {
         }
     }
 
+    /// The OOM score belongs to the process rather than its cgroup, so it is written once the VMM's
+    /// process exists; the jailer's exec keeps it.
+    pub(crate) fn apply_oom_score(&self, pid: i32) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fake_mounts {
+            return Ok(());
+        }
+        self.limits.write_oom_score(pid)
+    }
+
     pub(crate) fn grant_socket(&self, path: &Path) -> std::io::Result<()> {
         own(path, self.uid, self.gid)
     }

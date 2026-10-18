@@ -43,6 +43,9 @@ pub struct InstanceRecord {
     pub health: HealthTracker,
     pub health_check: HealthCheck,
     pub resources: InstanceResources,
+    /// The document's `limits`, which the host applies to a running microVM as they change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<protocol::InstanceLimits>,
     /// The policy the status loop judges an exit by. Absent is a record written before the status
     /// loop needed it; it reads as the default until the first pass copies the document's.
     #[serde(default = "default_restart_policy")]
@@ -92,6 +95,7 @@ pub struct RecordFields {
     pub layer_digests: Vec<Sha256Digest>,
     pub health_check: HealthCheck,
     pub resources: InstanceResources,
+    pub limits: Option<protocol::InstanceLimits>,
     pub restart_policy: RestartPolicy,
     pub desired_running: bool,
     pub on_request: bool,
@@ -114,6 +118,7 @@ impl InstanceRecord {
             health,
             health_check: fields.health_check,
             resources: fields.resources,
+            limits: fields.limits,
             restart_policy: fields.restart_policy,
             desired_running: fields.desired_running,
             on_request: fields.on_request,
@@ -143,6 +148,7 @@ impl InstanceRecord {
         self.layer_digests = fields.layer_digests;
         self.health_check = fields.health_check;
         self.resources = fields.resources;
+        self.limits = fields.limits;
         self.restart_policy = fields.restart_policy;
         self.desired_running = fields.desired_running;
         self.on_request = fields.on_request;
