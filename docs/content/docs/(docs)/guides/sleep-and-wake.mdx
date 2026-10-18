@@ -81,6 +81,11 @@ freezes a running quiet app before it snapshots one. A document that makes an ap
 sleeping, a cron job, or an export resumes a frozen app first. Omit `freeze_after_ms` to freeze
 nothing new; requests still resume those already frozen.
 
+A frozen VM that will not resume, or whose guest does not answer the clock handshake, is not left
+paused for the next request to find the same way: the host stops it and boots the app from cold,
+and the request waits for that boot. One whose deployment is being replaced is left to the
+replacement instead, and the request waits for the new deployment to answer.
+
 ## Revision retention
 
 An `on-request` instance can set an `expiry` policy with `idleMs` and an optional ISO 8601

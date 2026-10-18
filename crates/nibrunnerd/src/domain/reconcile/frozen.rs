@@ -362,25 +362,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_thaw_keeps_the_frozen_vm_and_never_boots_over_it() {
+    async fn a_frozen_guest_that_will_not_thaw_is_let_go_of_and_the_app_booted_afresh() {
         let host = quiet_host().await;
         apply(&host).await;
         let _transition = host.state.transition(&app_id()).await;
-        host.vms
-            .refuse_thaw(crate::ports::VmError::Host("clock handshake failed".into()));
-        assert!(super::super::instances::resume_instance(&host, &on_request())
+        host.vms.refuse_thaw(crate::ports::VmError::Host(
+            "guest clock synchronization timed out".into(),
+        ));
+        assert_eq!(
+            super::super::instances::resume_instance(&host, &on_request())
+                .await
+                .unwrap(),
+            WakeOutcome::ColdBoot
+        );
+        assert_eq!(
+            host.vms.calls(),
+            vec![
+                VmCall::Freeze,
+                VmCall::Thaw,
+                VmCall::Stop,
+                VmCall::Discard,
+                VmCall::Boot
+            ],
+            "the paused guest is taken down before another is booted"
+        );
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Starting);
+        assert!(!record.stop_requested);
+    }
+
+    #[tokio::test]
+    async fn a_frozen_guest_of_a_deployment_being_replaced_is_left_to_the_pass_when_it_will_not_thaw() {
+        let host = quiet_host().await;
+        apply(&host).await;
+        let _transition = host.state.transition(&app_id()).await;
+        host.vms.refuse_thaw(crate::ports::VmError::Host(
+            "guest clock synchronization timed out".into(),
+        ));
+        let redeployed = desired_instance(|instance| {
+            instance.desired_state = protocol::DesiredInstanceState::OnRequest;
+            instance.deployment_id = protocol::DeploymentId::parse("dep-2").unwrap();
+        });
+        assert!(super::super::instances::resume_instance(&host, &redeployed)
             .await
             .is_err());
         assert_eq!(host.vms.calls(), vec![VmCall::Freeze, VmCall::Thaw]);
+    }
+
+    fn named(hostnames: &[&str]) -> protocol::HostDesiredState {
+        desired_state(|state| {
+            state.instances = vec![desired_instance(|instance| {
+                instance.desired_state = protocol::DesiredInstanceState::OnRequest;
+                instance.hostnames = hostnames
+                    .iter()
+                    .map(|name| protocol::AppHostname {
+                        hostname: protocol::Hostname::parse(*name).unwrap(),
+                        kind: protocol::AppHostnameKind::Custom,
+                    })
+                    .chain([app_hostname()])
+                    .collect();
+            })]
+        })
+    }
+
+    async fn renamed_while_frozen(host: &TestHost) {
+        apply(host).await;
+        for added in [&["app-test.example.com"][..], &[]] {
+            let desired = named(added);
+            host.cache.lock().await.accept(desired.clone());
+            super::super::reconcile(
+                host.arc(),
+                &desired,
+                crate::domain::metrics::passes::Trigger::Change,
+            )
+            .await;
+            let routes = host.router.routes().await;
+            let port = host.slot_of(&app_id()).await.unwrap().host_port;
+            assert_eq!(routes.port_for(app_hostname().hostname.as_str()), Some(port));
+            assert_eq!(
+                routes.port_for("app-test.example.com"),
+                (!added.is_empty()).then_some(port),
+                "the route follows the document while the app is frozen"
+            );
+            assert_eq!(
+                host.state.record(&app_id()).await.unwrap().state,
+                InstanceState::Frozen
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frozen_app_given_a_hostname_and_then_its_old_ones_is_served_by_the_next_request() {
+        let host = quiet_host().await;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = protocol::HttpPort::new(listener.local_addr().unwrap().port()).unwrap();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        renamed_while_frozen(&host).await;
+        // After the passes, which set the port the document names: the guest answers on ours.
+        host.state
+            .update_record(&app_id(), |record| {
+                record.guest_ipv4 = Some(crate::domain::health::probe::loopback());
+                record.http_port = port;
+                record.health_check = protocol::HealthCheck::BootCompleted;
+            })
+            .await;
+
+        let waker = crate::domain::waker::AppWaker::new(host.arc().clone());
+        let woke = crate::ports::Waker::wake(waker.as_ref(), &app_id()).await;
+        assert!(woke.is_ok(), "{woke:?}");
+        assert_eq!(host.vms.calls(), vec![VmCall::Freeze, VmCall::Thaw]);
         assert_eq!(
             host.state.record(&app_id()).await.unwrap().state,
-            InstanceState::Frozen
+            InstanceState::Starting
         );
-        host.vms
-            .refuse_thaw(crate::ports::VmError::Host("still unavailable".into()));
-        assert!(super::super::instances::resume_instance(&host, &on_request())
-            .await
-            .is_err());
-        assert_eq!(host.vms.calls(), vec![VmCall::Freeze, VmCall::Thaw, VmCall::Thaw]);
+    }
+
+    #[tokio::test]
+    async fn a_frozen_app_renamed_twice_whose_guest_will_not_thaw_is_booted_by_the_next_request() {
+        let host = quiet_host().await;
+        renamed_while_frozen(&host).await;
+        host.vms.refuse_thaw(crate::ports::VmError::Host(
+            "guest clock synchronization timed out".into(),
+        ));
+        let _transition = host.state.transition(&app_id()).await;
+        assert_eq!(
+            super::super::instances::resume_instance(&host, &named(&[]).instances[0])
+                .await
+                .unwrap(),
+            WakeOutcome::ColdBoot
+        );
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Starting);
+        assert_eq!(record.hostnames, vec![app_hostname()]);
     }
 }
