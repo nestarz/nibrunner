@@ -13,7 +13,7 @@ pub struct RouteTarget {
 pub fn renderable_routes(records: &[InstanceRecord]) -> Vec<RouteTarget> {
     records
         .iter()
-        .filter(|record| !record.hostnames.is_empty())
+        .filter(|record| !record.hostnames.is_empty() && record.staging_for.is_none())
         .filter_map(|record| {
             // No slot, nothing to route to: a start refused before one was ever handed out has
             // no `host_port` a route could name.

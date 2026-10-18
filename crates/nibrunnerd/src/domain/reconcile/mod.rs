@@ -1,4 +1,5 @@
 pub mod checkpoints;
+pub(crate) mod cutover;
 pub(crate) mod expiry;
 pub mod exports;
 pub(crate) mod frozen;
@@ -57,12 +58,29 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                             && record.start_attempts == NO_START_ATTEMPTS
                     }),
                     ran_once: record.is_some_and(|record| record.state == InstanceState::Exited),
+                    staging_for: record.and_then(|record| record.staging_for.clone()),
+                    cutover: record.and_then(|record| {
+                        let cutover = record.cutover.as_ref()?;
+                        let staged = cutover::staging_id(app_id)
+                            .and_then(|staging| snapshot.records.get(&staging))
+                            .filter(|staged| {
+                                staged.staging_for.as_ref() == Some(app_id)
+                                    && staged.deployment_id == cutover.deployment_id
+                            });
+                        Some(ObservedCutover {
+                            deployment_id: cutover.deployment_id.clone(),
+                            deadline_ms: cutover.deadline_ms,
+                            abandoned: cutover.abandoned,
+                            staging: staged.map(cutover::progress),
+                        })
+                    }),
                 }
             })
             .collect(),
         volumes: volumes::observe_volumes(host, &volumes::volume_owners(desired, &snapshot.records)).await,
         checkpoints: checkpoints::observe_checkpoints(host, desired).await,
         exports: exports::observe_exports(host).await,
+        now_ms: crate::clock::now_ms(),
     }
 }
 
@@ -84,6 +102,12 @@ async fn sync_desired(host: &Arc<Host>, desired: &HostDesiredState) {
                 record.desired_running = wanted.desired_state != DesiredInstanceState::Stopped;
                 record.on_request = wanted.desired_state == DesiredInstanceState::OnRequest;
                 record.http_port = wanted.config.http_port;
+                // A cut-over the document no longer asks for, because it names the deployment
+                // this app already runs, has nothing left to say.
+                if record.deployment_id == wanted.deployment_id && record.cutover.take().is_some() {
+                    record.cutover_note = None;
+                    record.cutover_outcome = None;
+                }
             })
             .await;
     }
@@ -133,7 +157,7 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             InstancePlan::Stop { app_id, reason } => {
                 instances::stop_instance(host, app_id, reason.as_str()).await;
             }
-            InstancePlan::Replace { desired } => {
+            InstancePlan::Replace { desired } | InstancePlan::FallBack { desired, .. } => {
                 let _transition = host.state.transition(&desired.app_id).await;
                 instances::stop_instance(host, &desired.app_id, InstanceStopReason::Superseded.as_str())
                     .await;
@@ -157,6 +181,15 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             InstancePlan::Forget { app_id } => {
                 let _transition = host.state.transition(app_id).await;
                 let _ = host.vms.discard(app_id).await;
+                // Nothing else will ever ask for the slot of what was booted for a cut-over.
+                if host
+                    .state
+                    .record(app_id)
+                    .await
+                    .is_some_and(|record| record.staging_for.is_some())
+                {
+                    volumes::give_back_slot(host, app_id).await;
+                }
                 let deleting_expired_disk = plan.volumes.iter().any(|v| {
                     matches!(v,
                     VolumePlan::Teardown { desired } if desired.app_id == *app_id)
@@ -229,6 +262,7 @@ async fn apply_starts(host: &Arc<Host>, plan: &ReconcilePlan) {
         .filter_map(|action| match action {
             InstancePlan::Start { desired }
             | InstancePlan::Replace { desired }
+            | InstancePlan::FallBack { desired, .. }
             | InstancePlan::Recover { desired } => Some(desired),
             _ => None,
         })
@@ -320,6 +354,8 @@ pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Tr
     network::apply_activators(host).await;
     network::apply_network(host).await;
     apply_starts(host, &plan).await;
+    cutover::note_fallbacks(host, &plan).await;
+    cutover::apply_cutovers(host, &plan).await;
     volumes::apply_teardowns(host, &plan).await;
     checkpoints::apply_checkpoints(host, &plan).await;
     exports::apply_exports(host, &plan, trigger).await;
@@ -356,10 +392,13 @@ fn stands_on_its_layers(host: &Host, record: &crate::domain::report::InstanceRec
         InstanceState::Pending
         | InstanceState::Starting
         | InstanceState::Running
+        | InstanceState::Frozen
         | InstanceState::Unhealthy
         | InstanceState::Stopping => true,
         InstanceState::Idle => host.vms.holds_snapshot(&record.app_id),
-        InstanceState::Stopped | InstanceState::Failed => false,
+        InstanceState::Stopped | InstanceState::Expired | InstanceState::Failed | InstanceState::Exited => {
+            false
+        }
     }
 }
 
@@ -794,6 +833,8 @@ mod tests {
             document.instances = vec![desired_instance(|instance| {
                 instance.desired_state = state;
                 instance.activation = Some(protocol::ActivationPolicy {
+                    cutover_timeout_ms: None,
+                    first_boot: protocol::FirstBoot::Eager,
                     sleep_when: protocol::SleepPolicy::Never,
                     snapshot_ttl_ms: Some(protocol::SnapshotTtlMs::try_from(86_400_000).unwrap()),
                 });
@@ -865,6 +906,8 @@ mod tests {
                 instance.deployment_id = protocol::DeploymentId::parse(deployment).unwrap();
                 instance.desired_state = DesiredInstanceState::OnRequest;
                 instance.activation = Some(protocol::ActivationPolicy {
+                    cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
                     sleep_when: protocol::SleepPolicy::TrafficIdle {
                         timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
                     },
@@ -946,6 +989,30 @@ mod tests {
             host.state.record(&app_id()).await.unwrap().state,
             InstanceState::Starting
         );
+    }
+
+    #[tokio::test]
+    async fn a_lazy_app_never_booted_still_expires_at_its_deadline() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let mut desired = lazy_app("dep-1");
+        desired.instances[0].expiry = Some(protocol::ExpiryPolicy {
+            idle_ms: protocol::ExpiryIdleMs::try_from(protocol::MIN_EXPIRY_IDLE_MS).unwrap(),
+            deadline: Some(protocol::Timestamp::from_epoch_ms(1)),
+        });
+        reconcile(host.arc(), &desired, Trigger::Change).await;
+
+        expiry::apply(host.arc(), crate::clock::now_ms()).await;
+
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(record.state, InstanceState::Expired);
+        assert!(host
+            .state
+            .admit(&app_id(), crate::clock::now_ms(), || ())
+            .await
+            .is_none());
+        reconcile(host.arc(), &desired, Trigger::Tick).await;
+        assert!(!host.vms.calls().contains(&VmCall::Boot));
     }
 
     #[tokio::test]

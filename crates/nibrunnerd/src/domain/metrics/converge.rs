@@ -743,6 +743,7 @@ mod tests {
                     first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
                     snapshot_ttl_ms: None,
+                    cutover_timeout_ms: None,
                 });
                 instance.config.health_check = HealthCheck::BootCompleted;
             })];

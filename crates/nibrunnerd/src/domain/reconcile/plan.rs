@@ -23,6 +23,28 @@ pub struct ObservedInstance {
     /// runs it again.
     pub ran_once: bool,
     pub expired: bool,
+    /// The app this instance was booted beside, to take over once it is healthy.
+    pub staging_for: Option<AppId>,
+    /// The deployment this app is being cut over to, and how far the instance booted for it has got.
+    pub cutover: Option<ObservedCutover>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedCutover {
+    pub deployment_id: DeploymentId,
+    pub deadline_ms: i64,
+    pub abandoned: bool,
+    pub staging: Option<StagingProgress>,
+}
+
+/// How far the instance booted beside the one serving has got, as its record says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingProgress {
+    /// Not booted yet: the host had no room or no start slot for it.
+    Waiting,
+    Starting,
+    Healthy,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +78,8 @@ pub struct ObservedState {
     pub volumes: Vec<ObservedVolume>,
     pub checkpoints: Vec<ObservedCheckpoint>,
     pub exports: Vec<ObservedExport>,
+    /// When this was observed, which a cut-over's deadline is measured against.
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,12 +103,48 @@ impl InstanceStopReason {
     }
 }
 
+pub use protocol::CutoverFallback;
+
+pub(super) fn fallback_note(reason: CutoverFallback) -> protocol::StateMessage {
+    let why = match reason {
+        CutoverFallback::Volume => "it writes to a volume, which two guests cannot share",
+        CutoverFallback::NoRoom => {
+            "the host had no room to boot it beside the one serving within its cutoverTimeoutMs"
+        }
+        CutoverFallback::NoStagingName => {
+            "the name it would be booted under beside the one serving is taken or too long"
+        }
+    };
+    protocol::StateMessage::new(format!(
+        "cutover_fallback: the old deployment was stopped before this one started, because {why}"
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstancePlan {
     Start {
         desired: DesiredInstance,
     },
     Replace {
+        desired: DesiredInstance,
+    },
+    /// A replacement that was asked to be a cut-over and cannot be: the old deployment is
+    /// stopped before the new one starts, and the instance says why.
+    FallBack {
+        desired: DesiredInstance,
+        reason: CutoverFallback,
+    },
+    /// Boot the new deployment beside the one still serving, or go on waiting for it to be well.
+    Stage {
+        desired: DesiredInstance,
+        timeout_ms: u64,
+    },
+    /// Hand the app's hostnames to its new deployment, which is healthy, and stop the old one.
+    Promote {
+        desired: DesiredInstance,
+    },
+    /// Stop the new deployment, which did not become healthy in time; the old one keeps serving.
+    Abandon {
         desired: DesiredInstance,
     },
     /// Cold-restart an instance whose data volume backing was pulled out from under it (a ZeroFS
@@ -183,10 +243,73 @@ pub fn plan_reconcile(desired: &HostDesiredState, observed: &ObservedState) -> R
     }
 }
 
+/// What a new deployment of an app that is up comes to: a plain replacement unless the document
+/// asked for it to be booted beside the old one first, and then wherever that cut-over has got.
+fn replacement(wanted: &DesiredInstance, current: &ObservedInstance, room: CutoverRoom) -> InstancePlan {
+    let Some(timeout) = wanted.activation().cutover_timeout_ms else {
+        return InstancePlan::Replace {
+            desired: wanted.clone(),
+        };
+    };
+    // Nothing is being served to keep up while the new one comes up.
+    if !current.running {
+        return InstancePlan::Replace {
+            desired: wanted.clone(),
+        };
+    }
+    let fall_back = |reason| InstancePlan::FallBack {
+        desired: wanted.clone(),
+        reason,
+    };
+    if wanted.volume_id.is_some() {
+        return fall_back(CutoverFallback::Volume);
+    }
+    if !room.staging_name_free {
+        return fall_back(CutoverFallback::NoStagingName);
+    }
+    let stage = || InstancePlan::Stage {
+        desired: wanted.clone(),
+        timeout_ms: timeout.get(),
+    };
+    let Some(cutover) = current
+        .cutover
+        .as_ref()
+        .filter(|cutover| cutover.deployment_id == wanted.deployment_id)
+    else {
+        return stage();
+    };
+    if cutover.abandoned {
+        return InstancePlan::None {
+            app_id: wanted.app_id.clone(),
+        };
+    }
+    let abandon = || InstancePlan::Abandon {
+        desired: wanted.clone(),
+    };
+    match cutover.staging {
+        Some(StagingProgress::Healthy) => InstancePlan::Promote {
+            desired: wanted.clone(),
+        },
+        Some(StagingProgress::Failed) => abandon(),
+        Some(StagingProgress::Starting) if room.now_ms >= cutover.deadline_ms => abandon(),
+        Some(StagingProgress::Waiting) | None if room.now_ms >= cutover.deadline_ms => {
+            fall_back(CutoverFallback::NoRoom)
+        }
+        _ => stage(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CutoverRoom {
+    staging_name_free: bool,
+    now_ms: i64,
+}
+
 fn plan_instance(
     wanted: &DesiredInstance,
     current: Option<&ObservedInstance>,
     volume_lost: bool,
+    room: CutoverRoom,
 ) -> InstancePlan {
     // A guest whose disk was yanked keeps a dead virtio-blk device even after the host re-attaches
     // the NBD device, so the only way back is a fresh boot onto the recovered device.
@@ -236,9 +359,7 @@ fn plan_instance(
                     desired: wanted.clone(),
                 }
             } else {
-                InstancePlan::Replace {
-                    desired: wanted.clone(),
-                }
+                replacement(wanted, current, room)
             };
         }
         if current.ran_once {
@@ -250,6 +371,10 @@ fn plan_instance(
             return if wanted.expiry.is_some() {
                 InstancePlan::None {
                     app_id: wanted.app_id.clone(),
+                }
+            } else if wanted.boots_lazily() {
+                InstancePlan::Declare {
+                    desired: wanted.clone(),
                 }
             } else {
                 InstancePlan::Replace {
@@ -289,9 +414,7 @@ fn plan_instance(
         };
     };
     if current.deployment_id.as_ref() != Some(&wanted.deployment_id) {
-        return InstancePlan::Replace {
-            desired: wanted.clone(),
-        };
+        return replacement(wanted, current, room);
     }
     if current.ran_once {
         return InstancePlan::None {
@@ -338,6 +461,16 @@ fn plan_instances(desired: &HostDesiredState, observed: &ObservedState) -> Vec<I
         .iter()
         .map(|instance| &instance.app_id)
         .collect();
+    // A staging name is free when no app the document names has it, and nothing on this host
+    // answers to it but what was booted for this very app.
+    let staging_name_free = |owner: &AppId| {
+        super::cutover::staging_id(owner).is_some_and(|staging| {
+            !desired_ids.contains(&staging)
+                && observed_by_id
+                    .get(&staging)
+                    .is_none_or(|held| held.staging_for.as_ref() == Some(owner))
+        })
+    };
     let mut plans: Vec<InstancePlan> = desired
         .instances
         .iter()
@@ -349,14 +482,29 @@ fn plan_instances(desired: &HostDesiredState, observed: &ObservedState) -> Vec<I
                     .volume_id
                     .as_ref()
                     .is_some_and(|id| lost_volumes.contains(id)),
+                CutoverRoom {
+                    staging_name_free: staging_name_free(&wanted.app_id),
+                    now_ms: observed.now_ms,
+                },
             )
+        })
+        .collect();
+    // What was booted for a cut-over still under way is that cut-over's to promote or stop. One
+    // whose app is no longer being cut over is stopped and forgotten like an app nobody names.
+    let staged: BTreeSet<AppId> = plans
+        .iter()
+        .filter_map(|plan| match plan {
+            InstancePlan::Stage { desired, .. }
+            | InstancePlan::Promote { desired }
+            | InstancePlan::Abandon { desired } => super::cutover::staging_id(&desired.app_id),
+            _ => None,
         })
         .collect();
     plans.extend(
         observed
             .instances
             .iter()
-            .filter(|current| !desired_ids.contains(&current.app_id))
+            .filter(|current| !desired_ids.contains(&current.app_id) && !staged.contains(&current.app_id))
             .map(|current| {
                 if current.running {
                     InstancePlan::Stop {
@@ -773,6 +921,8 @@ mod tests {
             desired_instance(|instance| {
                 instance.desired_state = DesiredInstanceState::OnRequest;
                 instance.activation = Some(protocol::ActivationPolicy {
+                    cutover_timeout_ms: None,
+                    snapshot_ttl_ms: None,
                     sleep_when: protocol::SleepPolicy::TrafficIdle {
                         timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
                     },
@@ -844,6 +994,33 @@ mod tests {
                 }),
             );
             assert_eq!(result.instances, declared());
+        }
+
+        #[test]
+        fn one_that_expired_stays_expired_and_is_declared_again_once_its_expiry_is_lifted() {
+            let expired = || {
+                observed_state(|state| {
+                    state.instances = vec![observed_instance(|instance| {
+                        instance.running = false;
+                        instance.expired = true;
+                    })]
+                })
+            };
+            let retained = plan(
+                desired_state(|state| {
+                    state.instances = vec![desired_instance(|instance| {
+                        *instance = lazy();
+                        instance.expiry = Some(protocol::ExpiryPolicy {
+                            idle_ms: protocol::ExpiryIdleMs::try_from(protocol::MIN_EXPIRY_IDLE_MS).unwrap(),
+                            deadline: None,
+                        });
+                    })]
+                }),
+                expired(),
+            );
+            assert_eq!(retained.instances, vec![InstancePlan::None { app_id: app_id() }]);
+            let lifted = plan(desired_state(|state| state.instances = vec![lazy()]), expired());
+            assert_eq!(lifted.instances, declared());
         }
     }
 
@@ -1016,6 +1193,236 @@ mod tests {
             assert_eq!(
                 result.instances,
                 vec![InstancePlan::Replace { desired: redeployed }]
+            );
+        }
+    }
+
+    mod a_deployment_asked_to_be_cut_over {
+        use super::*;
+
+        const DEADLINE_MS: i64 = 1_000_000;
+
+        fn new_deployment() -> DeploymentId {
+            DeploymentId::parse("dep-2").unwrap()
+        }
+
+        fn staging() -> AppId {
+            crate::domain::reconcile::cutover::staging_id(&app_id()).unwrap()
+        }
+
+        fn wanted() -> DesiredInstance {
+            desired_instance(|instance| {
+                instance.deployment_id = new_deployment();
+                instance.volume_id = None;
+                instance.scratch = Some(protocol::Scratch::Memory {
+                    mib: std::num::NonZeroU32::new(64).unwrap(),
+                });
+                instance.activation = Some(protocol::ActivationPolicy {
+                    snapshot_ttl_ms: None,
+                    first_boot: protocol::FirstBoot::Eager,
+                    sleep_when: protocol::SleepPolicy::Never,
+                    cutover_timeout_ms: Some(protocol::CutoverTimeoutMs::try_from(600_000).unwrap()),
+                });
+            })
+        }
+
+        fn serving(cutover: Option<ObservedCutover>) -> ObservedInstance {
+            observed_instance(|instance| {
+                instance.volume_id = None;
+                instance.cutover = cutover;
+            })
+        }
+
+        fn under_way(staging: Option<StagingProgress>) -> Option<ObservedCutover> {
+            Some(ObservedCutover {
+                deployment_id: new_deployment(),
+                deadline_ms: DEADLINE_MS,
+                abandoned: false,
+                staging,
+            })
+        }
+
+        fn planned(wanted: DesiredInstance, current: ObservedInstance, now_ms: i64) -> InstancePlan {
+            plan(
+                desired_state(|state| state.instances = vec![wanted]),
+                observed_state(|state| {
+                    state.instances = vec![current];
+                    state.now_ms = now_ms;
+                }),
+            )
+            .instances
+            .remove(0)
+        }
+
+        #[test]
+        fn boots_the_new_deployment_beside_the_one_serving() {
+            assert_eq!(
+                planned(wanted(), serving(None), 0),
+                InstancePlan::Stage {
+                    desired: wanted(),
+                    timeout_ms: 600_000
+                }
+            );
+        }
+
+        #[test]
+        fn keeps_waiting_for_the_new_deployment_until_its_deadline() {
+            for progress in [
+                None,
+                Some(StagingProgress::Waiting),
+                Some(StagingProgress::Starting),
+            ] {
+                assert!(
+                    matches!(
+                        planned(wanted(), serving(under_way(progress)), DEADLINE_MS - 1),
+                        InstancePlan::Stage { .. }
+                    ),
+                    "{progress:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn hands_the_app_over_once_the_new_deployment_is_healthy() {
+            assert_eq!(
+                planned(wanted(), serving(under_way(Some(StagingProgress::Healthy))), 0),
+                InstancePlan::Promote { desired: wanted() }
+            );
+        }
+
+        #[test]
+        fn stops_a_new_deployment_that_failed_or_was_not_healthy_by_its_deadline() {
+            assert_eq!(
+                planned(wanted(), serving(under_way(Some(StagingProgress::Failed))), 0),
+                InstancePlan::Abandon { desired: wanted() }
+            );
+            assert_eq!(
+                planned(
+                    wanted(),
+                    serving(under_way(Some(StagingProgress::Starting))),
+                    DEADLINE_MS
+                ),
+                InstancePlan::Abandon { desired: wanted() }
+            );
+        }
+
+        #[test]
+        fn falls_back_to_stopping_first_when_the_host_had_no_room_by_the_deadline() {
+            for progress in [None, Some(StagingProgress::Waiting)] {
+                assert_eq!(
+                    planned(wanted(), serving(under_way(progress)), DEADLINE_MS),
+                    InstancePlan::FallBack {
+                        desired: wanted(),
+                        reason: CutoverFallback::NoRoom
+                    },
+                    "{progress:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn leaves_the_old_deployment_serving_once_the_new_one_was_given_up_on() {
+            let given_up = Some(ObservedCutover {
+                abandoned: true,
+                ..under_way(Some(StagingProgress::Failed)).unwrap()
+            });
+            assert_eq!(
+                planned(wanted(), serving(given_up), DEADLINE_MS * 2),
+                InstancePlan::None { app_id: app_id() }
+            );
+        }
+
+        #[test]
+        fn tries_again_when_the_document_names_yet_another_deployment() {
+            let other = desired_instance(|instance| {
+                *instance = wanted();
+                instance.deployment_id = DeploymentId::parse("dep-3").unwrap();
+            });
+            let given_up = Some(ObservedCutover {
+                abandoned: true,
+                ..under_way(Some(StagingProgress::Failed)).unwrap()
+            });
+            assert!(matches!(
+                planned(other, serving(given_up), 0),
+                InstancePlan::Stage { .. }
+            ));
+        }
+
+        #[test]
+        fn stops_first_when_the_instance_writes_to_a_volume() {
+            let with_volume = desired_instance(|instance| {
+                *instance = wanted();
+                instance.scratch = None;
+                instance.volume_id = Some(volume_id());
+            });
+            assert_eq!(
+                planned(with_volume.clone(), serving(None), 0),
+                InstancePlan::FallBack {
+                    desired: with_volume,
+                    reason: CutoverFallback::Volume
+                }
+            );
+        }
+
+        #[test]
+        fn stops_first_when_the_document_names_an_app_by_the_staging_id() {
+            let squatter = desired_instance(|instance| instance.app_id = staging());
+            let result = plan(
+                desired_state(|state| state.instances = vec![wanted(), squatter]),
+                observed_state(|state| state.instances = vec![serving(None)]),
+            );
+            assert_eq!(
+                result.instances[0],
+                InstancePlan::FallBack {
+                    desired: wanted(),
+                    reason: CutoverFallback::NoStagingName
+                }
+            );
+        }
+
+        #[test]
+        fn is_a_plain_replacement_when_nothing_is_up_to_keep_serving() {
+            let down = observed_instance(|instance| {
+                instance.volume_id = None;
+                instance.running = false;
+                instance.exited = true;
+            });
+            assert_eq!(
+                planned(wanted(), down, 0),
+                InstancePlan::Replace { desired: wanted() }
+            );
+        }
+
+        #[test]
+        fn leaves_what_it_booted_alone_while_under_way_and_stops_it_once_it_is_not() {
+            let booted = observed_instance(|instance| {
+                instance.app_id = staging();
+                instance.volume_id = None;
+                instance.deployment_id = Some(new_deployment());
+                instance.staging_for = Some(app_id());
+            });
+            let under_way = plan(
+                desired_state(|state| state.instances = vec![wanted()]),
+                observed_state(|state| {
+                    state.instances = vec![
+                        serving(under_way(Some(StagingProgress::Starting))),
+                        booted.clone(),
+                    ]
+                }),
+            );
+            assert_eq!(under_way.instances.len(), 1);
+            let no_longer = plan(
+                desired_state(|state| {
+                    state.instances = vec![desired_instance(|instance| instance.volume_id = None)]
+                }),
+                observed_state(|state| state.instances = vec![serving(None), booted]),
+            );
+            assert_eq!(
+                no_longer.instances[1],
+                InstancePlan::Stop {
+                    app_id: staging(),
+                    reason: InstanceStopReason::NotDesired
+                }
             );
         }
     }

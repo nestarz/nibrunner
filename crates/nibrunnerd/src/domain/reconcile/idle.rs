@@ -809,6 +809,7 @@ mod sleep_tests {
         ActivationPolicy {
             first_boot: protocol::FirstBoot::Eager,
             snapshot_ttl_ms: None,
+            cutover_timeout_ms: None,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },
@@ -1048,6 +1049,7 @@ mod sleep_tests {
                 ttl_ms: protocol::MaxLifetimeMs::try_from(ttl_ms).unwrap(),
             },
             snapshot_ttl_ms: None,
+            cutover_timeout_ms: None,
         }
     }
 
@@ -1111,6 +1113,7 @@ mod sleep_tests {
             first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::Never,
             snapshot_ttl_ms: None,
+            cutover_timeout_ms: None,
         };
         let host = host_under(never).await;
         last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 * 10).await;

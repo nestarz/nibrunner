@@ -65,6 +65,35 @@ impl VmManager {
         self.start_permits.try_acquire().map_err(|_| VmError::StartBusy)
     }
 
+    fn key_path(&self, app_id: &AppId) -> PathBuf {
+        self.vm_dir.join("keys").join(app_id.as_str())
+    }
+
+    /// The id the microVM answering to `app_id` was booted under: its own, unless a cut-over
+    /// handed the app a microVM booted beside it. That microVM keeps its jail, cgroup, sockets and
+    /// snapshot exchange, all named after the id it was booted under, and the app is mapped onto
+    /// it here. Two apps only ever trade ids with each other, so mapping an id twice gives it back:
+    /// the app a microVM's id answers for is `key` of that id.
+    pub fn key(&self, app_id: &AppId) -> AppId {
+        std::fs::read_to_string(self.key_path(app_id))
+            .ok()
+            .and_then(|key| AppId::parse(key.trim()).ok())
+            .unwrap_or_else(|| app_id.clone())
+    }
+
+    fn write_key(&self, app_id: &AppId, key: &AppId) -> std::io::Result<()> {
+        let path = self.key_path(app_id);
+        if key == app_id {
+            return match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            };
+        }
+        make_directory(path.parent().expect("a key has a directory"), VM_DIR_MODE)?;
+        crate::json_store::write_text(&path, key.as_str(), 0o600)
+            .map_err(|error| std::io::Error::other(error.message()))
+    }
+
     pub fn working_dir_for(&self, app_id: &AppId) -> PathBuf {
         if let Some(record) = self.processes.read_record(app_id) {
             if let Some(root) = record.jail_root {
@@ -204,15 +233,18 @@ impl VmManager {
         Ok(config_file)
     }
 
+    /// `app_id` is the id the microVM runs under; `source` the app its guest speaks for.
     async fn attach_channels(
         &self,
         app_id: &AppId,
+        source: &AppId,
         deployment_id: &protocol::DeploymentId,
         working_dir: &Path,
     ) -> Result<(), VmError> {
         self.logs
-            .attach(
+            .attach_as(
                 app_id.clone(),
+                source.clone(),
                 deployment_id.clone(),
                 tenant_log_socket_path(working_dir),
                 self.sink.clone(),
@@ -221,8 +253,9 @@ impl VmManager {
             .map_err(|error| VmError::Host(error.to_string()))?;
         if let Err(error) = self
             .cron_registration
-            .attach(
+            .attach_as(
                 app_id.clone(),
+                source.clone(),
                 deployment_id.clone(),
                 cron_registration_socket_path(working_dir),
             )
@@ -234,13 +267,20 @@ impl VmManager {
         Ok(())
     }
 
+    /// `request` names the microVM by the id it is booted under.
     async fn stage(&self, request: &BootRequest) -> Result<PreparedVm, VmError> {
+        // What a new deployment booted beside the one serving writes is already that app's.
+        let source = request
+            .staged_for
+            .clone()
+            .unwrap_or_else(|| self.key(&request.desired.app_id));
         let config_file = self.stage_inputs(request).await?;
         #[cfg(not(test))]
         let _ = config_file;
         let jail = self.prepare_jail(&request.desired.app_id).await?;
         self.attach_channels(
             &request.desired.app_id,
+            &source,
             &request.desired.deployment_id,
             &jail.root,
         )
@@ -481,7 +521,8 @@ impl VmManager {
 
     /// Whether this microVM may be snapshotted now, and its share of the disk while it is.
     async fn admit_snapshot(&self, app_id: &AppId) -> Result<Reserved<'_>, String> {
-        let record = self.state.record(app_id).await;
+        // `app_id` is the microVM's; the record is its app's.
+        let record = self.state.record(&self.key(app_id)).await;
         let subject = record.as_ref().map(|record| SleepSubject {
             stop_requested: record.stop_requested,
             desired_running: record.desired_running,
@@ -510,8 +551,9 @@ impl VmManager {
 
 #[async_trait]
 impl Vmm for VmManager {
-    async fn boot(&self, request: BootRequest) -> Result<(), VmError> {
+    async fn boot(&self, mut request: BootRequest) -> Result<(), VmError> {
         let _starting = self.admit_start()?;
+        request.desired.app_id = self.key(&request.desired.app_id);
         let app_id = request.desired.app_id.clone();
         self.discard_snapshot(&app_id);
         let staged = std::time::Instant::now();
@@ -560,45 +602,17 @@ impl Vmm for VmManager {
     }
 
     async fn freeze(&self, app_id: &AppId) -> Result<(), VmError> {
-        if !self
-            .processes
-            .read_record(app_id)
-            .is_some_and(|record| record.jail_root.is_some())
-            || !self.processes.status(app_id).active
-        {
-            return Err(VmError::Host(
-                "only a running jailed microVM can be frozen".into(),
-            ));
-        }
-        // Recorded first, so a daemon that dies half way readopts a guest it must not route to.
-        self.processes
-            .remember_frozen(app_id, true)
-            .map_err(|error| VmError::Host(error.to_string()))?;
-        // The VMM alone is paused: a paused guest runs nothing, so its tenant needs no hold, and
-        // kvmclock reads the host's clock again on the guest's first instruction after the
-        // resume, so the thaw needs no clock step either.
-        if let Err(error) = self.api(app_id).pause().await {
-            let _ = self.processes.remember_frozen(app_id, false);
-            return Err(error);
-        }
-        if let Some(cgroup) = self.processes.cgroup(app_id) {
-            if let Err(error) = super::limits::reclaim(&cgroup, FROZEN_RECLAIM_BYTES).await {
-                tracing::debug!(%app_id, %error, "a frozen microVM's memory reclaim was incomplete");
-            }
-        }
-        Ok(())
+        self.freeze_vm(&self.key(app_id)).await
     }
 
     async fn thaw(&self, app_id: &AppId) -> Result<(), VmError> {
-        self.api(app_id).resume().await?;
-        self.processes
-            .remember_frozen(app_id, false)
-            .map_err(|error| VmError::Host(error.to_string()))
+        self.thaw_vm(&self.key(app_id)).await
     }
 
-    async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError> {
+    async fn sleep(&self, mut request: SuspendRequest) -> Result<(), VmError> {
+        request.app_id = self.key(&request.app_id);
         if self.processes.status(&request.app_id).frozen {
-            self.thaw(&request.app_id).await?;
+            self.thaw_vm(&request.app_id).await?;
         }
         // Held to the end, whichever way the snapshot goes: only once it is on the disk does
         // the next measurement count it, and only once it has failed is the room free again.
@@ -658,7 +672,8 @@ impl Vmm for VmManager {
         Ok(())
     }
 
-    async fn wake(&self, request: SuspendRequest) -> Result<(), VmError> {
+    async fn wake(&self, mut request: SuspendRequest) -> Result<(), VmError> {
+        request.app_id = self.key(&request.app_id);
         let _starting = self.admit_start()?;
         let paths = snapshot_paths(&self.snapshot_dir, &request.app_id);
         let expected = self.current_stamp(&request);
@@ -686,7 +701,7 @@ impl Vmm for VmManager {
 
         let _ = std::fs::remove_file(&paths.stamp_path);
         let mut jail = self.prepare_jail(&request.app_id).await?;
-        self.readopt(&request.app_id).await?;
+        self.readopt_vm(&request.app_id).await?;
         jail.grant_socket(&tenant_log_socket_path(&jail.root))
             .map_err(|error| VmError::Host(error.to_string()))?;
         jail.grant_socket(&cron_registration_socket_path(&jail.root))
@@ -750,6 +765,7 @@ impl Vmm for VmManager {
     }
 
     async fn stop(&self, app_id: &AppId) -> Result<(), VmError> {
+        let app_id = &self.key(app_id);
         self.discard_snapshot(app_id);
         self.processes.stop(app_id).await;
         if let Err(error) = super::scratch::remove_disk(&self.scratch_disk_path(app_id)) {
@@ -759,6 +775,17 @@ impl Vmm for VmManager {
     }
 
     async fn discard(&self, app_id: &AppId) -> Result<(), VmError> {
+        let owner = app_id;
+        let app_id = &self.key(owner);
+        // Once neither of two apps that traded microVMs holds one, the trade is undone: the next
+        // microVM of each is booted under its own id again.
+        if app_id != owner
+            && self.processes.read_record(owner).is_none()
+            && !snapshot_paths(&self.snapshot_dir, owner).stamp_path.exists()
+        {
+            let _ = self.write_key(owner, owner);
+            let _ = self.write_key(app_id, app_id);
+        }
         self.discard_snapshot(app_id);
         self.processes.forget(app_id);
         self.logs.detach(app_id).await;
@@ -787,18 +814,26 @@ impl Vmm for VmManager {
     async fn statuses(&self, app_ids: &[AppId]) -> std::collections::BTreeMap<AppId, VmStatus> {
         app_ids
             .iter()
-            .map(|app_id| (app_id.clone(), self.processes.status(app_id)))
+            .map(|app_id| (app_id.clone(), self.processes.status(&self.key(app_id))))
             .collect()
     }
 
     async fn adopted_app_ids(&self) -> Vec<AppId> {
-        self.processes.adopted_app_ids()
+        self.processes
+            .adopted_app_ids()
+            .iter()
+            .map(|key| self.key(key))
+            .collect()
     }
 
     async fn memory(&self, app_ids: &[AppId]) -> std::collections::BTreeMap<AppId, protocol::ReportedMemory> {
         app_ids
             .iter()
-            .filter_map(|id| self.processes.memory(id).map(|memory| (id.clone(), memory)))
+            .filter_map(|id| {
+                self.processes
+                    .memory(&self.key(id))
+                    .map(|memory| (id.clone(), memory))
+            })
             .collect()
     }
 
@@ -808,6 +843,7 @@ impl Vmm for VmManager {
         resources: protocol::InstanceResources,
         limits: Option<protocol::InstanceLimits>,
     ) -> Result<(), VmError> {
+        let app_id = &self.key(app_id);
         let Some(record) = self
             .processes
             .read_record(app_id)
@@ -824,18 +860,105 @@ impl Vmm for VmManager {
     }
 
     fn holds_snapshot(&self, app_id: &AppId) -> bool {
-        snapshot_paths(&self.snapshot_dir, app_id).stamp_path.exists()
+        snapshot_paths(&self.snapshot_dir, &self.key(app_id))
+            .stamp_path
+            .exists()
     }
 
     async fn readopt(&self, app_id: &AppId) -> Result<(), VmError> {
+        self.readopt_vm(&self.key(app_id)).await
+    }
+
+    async fn guest_verdict(&self, app_id: &AppId) -> Option<String> {
+        let console = std::fs::read_to_string(self.processes.console_path(&self.key(app_id))).ok()?;
+        guest_contract::control::exit_reason(&console)
+    }
+
+    fn working_dir(&self, app_id: &AppId) -> PathBuf {
+        self.working_dir_for(&self.key(app_id))
+    }
+
+    async fn expire_snapshot(&self, app_id: &AppId, kept_for: std::time::Duration) -> bool {
+        let app_id = &self.key(app_id);
+        let paths = snapshot_paths(&self.snapshot_dir, app_id);
+        // The stamp is the last thing a sleep writes and a wake removes, so its age is how long
+        // the snapshot has been waiting to be woken from.
+        let Ok(written) = std::fs::metadata(&paths.stamp_path).and_then(|info| info.modified()) else {
+            return false;
+        };
+        if written.elapsed().unwrap_or_default() < kept_for {
+            return false;
+        }
+        let bytes = super::snapshot::read_snapshot_bytes(&paths.directory);
+        self.discard_snapshot(app_id);
+        tracing::info!(
+            %app_id,
+            bytes,
+            "a snapshot kept past its snapshotTtlMs was deleted; the next request boots the app afresh"
+        );
+        true
+    }
+
+    async fn exchange(&self, first: &AppId, second: &AppId) -> Result<(), VmError> {
+        let (first_key, second_key) = (self.key(first), self.key(second));
+        self.write_key(first, &second_key)
+            .and_then(|()| self.write_key(second, &first_key))
+            .map_err(|error| VmError::Host(format!("the microVMs could not trade apps: {error}")))
+    }
+}
+
+impl VmManager {
+    /// Pauses the microVM run under `app_id`.
+    async fn freeze_vm(&self, app_id: &AppId) -> Result<(), VmError> {
+        if !self
+            .processes
+            .read_record(app_id)
+            .is_some_and(|record| record.jail_root.is_some())
+            || !self.processes.status(app_id).active
+        {
+            return Err(VmError::Host(
+                "only a running jailed microVM can be frozen".into(),
+            ));
+        }
+        // Recorded first, so a daemon that dies half way readopts a guest it must not route to.
+        self.processes
+            .remember_frozen(app_id, true)
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        // The VMM alone is paused: a paused guest runs nothing, so its tenant needs no hold, and
+        // kvmclock reads the host's clock again on the guest's first instruction after the
+        // resume, so the thaw needs no clock step either.
+        if let Err(error) = self.api(app_id).pause().await {
+            let _ = self.processes.remember_frozen(app_id, false);
+            return Err(error);
+        }
+        if let Some(cgroup) = self.processes.cgroup(app_id) {
+            if let Err(error) = super::limits::reclaim(&cgroup, FROZEN_RECLAIM_BYTES).await {
+                tracing::debug!(%app_id, %error, "a frozen microVM's memory reclaim was incomplete");
+            }
+        }
+        Ok(())
+    }
+
+    /// Resumes the microVM run under `app_id`.
+    async fn thaw_vm(&self, app_id: &AppId) -> Result<(), VmError> {
+        self.api(app_id).resume().await?;
+        self.processes
+            .remember_frozen(app_id, false)
+            .map_err(|error| VmError::Host(error.to_string()))
+    }
+
+    /// Takes back up a microVM by the id it runs under, `app_id`.
+    async fn readopt_vm(&self, app_id: &AppId) -> Result<(), VmError> {
         // The deployment its output should be stamped with is the one the record remembers. A
         // guest this host holds no record of has nothing to attribute its lines to, so it is left
         // for the reconcile pass, which discards a microVM it was never told to keep.
-        let Some(record) = self.state.record(app_id).await else {
+        let owner = self.key(app_id);
+        let Some(record) = self.state.record(&owner).await else {
             return Ok(());
         };
+        let source = record.staging_for.clone().unwrap_or(owner);
         let working_dir = self.working_dir_for(app_id);
-        self.attach_channels(app_id, &record.deployment_id, &working_dir)
+        self.attach_channels(app_id, &source, &record.deployment_id, &working_dir)
             .await?;
         if self
             .processes
@@ -868,35 +991,6 @@ impl Vmm for VmManager {
             }
         }
         Ok(())
-    }
-
-    async fn guest_verdict(&self, app_id: &AppId) -> Option<String> {
-        let console = std::fs::read_to_string(self.processes.console_path(app_id)).ok()?;
-        guest_contract::control::exit_reason(&console)
-    }
-
-    fn working_dir(&self, app_id: &AppId) -> PathBuf {
-        self.working_dir_for(app_id)
-    }
-
-    async fn expire_snapshot(&self, app_id: &AppId, kept_for: std::time::Duration) -> bool {
-        let paths = snapshot_paths(&self.snapshot_dir, app_id);
-        // The stamp is the last thing a sleep writes and a wake removes, so its age is how long
-        // the snapshot has been waiting to be woken from.
-        let Ok(written) = std::fs::metadata(&paths.stamp_path).and_then(|info| info.modified()) else {
-            return false;
-        };
-        if written.elapsed().unwrap_or_default() < kept_for {
-            return false;
-        }
-        let bytes = super::snapshot::read_snapshot_bytes(&paths.directory);
-        self.discard_snapshot(app_id);
-        tracing::info!(
-            %app_id,
-            bytes,
-            "a snapshot kept past its snapshotTtlMs was deleted; the next request boots the app afresh"
-        );
-        true
     }
 }
 
@@ -1406,6 +1500,7 @@ mod tests {
 
     fn boot_request(desired: protocol::DesiredInstance) -> BootRequest {
         BootRequest {
+            staged_for: None,
             slot: nft_render::describe_slot(0, desired.app_id.clone()),
             desired,
             writable: Writable::Volume {
@@ -1753,6 +1848,78 @@ mod tests {
         assert!(error.message().contains("SHA-256"), "{error}");
         assert!(fixture.manager.processes.read_record(&app_id()).is_none());
         assert!(!paths.directory.exists());
+    }
+
+    fn running_under(fixture: &Fixture, key: &AppId) {
+        fixture
+            .manager
+            .processes
+            .write_record(&crate::adapters::vm::process::VmRecord {
+                frozen: false,
+                app_id: key.clone(),
+                pid: std::process::id() as i32,
+                host_boot_id: fixture.manager.processes.boot_id().into(),
+                started_at_ms: 0,
+                exit_code: None,
+                signal: None,
+                stop_requested: false,
+                jail_root: None,
+                jail_uid: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_app_handed_the_microvm_booted_beside_it_reaches_that_microvm_by_its_own_id() {
+        let fixture = fixture();
+        let staging = AppId::parse("app-1--next").unwrap();
+        running_under(&fixture, &staging);
+
+        fixture.manager.exchange(&app_id(), &staging).await.unwrap();
+
+        assert_eq!(fixture.manager.key(&app_id()), staging);
+        assert_eq!(fixture.manager.key(&staging), app_id());
+        assert_eq!(
+            fixture.manager.working_dir(&app_id()),
+            fixture.manager.working_dir_for(&staging)
+        );
+        assert!(fixture.manager.statuses(&[app_id()]).await[&app_id()].loaded);
+        assert!(!fixture.manager.statuses(std::slice::from_ref(&staging)).await[&staging].loaded);
+        assert_eq!(fixture.manager.adopted_app_ids().await, vec![app_id()]);
+    }
+
+    #[tokio::test]
+    async fn a_trade_is_kept_while_either_app_holds_a_microvm_and_undone_once_neither_does() {
+        let fixture = fixture();
+        let staging = AppId::parse("app-1--next").unwrap();
+        running_under(&fixture, &staging);
+        fixture.manager.exchange(&app_id(), &staging).await.unwrap();
+
+        // The old deployment, now under the staging id, goes; the app keeps what it was handed,
+        // and the next deployment booted beside it lands on the id the old one left free.
+        fixture.manager.discard(&staging).await.unwrap();
+        assert_eq!(fixture.manager.key(&app_id()), staging);
+        assert_eq!(fixture.manager.key(&staging), app_id());
+
+        fixture.manager.discard(&app_id()).await.unwrap();
+        assert_eq!(fixture.manager.key(&app_id()), app_id());
+        assert_eq!(fixture.manager.key(&staging), staging);
+    }
+
+    #[tokio::test]
+    async fn a_deployment_booted_beside_the_serving_one_is_listened_for_under_its_own_id() {
+        let fixture = fixture();
+        let staging = AppId::parse("app-1--next").unwrap();
+        fixture
+            .manager
+            .stage(&BootRequest {
+                staged_for: Some(app_id()),
+                ..boot_request(desired_instance(|instance| instance.app_id = staging.clone()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(fixture.manager.logs.attached().await, vec![staging.clone()]);
+        assert_eq!(fixture.manager.cron_registration.attached().await, vec![staging]);
     }
 
     #[tokio::test]

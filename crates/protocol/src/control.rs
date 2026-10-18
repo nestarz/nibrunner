@@ -424,6 +424,7 @@ impl DesiredInstance {
             },
             first_boot: FirstBoot::Eager,
             snapshot_ttl_ms: None,
+            cutover_timeout_ms: None,
         })
     }
 
@@ -744,6 +745,35 @@ pub struct ReportedInstance {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+    /// How this app's last new deployment went when it asked for a cut-over and did not get a
+    /// clean one. Absent after a clean cut-over, and for an instance that never asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover: Option<CutoverOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+pub enum CutoverOutcome {
+    /// The old deployment was stopped before the one reported started.
+    Fallback { reason: CutoverFallback },
+    /// `deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the
+    /// deployment reported keeps serving, and the named one is not tried again.
+    Abandoned { deployment_id: DeploymentId },
+}
+
+/// Why a deployment that asked to be cut over to was started only once the old one was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum CutoverFallback {
+    /// Two guests cannot write one disk, so the old one has to let go of it first.
+    Volume,
+    /// The host had no room to boot it beside the old one within `cutoverTimeoutMs`.
+    NoRoom,
+    /// The id it would be booted under beside the old one (the app id with `--next` after it) is
+    /// named by another app in the document, or longer than an app id may be.
+    NoStagingName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

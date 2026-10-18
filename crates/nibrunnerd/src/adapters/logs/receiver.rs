@@ -49,10 +49,24 @@ impl TenantLogReceiver {
         socket_path: PathBuf,
         sink: Arc<dyn LogSink>,
     ) -> std::io::Result<()> {
+        self.attach_as(app_id.clone(), app_id, deployment_id, socket_path, sink)
+            .await
+    }
+
+    /// Listens for the guest of the microVM run under `app_id`, and says what it writes is
+    /// `source`'s: the same app, unless the microVM is a new deployment booted beside `source`.
+    pub async fn attach_as(
+        self: &Arc<Self>,
+        app_id: AppId,
+        source: AppId,
+        deployment_id: DeploymentId,
+        socket_path: PathBuf,
+        sink: Arc<dyn LogSink>,
+    ) -> std::io::Result<()> {
         let mut attachments = self.attachments.lock().await;
         if let Some(existing) = attachments.get(&app_id) {
             if existing.socket_path == socket_path {
-                *existing.source.lock().await = (app_id, deployment_id);
+                *existing.source.lock().await = (source, deployment_id);
                 return Ok(());
             }
         }
@@ -65,7 +79,7 @@ impl TenantLogReceiver {
         }
         let _ = std::fs::remove_file(&socket_path);
         let listener = crate::unix_socket::bind(&socket_path)?;
-        let source = Arc::new(Mutex::new((app_id.clone(), deployment_id)));
+        let source = Arc::new(Mutex::new((source, deployment_id)));
         let (detached, detaching) = watch::channel(());
         let task = tokio::spawn(serve(listener, source.clone(), sink, detaching));
         attachments.insert(
