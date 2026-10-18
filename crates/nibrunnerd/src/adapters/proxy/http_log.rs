@@ -44,6 +44,8 @@ pub struct HttpRequestRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     cache: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     encoding: Option<&'static str>,
 }
 
