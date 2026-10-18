@@ -360,6 +360,7 @@ async fn a_document_this_host_refused_changes_nothing_about_the_app_it_is_alread
     let refused = host.document(std::slice::from_ref(&app.clone().edited(|instance| {
         instance.desired_state = DesiredInstanceState::Running;
         instance.activation = Some(protocol::ActivationPolicy {
+            first_boot: protocol::FirstBoot::Eager,
             sleep_when: protocol::SleepPolicy::TrafficIdle {
                 timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
             },
@@ -438,5 +439,33 @@ async fn an_app_the_document_stopped_has_no_microvm_of_its_own_left_running() {
         "a stopped app still has a microVM: {statuses:?}"
     );
 
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lazy_instance_is_routed_without_booting_and_its_first_request_boots_it() {
+    let Some(host) = crate::host().await else {
+        return;
+    };
+    let app = host.tenant(1).on_request(60_000).edited(|instance| {
+        instance.idle_timeout_ms = None;
+        instance.activation = Some(protocol::ActivationPolicy {
+            first_boot: protocol::FirstBoot::Lazy,
+            sleep_when: protocol::SleepPolicy::TrafficIdle {
+                timeout_ms: protocol::DEFAULT_IDLE_TIMEOUT,
+            },
+        });
+    });
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Idle).await;
+    let processes = nibrunnerd::adapters::vm::process::VmProcesses::new(host.host.config.runtime_dir.clone());
+    assert!(processes.read_record(&app.app_id).is_none(), "nothing was booted");
+
+    let answer = host.get(&app, "/").await.expect("the first request is answered");
+    assert_eq!(answer.status, 200);
+    assert!(
+        processes.read_record(&app.app_id).is_some(),
+        "the request booted it"
+    );
     host.stop().await;
 }

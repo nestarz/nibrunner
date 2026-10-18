@@ -9,7 +9,8 @@ use protocol::{DesiredLayer, DownloadUrl, OciSource, Sha256Digest, TarEntry, Zip
 
 use crate::json_store::make_directory;
 use crate::ports::{
-    ArtifactError, ArtifactStore, ArtifactStoreExt, CommandRunner, PayloadBuilder, PreparedPayload,
+    ArtifactError, ArtifactStore, ArtifactStoreExt, CommandRunner, LayerRetention, PayloadBuilder,
+    PreparedPayload, RetainedLayers,
 };
 
 mod oci;
@@ -117,6 +118,9 @@ pub struct LayerImages {
     store: Arc<dyn ArtifactStore>,
     cache_dir: PathBuf,
     commands: Arc<dyn CommandRunner>,
+    max_bytes: Option<u64>,
+    // A prune holds it whole, a prepare shares it, so no layer is removed from under a boot.
+    access: tokio::sync::RwLock<()>,
 }
 
 impl LayerImages {
@@ -125,17 +129,140 @@ impl LayerImages {
         cache_dir: PathBuf,
         commands: Arc<dyn CommandRunner>,
     ) -> Arc<Self> {
+        Self::bounded(store, cache_dir, commands, None)
+    }
+
+    pub fn bounded(
+        store: Arc<dyn ArtifactStore>,
+        cache_dir: PathBuf,
+        commands: Arc<dyn CommandRunner>,
+        max_bytes: Option<u64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             cache_dir,
             commands,
+            max_bytes,
+            access: tokio::sync::RwLock::new(()),
         })
     }
 }
 
+// A start prepares its layers and only then hands them to Firecracker, outside the lock a prune
+// takes, and a cold boot from a wake does so before its record says it is starting. A layer
+// touched this recently is one a boot may be about to open, so no cap evicts it.
+const RECENTLY_PREPARED: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One digest's directory in the cache: what it holds, and when a prepare last touched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedLayer {
+    digest: Sha256Digest,
+    bytes: u64,
+    last_used: std::time::SystemTime,
+}
+
+/// The layers a cap takes, least recently used first, until what is left fits under it. A pinned
+/// layer, or one a boot may be opening, is never taken, even when the cache stays over the cap.
+fn evictions<'a>(
+    held: &'a [CachedLayer],
+    pinned: &std::collections::BTreeSet<Sha256Digest>,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+) -> Vec<&'a CachedLayer> {
+    let mut total: u64 = held.iter().map(|layer| layer.bytes).sum();
+    let mut coldest_first: Vec<&CachedLayer> = held
+        .iter()
+        .filter(|layer| !pinned.contains(&layer.digest))
+        .filter(|layer| now.duration_since(layer.last_used).unwrap_or_default() >= RECENTLY_PREPARED)
+        .collect();
+    coldest_first.sort_by_key(|layer| layer.last_used);
+    coldest_first
+        .into_iter()
+        .take_while(|layer| {
+            let over = total > max_bytes;
+            total = total.saturating_sub(layer.bytes);
+            over
+        })
+        .collect()
+}
+
+fn measure(directory: &Path, digest: Sha256Digest) -> std::io::Result<CachedLayer> {
+    let mut layer = CachedLayer {
+        digest,
+        bytes: 0,
+        last_used: std::time::SystemTime::UNIX_EPOCH,
+    };
+    for entry in std::fs::read_dir(directory)? {
+        let metadata = entry?.metadata()?;
+        layer.bytes += metadata.len();
+        layer.last_used = layer.last_used.max(metadata.modified()?);
+    }
+    Ok(layer)
+}
+
+fn remove(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+fn prune(
+    cache_dir: &Path,
+    retention: &LayerRetention,
+    max_bytes: Option<u64>,
+) -> std::io::Result<RetainedLayers> {
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(RetainedLayers::default()),
+        Err(error) => return Err(error),
+    };
+    let mut held = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(digest) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| Sha256Digest::parse(name).ok())
+        else {
+            continue;
+        };
+        if !retention.named.contains(&digest) {
+            remove(&entry.path())?;
+        } else if entry.file_type()?.is_dir() {
+            held.push(measure(&entry.path(), digest)?);
+        }
+    }
+    let mut retained = RetainedLayers {
+        held_bytes: held.iter().map(|layer| layer.bytes).sum(),
+        evicted: 0,
+    };
+    let Some(max_bytes) = max_bytes else {
+        return Ok(retained);
+    };
+    for layer in evictions(&held, &retention.pinned, max_bytes, std::time::SystemTime::now()) {
+        std::fs::remove_dir_all(cache_dir.join(layer.digest.as_str()))?;
+        retained.held_bytes -= layer.bytes;
+        retained.evicted += 1;
+        tracing::info!(digest = %layer.digest, bytes = layer.bytes, "layer evicted from the cache to keep it under cache_max_gib");
+    }
+    Ok(retained)
+}
+
 #[async_trait]
 impl PayloadBuilder for LayerImages {
+    async fn retain(&self, retention: &LayerRetention) -> Result<RetainedLayers, ArtifactError> {
+        let _access = self.access.write().await;
+        let (cache_dir, retention, max_bytes) = (self.cache_dir.clone(), retention.clone(), self.max_bytes);
+        tokio::task::spawn_blocking(move || prune(&cache_dir, &retention, max_bytes))
+            .await
+            .map_err(|error| ArtifactError::Transfer(error.to_string()))?
+            .map_err(|error| ArtifactError::Transfer(error.to_string()))
+    }
+
     async fn prepare(&self, layers: &[DesiredLayer]) -> Result<PreparedPayload, ArtifactError> {
+        let _access = self.access.read().await;
         let mut layer_image_paths = Vec::with_capacity(layers.len());
         let mut fetched_bytes = 0;
         for layer in layers {
@@ -852,5 +979,121 @@ mod tests {
         prepare_layer(&store, directory.path(), &layer).await.unwrap();
         let again = prepare_layer(&store, directory.path(), &layer).await.unwrap();
         assert_eq!(again.fetched_bytes, 0);
+    }
+
+    fn cached(digest: char, bytes: u64, idle_for_secs: u64, now: std::time::SystemTime) -> CachedLayer {
+        CachedLayer {
+            digest: Sha256Digest::parse(digest.to_string().repeat(64)).unwrap(),
+            bytes,
+            last_used: now - std::time::Duration::from_secs(idle_for_secs),
+        }
+    }
+
+    #[test]
+    fn a_cap_takes_the_least_recently_used_layers_until_what_is_left_fits() {
+        let now = std::time::SystemTime::now();
+        let held = [
+            cached('a', 40, 600, now),
+            cached('b', 40, 6_000, now),
+            cached('c', 40, 3_000, now),
+        ];
+        let taken: Vec<_> = evictions(&held, &Default::default(), 60, now)
+            .into_iter()
+            .map(|layer| layer.digest.clone())
+            .collect();
+        assert_eq!(taken, vec![held[1].digest.clone(), held[2].digest.clone()]);
+        assert!(
+            evictions(&held, &Default::default(), 120, now).is_empty(),
+            "a cache at its cap is left alone"
+        );
+    }
+
+    #[test]
+    fn a_layer_an_app_stands_on_or_a_boot_may_be_opening_is_kept_even_over_the_cap() {
+        let now = std::time::SystemTime::now();
+        let held = [
+            cached('a', 40, 6_000, now),
+            cached('b', 40, 5, now),
+            cached('c', 40, 3_000, now),
+        ];
+        let pinned = [held[0].digest.clone()].into();
+        let taken: Vec<_> = evictions(&held, &pinned, 0, now)
+            .into_iter()
+            .map(|layer| layer.digest.clone())
+            .collect();
+        assert_eq!(taken, vec![held[2].digest.clone()]);
+    }
+
+    fn backdate(directory: &Path, by_secs: u64) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(by_secs);
+        for entry in std::fs::read_dir(directory).unwrap() {
+            std::fs::File::options()
+                .write(true)
+                .open(entry.unwrap().path())
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(then))
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_capped_cache_evicts_the_coldest_named_layer_and_fetches_it_again_when_asked() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::ports::MockArtifactStore::new();
+        store.expect_read().returning(|key| {
+            Ok(if key == &base_layer().stored_object().unwrap().object_key {
+                BASE_LAYER_BYTES.to_vec()
+            } else {
+                ARTIFACT_BYTES.to_vec()
+            })
+        });
+        let images = LayerImages::bounded(
+            Arc::new(store),
+            directory.path().to_path_buf(),
+            mocks::commands_succeeding().0,
+            Some(1),
+        );
+        let both = images.prepare(&[base_layer(), layer(|_| {})]).await.unwrap();
+        backdate(both.layer_image_paths[0].parent().unwrap(), 7_200);
+        backdate(both.layer_image_paths[1].parent().unwrap(), 3_600);
+        let retention = LayerRetention {
+            named: [base_layer().digest().clone(), layer(|_| {}).digest().clone()].into(),
+            pinned: [layer(|_| {}).digest().clone()].into(),
+        };
+
+        let retained = images.retain(&retention).await.unwrap();
+
+        assert_eq!(retained.evicted, 1);
+        assert!(!both.layer_image_paths[0].exists());
+        assert!(
+            both.layer_image_paths[1].exists(),
+            "a pinned layer outlives the cap"
+        );
+        assert_eq!(
+            retained.held_bytes,
+            std::fs::metadata(&both.layer_image_paths[1]).unwrap().len()
+        );
+        let again = images.prepare(&[base_layer()]).await.unwrap();
+        assert_eq!(again.fetched_bytes, BASE_LAYER_BYTES.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_layer_no_document_or_record_names_is_removed_and_a_named_one_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let images = LayerImages::new(
+            store(artifact_bytes()),
+            directory.path().to_path_buf(),
+            mocks::commands_succeeding().0,
+        );
+        let path = images.prepare(&[layer(|_| {})]).await.unwrap().layer_image_paths[0].clone();
+        let named = LayerRetention {
+            named: [layer(|_| {}).digest().clone()].into(),
+            pinned: Default::default(),
+        };
+        images.retain(&named).await.unwrap();
+        assert!(path.exists(), "a named layer is kept");
+        images.retain(&LayerRetention::default()).await.unwrap();
+        assert!(!path.exists(), "an unnamed layer is gone");
+        images.retain(&LayerRetention::default()).await.unwrap();
     }
 }

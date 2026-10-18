@@ -14,7 +14,7 @@ after how long, is set per instance in `desired.json`.
 | `desiredState` | Behaviour |
 | --- | --- |
 | `running` | Keep the microVM up. |
-| `on-request` | Start it on first deploy and on every request that arrives while it sleeps. Let it sleep in between. |
+| `on-request` | Start it on first deploy (or on its first request, with a [lazy first boot](#first-boot)) and on every request that arrives while it sleeps. Let it sleep in between. |
 | `stopped` | Stop the microVM. Requests to its hostnames get a 503. |
 
 ## When it sleeps
@@ -105,6 +105,32 @@ lease can release it under a host that still holds it frozen. A frozen VM that w
 not left paused for the next request to find the same way: the host stops it and boots the app
 from cold, and the request waits for that boot. One whose deployment is being replaced is left to the
 replacement instead, and the request waits for the new deployment to answer.
+## First boot
+
+`activation.firstBoot` says whether an `on-request` instance is booted once it is declared:
+
+```json
+{
+  "desiredState": "on-request",
+  "activation": {
+    "sleepWhen": { "kind": "traffic-idle", "timeoutMs": 900000 },
+    "firstBoot": "lazy"
+  }
+}
+```
+
+| `firstBoot` | On declaration |
+| --- | --- |
+| `eager` (default) | The host boots it, as it boots a `running` instance. |
+| `lazy` | The host fetches its layers and routes its hostnames, but holds no memory for it and boots nothing. It reports `idle`, and its first request boots it as a wake with no snapshot does. |
+
+A new `deploymentId` for a lazy instance that is not up replaces the declaration without booting
+it. Its `expiry` runs from the declaration, booted or not.
+
+<Callout title="Note">
+  Only an `on-request` instance may set `firstBoot: lazy`: no request would ever boot anything
+  else. A file that does this is rejected as a whole.
+</Callout>
 
 ## What wakes it
 

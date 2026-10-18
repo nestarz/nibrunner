@@ -64,6 +64,14 @@ does the fetching.
 A layer is downloaded once per host and cached by digest. Ten apps on the same base image share
 one copy.
 
+Downloaded layers are cached by digest. Apps on the same host share cached layers. A layer that
+neither the document nor any instance record names is removed after each pass. With
+`[artifacts] cache_max_gib`, the least recently used layers past the cap are evicted too, unless an
+app that is up, frozen or asleep on a snapshot stands on them; an evicted layer is fetched again by
+the next boot that needs it. `nibrunner_layer_cache_bytes` and `nibrunner_layer_evictions_total`
+report the cache. A `firstBoot: lazy` instance's layers are fetched by the request that first
+wakes it, not at declaration.
+
 ## The volume
 
 The volume is the writable top of the stack. Every write goes there and persists. Nothing else

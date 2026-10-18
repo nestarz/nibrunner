@@ -486,6 +486,18 @@
     "name": "nibrunner_layer_fetch_bytes_total"
   },
   {
+    "help": "What the layer cache held on disk once the last pass pruned it.",
+    "kind": "gauge",
+    "labels": [],
+    "name": "nibrunner_layer_cache_bytes"
+  },
+  {
+    "help": "Layers the cache evicted to stay under cache_max_gib: each is fetched again by the next boot that needs it.",
+    "kind": "counter",
+    "labels": [],
+    "name": "nibrunner_layer_evictions_total"
+  },
+  {
     "help": "1 for the state a volume is in, 0 for every state it is not.",
     "kind": "gauge",
     "labels": [

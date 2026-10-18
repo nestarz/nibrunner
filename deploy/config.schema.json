@@ -110,6 +110,12 @@
       "description": "One store, in S3 or on this disk.",
       "type": "object",
       "properties": {
+        "cache_max_gib": {
+          "description": "What the layer cache may hold, in GiB. Past it the least recently used layers that no\nrunning, frozen or snapshotted app stands on are evicted, and fetched again on the next\nwake that needs them. Absent keeps every layer the document names.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
         "store_url": {
           "description": "`s3://bucket[/prefix]`, or an absolute path.",
           "type": "string",
