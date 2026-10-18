@@ -380,7 +380,7 @@ impl VmManager {
     async fn resume_frozen_tenant(&self, app_id: &AppId, control: &Path) {
         let recovered = async {
             self.api(app_id).resume().await?;
-            time_sync::wake(control)
+            time_sync::release_after_refused_sleep(control)
                 .await
                 .map(drop)
                 .map_err(|stalled| VmError::Host(stalled.to_string()))
@@ -565,7 +565,7 @@ impl Vmm for VmManager {
             .working_dir_for(&request.app_id)
             .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
         if let Err(error) = time_sync::freeze_tenant(&control).await {
-            if let Err(recovery) = time_sync::wake(&control).await {
+            if let Err(recovery) = time_sync::release_after_refused_sleep(&control).await {
                 tracing::warn!(app_id = %request.app_id, error = %recovery, "guest clock recovery failed after sleep refusal");
             }
             return Err(error);

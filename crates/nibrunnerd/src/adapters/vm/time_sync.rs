@@ -143,13 +143,27 @@ async fn freeze_connected_tenant(path: &Path) -> Result<(), VmError> {
 /// Sets a resumed guest's clock and releases its tenant: the dial, then the sync, each within its
 /// own budget, so a wake that stalls says where.
 pub(super) async fn wake(path: &Path) -> Result<Synced, WakeStalled> {
+    wake_within(path, DIAL_BUDGET, SYNC_BUDGET).await
+}
+
+/// The same release for a guest the host froze for a sleep that was then refused: it may still be
+/// draining requests, so it is given the freeze exchange's patience rather than a wake's budgets.
+pub(super) async fn release_after_refused_sleep(path: &Path) -> Result<Synced, WakeStalled> {
+    wake_within(path, FREEZE_TIMEOUT, FREEZE_TIMEOUT).await
+}
+
+async fn wake_within(
+    path: &Path,
+    dial_budget: Duration,
+    sync_budget: Duration,
+) -> Result<Synced, WakeStalled> {
     let dialing = Instant::now();
-    let mut wire = dial(path, DIAL_BUDGET)
+    let mut wire = dial(path, dial_budget)
         .await
         .map_err(|reason| WakeStalled::new(WakePhase::Dial, reason))?;
     let dial = dialing.elapsed();
     let syncing = Instant::now();
-    release_connected_tenant(&mut wire, syncing + SYNC_BUDGET)
+    release_connected_tenant(&mut wire, syncing + sync_budget, sync_budget)
         .await
         .map_err(|reason| WakeStalled::new(WakePhase::Sync, reason))?;
     Ok(Synced {
@@ -158,11 +172,15 @@ pub(super) async fn wake(path: &Path) -> Result<Synced, WakeStalled> {
     })
 }
 
-async fn release_connected_tenant(wire: &mut BufReader<UnixStream>, deadline: Instant) -> Result<(), String> {
+async fn release_connected_tenant(
+    wire: &mut BufReader<UnixStream>,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<(), String> {
     use guest_contract::control::{
         TENANT_CLOCK_READY, TENANT_CLOCK_RELEASE, TENANT_CLOCK_RELEASED, TENANT_CLOCK_REQUEST,
     };
-    let budget = millis(SYNC_BUDGET);
+    let budget = millis(budget);
     wire.get_mut()
         .write_all(format!("{TENANT_CLOCK_REQUEST}\n").as_bytes())
         .await
