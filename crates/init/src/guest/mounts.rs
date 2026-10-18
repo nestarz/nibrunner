@@ -227,7 +227,8 @@ pub(crate) fn volume(device: &str, target: &str) -> Result<(), MountFailed> {
         target,
         "ext4",
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME,
-        None,
+        // Online discard: a freed block becomes a hole in the host's file at once.
+        Some("discard"),
         Existing::Refuse,
     )
 }

@@ -239,6 +239,18 @@ in desired state supplies both values; no additional host configuration is neede
 | Memory | `memoryMib` plus 64 MiB and 12.5% of guest RAM for Firecracker and kernel overhead. |
 | Swap | Disabled for the VM process. |
 
+Guest memory is backed by transparent huge pages (Firecracker's `huge_pages: Transparent`), which
+cuts the TLB misses and page walks of a runtime touching hundreds of MiB. Firecracker then needs
+`memoryMib` to be a multiple of 2, and a document with an odd one is refused. The host must not
+set `/sys/kernel/mm/transparent_hugepage/enabled` to `never`; `nibrunnerd install` checks it
+(`madvise`, Debian's default, and `always` both work).
+
+Not taken, on purpose: explicit `2M` hugetlbfs pages, which need a pool sized ahead and fail a
+guest with `SIGBUS` when it runs out, the opposite of admitting by measured memory; diff snapshots
+with dirty-page tracking, which would map huge-page memory at 4 KiB; virtio-mem, since memory is
+sized by admission, not hot-plugged; and the `Async` block engine, which Firecracker does not call
+ready for production.
+
 For example, a VM with 1 vCPU and 256 MiB of guest RAM has a 100% CPU ceiling and
 a 352 MiB host memory ceiling. CPU limits throttle the whole VMM, including its
 I/O threads. Exceeding the memory ceiling can kill the VM; its existing restart

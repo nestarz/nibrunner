@@ -667,10 +667,37 @@ pub const DEFAULT_IDLE_TIMEOUT: IdleTimeoutMs = IdleTimeoutMs(DEFAULT_IDLE_TIMEO
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "RawInstanceResources")]
 pub struct InstanceResources {
     pub vcpu_count: u32,
     pub memory_mib: u32,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "InstanceResources"))]
+#[serde(rename_all = "camelCase")]
+struct RawInstanceResources {
+    vcpu_count: u32,
+    /// A multiple of 2: guest memory is backed by transparent huge pages, which Firecracker
+    /// requires in 2 MiB multiples.
+    #[cfg_attr(feature = "schema", schemars(extend("multipleOf" = 2)))]
+    memory_mib: u32,
+}
+
+impl TryFrom<RawInstanceResources> for InstanceResources {
+    type Error = InvalidValue;
+    fn try_from(raw: RawInstanceResources) -> Result<Self, Self::Error> {
+        if !raw.memory_mib.is_multiple_of(2) {
+            return Err(InvalidValue::new_public(
+                "memoryMib must be a multiple of 2: guest memory is backed by 2 MiB huge pages",
+            ));
+        }
+        Ok(Self {
+            vcpu_count: raw.vcpu_count,
+            memory_mib: raw.memory_mib,
+        })
+    }
 }
 
 pub const DEFAULT_INSTANCE_RESOURCES: InstanceResources = InstanceResources {

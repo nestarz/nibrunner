@@ -1890,3 +1890,18 @@ fn a_cutover_outcome_is_reported_by_kind() {
         serde_json::json!({ "kind": "abandoned", "deploymentId": "dep-2" })
     );
 }
+
+#[test]
+fn guest_memory_is_a_whole_number_of_2_mib_huge_pages() {
+    let even = serde_json::json!({"vcpuCount": 1, "memoryMib": 256});
+    assert_eq!(
+        serde_json::from_value::<InstanceResources>(even).unwrap(),
+        InstanceResources {
+            vcpu_count: 1,
+            memory_mib: 256
+        }
+    );
+    let odd = serde_json::json!({"vcpuCount": 1, "memoryMib": 257});
+    let error = serde_json::from_value::<InstanceResources>(odd).unwrap_err();
+    assert!(error.to_string().contains("multiple of 2"), "{error}");
+}

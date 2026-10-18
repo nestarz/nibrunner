@@ -282,3 +282,43 @@ async fn two_apps_on_one_host_never_read_each_others_volumes() {
 
     host.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blocks_a_tenant_frees_on_its_volume_are_given_back_to_the_host() {
+    use std::os::unix::fs::MetadataExt;
+    const WRITTEN_MIB: u64 = 200;
+
+    let Some(host) = crate::host().await else {
+        return;
+    };
+    let mut app = host.tenant(1);
+    app.volume.size_bytes = 512 * 1024 * 1024;
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Running).await;
+    let backing = host.host.config.volumes_dir().join(app.volume.volume_id.as_str());
+    let allocated_mib = || std::fs::metadata(&backing).unwrap().blocks() * 512 / (1024 * 1024);
+
+    let filled = host
+        .get(&app, &format!("/fill?path=freed&mib={WRITTEN_MIB}"))
+        .await
+        .unwrap();
+    assert_eq!(filled.body, WRITTEN_MIB.to_string());
+    let full = allocated_mib();
+    assert_eq!(
+        host.get(&app, "/remove?path=freed").await.unwrap().body,
+        "removed"
+    );
+    let mut emptied = full;
+    for _ in 0..50 {
+        emptied = allocated_mib();
+        if full - emptied >= 150 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(
+        full - emptied >= 150,
+        "the host file holds {full} MiB with the file and {emptied} MiB after it was removed"
+    );
+    host.stop().await;
+}

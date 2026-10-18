@@ -272,6 +272,8 @@ fn answer(target: &str, data_dir: &Path) -> (&'static str, String) {
             ("200 OK", "burned".to_string())
         }
         "/write" => write_file(target, data_dir),
+        "/fill" => fill_file(target, data_dir),
+        "/remove" => remove_file(target, data_dir),
         "/read" => read_file(target, data_dir),
         "/log" => {
             let lines: u64 = query(target, "lines").and_then(|n| n.parse().ok()).unwrap_or(1);
@@ -329,6 +331,51 @@ fn write_file(target: &str, data_dir: &Path) -> (&'static str, String) {
     });
     match written {
         Ok(()) => ("200 OK", body.len().to_string()),
+        Err(error) => ("500 Internal Server Error", error.to_string()),
+    }
+}
+
+/// `mib` MiB that no filesystem or host can store as holes, made durable.
+fn fill_file(target: &str, data_dir: &Path) -> (&'static str, String) {
+    let Some(path) = query(target, "path").and_then(|asked| within(data_dir, &asked)) else {
+        return ("400 Bad Request", "that is not a path".to_string());
+    };
+    let mib: usize = query(target, "mib").and_then(|n| n.parse().ok()).unwrap_or(0);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return ("500 Internal Server Error", error.to_string());
+        }
+    }
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let written = std::fs::File::create(&path).and_then(|mut file| {
+        for _ in 0..mib {
+            for byte in chunk.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            file.write_all(&chunk)?;
+        }
+        file.sync_all()
+    });
+    match written {
+        Ok(()) => ("200 OK", mib.to_string()),
+        Err(error) => ("500 Internal Server Error", error.to_string()),
+    }
+}
+
+/// The file gone, and its directory synced, so the journal commit that frees its blocks (and
+/// discards them, on a filesystem mounted with discard) has happened before the answer.
+fn remove_file(target: &str, data_dir: &Path) -> (&'static str, String) {
+    let Some(path) = query(target, "path").and_then(|asked| within(data_dir, &asked)) else {
+        return ("400 Bad Request", "that is not a path".to_string());
+    };
+    let removed = std::fs::remove_file(&path)
+        .and_then(|()| std::fs::File::open(path.parent().unwrap_or(data_dir))?.sync_all());
+    match removed {
+        Ok(()) => ("200 OK", "removed".to_string()),
         Err(error) => ("500 Internal Server Error", error.to_string()),
     }
 }

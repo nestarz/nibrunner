@@ -209,6 +209,7 @@ impl Jail {
                 vcpu_count: 1,
                 mem_size_mib: 256,
                 smt: false,
+                huge_pages: guest_contract::firecracker::HugePages::Transparent,
             })
             .expect("valid test resources"),
             fake_mounts: true,

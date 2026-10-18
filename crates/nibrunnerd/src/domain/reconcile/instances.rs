@@ -1206,6 +1206,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_snapshot_an_older_firecracker_took_is_a_cold_boot_and_never_an_error() {
+        let host = test_host().await;
+        host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
+        host.vms.refuse_wake(VmError::SnapshotUnusable {
+            reason: "it was taken by another Firecracker".into(),
+        });
+        let result = resume_instance(&host, &desired_instance(|_| {})).await;
+        assert_eq!(result, Ok(WakeOutcome::ColdBoot));
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!((record.state, record.message), (InstanceState::Starting, None));
+    }
+
+    #[tokio::test]
     async fn a_busy_cold_boot_fallback_is_reported_as_a_wake_refusal() {
         let host = test_host().await;
         host.volumes.provision(&desired_volume(|_| {})).await.unwrap();

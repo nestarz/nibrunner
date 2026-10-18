@@ -155,16 +155,23 @@ next request boots it afresh from its layers and volume, as after a host reboot.
 
 ## Snapshot integrity
 
-Before resuming a restored app, the host sets the guest's wall clock to the current host time.
-The app stays frozen until that succeeds. If the guest cannot synchronize its clock, the host
-starts it from cold instead.
+Before resuming a restored app, the host sets the guest's wall clock to the current host time and
+releases its tenant. The app stays frozen until that succeeds. If the guest cannot synchronize its
+clock, the host starts it from cold instead. (Firecracker's `clock_realtime` load option is not
+used: it needs a host whose own clocksource let KVM save the real time, which a virtual machine's
+`kvm-clock` does not, and Firecracker then refuses the load.)
+
+A snapshot names the Firecracker that took it. After an upgrade of Firecracker, a sleeping app's
+snapshot is refused by that name, and its next request boots it from cold, once, instead of
+restoring; it is never an error.
 
 Guests started before a host and guest-image upgrade keep running. If their init does not
 support the freeze protocol, the host refuses sleep and retries after its normal backoff.
 Redeploy the app to start it with the new guest image.
 
 The host commits a snapshot only after its state, memory and integrity record have been synced
-to disk. It verifies both files' sizes and SHA-256 hashes before restoring. A missing, damaged or
+to disk: Firecracker syncs the state and memory files before it answers the snapshot request,
+and the host syncs the integrity record and the directories that publish it. It verifies both files' sizes and SHA-256 hashes before restoring. A missing, damaged or
 older snapshot without integrity records is discarded; the request starts the app from cold
 instead. Files on its volume survive, but in-memory state does not.
 

@@ -434,13 +434,14 @@ fn hash_file(file: &mut std::fs::File) -> std::io::Result<SnapshotFile> {
     })
 }
 
+// Firecracker fsyncs the state and memory files before PUT /snapshot/create returns
+// (`sync_snapshot_files`, true by default since 1.17), so they are only hashed here; the stamp and
+// the directories are this host's to sync.
 fn seal_file(path: &Path) -> Result<SnapshotFile, VmError> {
     let failed =
         |error: std::io::Error| VmError::Host(format!("{} could not be committed: {error}", path.display()));
     let mut file = std::fs::File::open(path).map_err(failed)?;
-    let integrity = hash_file(&mut file).map_err(failed)?;
-    file.sync_all().map_err(failed)?;
-    Ok(integrity)
+    hash_file(&mut file).map_err(failed)
 }
 
 fn sync_directory(path: &Path) -> Result<(), VmError> {

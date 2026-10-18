@@ -937,9 +937,11 @@
       "type": "object",
       "properties": {
         "memoryMib": {
+          "description": "A multiple of 2: guest memory is backed by transparent huge pages, which Firecracker\nrequires in 2 MiB multiples.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 0,
+          "multipleOf": 2
         },
         "vcpuCount": {
           "type": "integer",

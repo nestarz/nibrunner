@@ -38,6 +38,11 @@ pub fn check(config: &HostConfig) -> Vec<Check> {
     checks.push(binary("getent", "install the libc-bin package"));
     // What sets this host's kernel settings, which `install` does rather than asks for.
     checks.push(binary("modprobe", "install the kmod package"));
+    checks.push(Check::new(
+        TRANSPARENT_HUGEPAGE,
+        std::fs::read_to_string(TRANSPARENT_HUGEPAGE).is_ok_and(|setting| huge_pages_allowed(&setting)),
+        "set transparent huge pages to madvise or always (echo madvise > /sys/kernel/mm/transparent_hugepage/enabled, and transparent_hugepage=madvise on the kernel command line); guest memory asks for them",
+    ));
 
     match &config.volumes {
         VolumeBackend::LocalFile => {}
@@ -59,6 +64,17 @@ pub fn check(config: &HostConfig) -> Vec<Check> {
     }
 
     checks
+}
+
+const TRANSPARENT_HUGEPAGE: &str = "/sys/kernel/mm/transparent_hugepage/enabled";
+
+/// Firecracker backs guest memory with `madvise(MADV_HUGEPAGE)`, which the kernel ignores only
+/// when the setting in force (the bracketed word) is `never`.
+fn huge_pages_allowed(setting: &str) -> bool {
+    setting
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix('[')?.strip_suffix(']'))
+        .is_some_and(|chosen| chosen != "never")
 }
 
 /// Not one of the checks above, because it hashes two files a few hundred megabytes long: asked
@@ -129,6 +145,14 @@ mod tests {
             on_path_in(directory.path().as_os_str(), "nibrunner-test-data"),
             None
         );
+    }
+
+    #[test]
+    fn guest_memory_gets_huge_pages_unless_the_host_says_never() {
+        assert!(huge_pages_allowed("always [madvise] never\n"));
+        assert!(huge_pages_allowed("[always] madvise never\n"));
+        assert!(!huge_pages_allowed("always madvise [never]\n"));
+        assert!(!huge_pages_allowed(""));
     }
 
     #[test]
