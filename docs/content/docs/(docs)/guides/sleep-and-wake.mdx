@@ -71,7 +71,7 @@ are paused, and the kernel is asked to reclaim up to 64 MiB of the VMM's cgroup.
 | Reported state | What it costs, and what a request does |
 | --- | --- |
 | `running` | The app runs. |
-| `frozen` | Its memory stays resident (less what the kernel reclaimed); nothing is scheduled. A request resumes the VM in place, sets its clock, and waits for its health check: no restore. |
+| `frozen` | Its memory stays resident (less what the kernel reclaimed); nothing is scheduled. A request resumes the VM in place and waits for its health check: no restore, and no clock step (kvmclock reads the host clock again on the first instruction after the resume). |
 | `idle` | The VM is snapshotted and stopped. A request restores the snapshot. |
 
 A frozen app still sleeps at its original deadline (the snapshot is taken from the paused VM, which
@@ -81,9 +81,10 @@ freezes a running quiet app before it snapshots one. A document that makes an ap
 sleeping, a cron job, or an export resumes a frozen app first. Omit `freeze_after_ms` to freeze
 nothing new; requests still resume those already frozen.
 
-A frozen VM that will not resume, or whose guest does not answer the clock handshake, is not left
-paused for the next request to find the same way: the host stops it and boots the app from cold,
-and the request waits for that boot. One whose deployment is being replaced is left to the
+Freezing pauses the VMM alone: a paused guest runs nothing, so its tenant is not held, and no
+lease can release it under a host that still holds it frozen. A frozen VM that will not resume is
+not left paused for the next request to find the same way: the host stops it and boots the app
+from cold, and the request waits for that boot. One whose deployment is being replaced is left to the
 replacement instead, and the request waits for the new deployment to answer.
 
 ## What wakes it

@@ -541,20 +541,14 @@ impl Vmm for VmManager {
                 "only a running jailed microVM can be frozen".into(),
             ));
         }
-        let control = self
-            .working_dir_for(app_id)
-            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
         // Recorded first, so a daemon that dies half way readopts a guest it must not route to.
         self.processes
             .remember_frozen(app_id, true)
             .map_err(|error| VmError::Host(error.to_string()))?;
-        let paused = async {
-            time_sync::freeze_tenant(&control).await?;
-            self.api(app_id).pause().await
-        }
-        .await;
-        if let Err(error) = paused {
-            self.resume_frozen_tenant(app_id, &control).await;
+        // The VMM alone is paused: a paused guest runs nothing, so its tenant needs no hold, and
+        // kvmclock reads the host's clock again on the guest's first instruction after the
+        // resume, so the thaw needs no clock step either.
+        if let Err(error) = self.api(app_id).pause().await {
             let _ = self.processes.remember_frozen(app_id, false);
             return Err(error);
         }
@@ -567,14 +561,7 @@ impl Vmm for VmManager {
     }
 
     async fn thaw(&self, app_id: &AppId) -> Result<(), VmError> {
-        let control = self
-            .working_dir_for(app_id)
-            .join(guest_contract::vsock::GUEST_VSOCK_FILENAME);
         self.api(app_id).resume().await?;
-        if let Err(error) = time_sync::wake(&control).await {
-            let _ = self.api(app_id).pause().await;
-            return Err(error);
-        }
         self.processes
             .remember_frozen(app_id, false)
             .map_err(|error| VmError::Host(error.to_string()))
