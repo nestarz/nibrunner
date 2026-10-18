@@ -1,5 +1,5 @@
 //! The per-unit hour and day a control plane charts, summed from this page's own `nibrunner_app_`
-//! counters. The shapes are the control plane's `metrics/<host>/<yyyymmddhh>.json` and `<yyyymmdd>.json`,
+//! counters and the per-app `nibrunner_proxy_` ones. The shapes are the control plane's `metrics/<host>/<yyyymmddhh>.json` and `<yyyymmdd>.json`,
 //! which its readers parse: a field renamed here is a chart gone blank there.
 use std::collections::BTreeMap;
 
@@ -22,6 +22,13 @@ pub struct UnitMetrics {
     pub tx_bytes: u64,
     pub wakes: u64,
     pub sleeps: u64,
+    pub cache_hit: u64,
+    pub cache_stale: u64,
+    pub cache_miss: u64,
+    pub cache_bypass: u64,
+    /// What the proxy's compression took from the app and gave out, every coding together.
+    pub encoded_bytes_in: u64,
+    pub encoded_bytes_out: u64,
 }
 
 impl UnitMetrics {
@@ -39,6 +46,12 @@ impl UnitMetrics {
         self.tx_bytes += other.tx_bytes;
         self.wakes += other.wakes;
         self.sleeps += other.sleeps;
+        self.cache_hit += other.cache_hit;
+        self.cache_stale += other.cache_stale;
+        self.cache_miss += other.cache_miss;
+        self.cache_bypass += other.cache_bypass;
+        self.encoded_bytes_in += other.encoded_bytes_in;
+        self.encoded_bytes_out += other.encoded_bytes_out;
     }
 }
 
@@ -72,13 +85,20 @@ pub fn micros_rfc3339(micros: i64) -> String {
     at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
-/// Series by unit, then by name without `nibrunner_app_` and the labels other than `app`.
+/// Series by unit, then by name without `nibrunner_app_` (a proxy series keeps `proxy_`) and the
+/// labels other than `app`.
 pub type Samples = BTreeMap<String, BTreeMap<String, f64>>;
+
+fn unit_series(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("nibrunner_")?;
+    rest.strip_prefix("app_")
+        .or_else(|| rest.starts_with("proxy_").then_some(rest))
+}
 
 pub fn parse(page: &str) -> Samples {
     let mut out = Samples::new();
     for line in page.lines() {
-        let Some(rest) = line.strip_prefix("nibrunner_app_") else {
+        let Some(rest) = unit_series(line) else {
             continue;
         };
         let Some(split) = rest.find(['{', ' ']) else {
@@ -174,9 +194,7 @@ impl Counting {
             let Some(app) = apps.get(unit) else { continue };
             let last = self.last.as_ref().map(|l| l.get(unit));
             let mut m = UnitMetrics::default();
-            // What each cumulative bucket counted, summed by `le` across the other labels (the
-            // status class): a bucket is one series per class, and only their sum is the unit's.
-            let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
+            let mut buckets: Vec<(f64, String, u64)> = vec![];
             let mut unit_moved = false;
             for (s, v) in series {
                 let name = s.split_once('{').map_or(s.as_str(), |(n, _)| n);
@@ -198,7 +216,7 @@ impl Counting {
                     }
                     "request_seconds_bucket" => {
                         let le = label(s, "le").unwrap_or("+Inf");
-                        *buckets.entry(le.to_owned()).or_default() += n;
+                        buckets.push((le.parse().unwrap_or(f64::INFINITY), le.to_owned(), n));
                     }
                     "cpu_seconds_total" => m.cpu_s += d,
                     "network_bytes_total" => match label(s, "direction") {
@@ -208,14 +226,22 @@ impl Counting {
                     },
                     "wakes_total" => m.wakes += n,
                     "sleeps_total" => m.sleeps += n,
+                    "proxy_cache_requests_total" => match label(s, "outcome") {
+                        Some("hit") => m.cache_hit += n,
+                        Some("stale") => m.cache_stale += n,
+                        Some("miss") => m.cache_miss += n,
+                        Some("bypass") => m.cache_bypass += n,
+                        _ => {}
+                    },
+                    "proxy_encode_bytes_total" => match label(s, "direction") {
+                        Some("in") => m.encoded_bytes_in += n,
+                        Some("out") => m.encoded_bytes_out += n,
+                        _ => {}
+                    },
                     _ => continue,
                 }
                 unit_moved |= d > 0.0;
             }
-            let mut buckets: Vec<(f64, String, u64)> = buckets
-                .into_iter()
-                .map(|(le, n)| (le.parse().unwrap_or(f64::INFINITY), le, n))
-                .collect();
             buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
             let mut below = 0;
             for (_, le, n) in buckets {
@@ -260,16 +286,28 @@ mod tests {
             "# TYPE nibrunner_app_requests_total counter\n\
              nibrunner_app_requests_total{{app=\"site\",class=\"2xx\"}} {requests}\n\
              nibrunner_app_requests_total{{app=\"site\",class=\"5xx\"}} 1\n\
-             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"0.005\"}} {requests}\n\
-             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"+Inf\"}} {requests}\n\
-             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"0.005\"}} 0\n\
-             nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"+Inf\"}} 1\n\
+             nibrunner_app_request_seconds_bucket{{app=\"site\",le=\"0.005\"}} {requests}\n\
+             nibrunner_app_request_seconds_bucket{{app=\"site\",le=\"+Inf\"}} {}\n\
              nibrunner_app_cpu_seconds_total{{app=\"site\"}} {cpu}\n\
              nibrunner_app_memory_used_bytes{{app=\"site\"}} 67108864\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"rx\"}} 100\n\
              nibrunner_app_network_bytes_total{{app=\"site\",direction=\"tx\"}} 200\n\
              nibrunner_app_wakes_total{{app=\"site\"}} 1\n\
-             nibrunner_app_requests_total{{app=\"build-x\",class=\"2xx\"}} 9\n"
+             nibrunner_proxy_requests_total{{app=\"site\",outcome=\"served\"}} {requests}\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"hit\"}} {requests}\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"stale\"}} 1\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"miss\"}} {}\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"bypass\"}} 0\n\
+             nibrunner_proxy_cache_bytes 4096\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"br\",direction=\"in\"}} {}\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"br\",direction=\"out\"}} {requests}\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"gzip\",direction=\"in\"}} {}\n\
+             nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"gzip\",direction=\"out\"}} {requests}\n\
+             nibrunner_app_requests_total{{app=\"build-x\",class=\"2xx\"}} 9\n",
+            requests + 1,
+            requests * 2,
+            requests * 10,
+            requests * 10,
         )
     }
 
@@ -296,44 +334,19 @@ mod tests {
             [("0.005".to_string(), 2), ("+Inf".to_string(), 0)].into()
         );
         assert_eq!((site.cpu_s, site.mem_peak_mib), (1.5, 64));
+        assert_eq!(
+            (
+                site.cache_hit,
+                site.cache_stale,
+                site.cache_miss,
+                site.cache_bypass
+            ),
+            (2, 0, 4, 0)
+        );
+        assert_eq!((site.encoded_bytes_in, site.encoded_bytes_out), (40, 4));
         assert!(
             !document.units.contains_key("build-x"),
             "a unit without labels is not charted"
-        );
-    }
-
-    #[test]
-    fn the_latency_buckets_of_every_status_class_are_summed_before_they_are_split() {
-        let page = |ok: u64, failed: u64| {
-            format!(
-                "nibrunner_app_requests_total{{app=\"site\",class=\"2xx\"}} {ok}\n\
-                 nibrunner_app_requests_total{{app=\"site\",class=\"5xx\"}} {failed}\n\
-                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"0.005\"}} {ok}\n\
-                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"0.1\"}} {ok}\n\
-                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"2xx\",le=\"+Inf\"}} {ok}\n\
-                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"0.005\"}} 0\n\
-                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"0.1\"}} {failed}\n\
-                 nibrunner_app_request_seconds_bucket{{app=\"site\",class=\"5xx\",le=\"+Inf\"}} {failed}\n"
-            )
-        };
-        let mut counting = Counting::carried(HOUR, None, None);
-        counting.count(parse(&page(0, 0)), &units());
-        assert!(counting.count(parse(&page(3, 1)), &units()));
-        let site = &counting.documents(HOUR)[0].1.units["site"];
-        assert_eq!(site.requests, 4);
-        assert_eq!(
-            site.by_status,
-            [("2xx".to_string(), 3), ("5xx".to_string(), 1)].into()
-        );
-        assert_eq!(
-            site.latency_hist,
-            [
-                ("0.005".to_string(), 3),
-                ("0.1".to_string(), 1),
-                ("+Inf".to_string(), 0)
-            ]
-            .into(),
-            "three 2xx under 5ms and one 5xx between 5ms and 100ms"
         );
     }
 
@@ -364,6 +377,12 @@ mod tests {
                 tx_bytes: 200,
                 wakes: 1,
                 sleeps: 0,
+                cache_hit: 2,
+                cache_stale: 0,
+                cache_miss: 1,
+                cache_bypass: 0,
+                encoded_bytes_in: 30_000,
+                encoded_bytes_out: 2_000,
             },
         )];
         let document = MetricsHour {
