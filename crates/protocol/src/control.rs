@@ -611,7 +611,8 @@ pub struct DesiredExport {
 /// `paths.desired_state_file` names and converges on every change to it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", schemars(!try_from))]
+#[serde(rename_all = "camelCase", try_from = "HostDesiredStateFields")]
 pub struct HostDesiredState {
     pub host_id: HostId,
     /// What whoever wrote this document calls this version of it, carried back in the report as
@@ -629,6 +630,48 @@ pub struct HostDesiredState {
     pub instances: Vec<DesiredInstance>,
     pub checkpoints: Vec<DesiredCheckpoint>,
     pub exports: Vec<DesiredExport>,
+}
+
+// A hostname routes to one app, so a document that gives one to two would have the host pick
+// between them; it is refused whole instead, as any other document this host cannot honour is.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostDesiredStateFields {
+    host_id: HostId,
+    revision: Revision,
+    volumes: Vec<DesiredVolume>,
+    instances: Vec<DesiredInstance>,
+    checkpoints: Vec<DesiredCheckpoint>,
+    exports: Vec<DesiredExport>,
+}
+
+impl TryFrom<HostDesiredStateFields> for HostDesiredState {
+    type Error = InvalidValue;
+
+    fn try_from(fields: HostDesiredStateFields) -> Result<Self, Self::Error> {
+        let mut named_by: std::collections::BTreeMap<&Hostname, &AppId> = std::collections::BTreeMap::new();
+        for instance in &fields.instances {
+            for entry in &instance.hostnames {
+                match named_by.insert(&entry.hostname, &instance.app_id) {
+                    Some(other) if other != &instance.app_id => {
+                        return Err(InvalidValue::new_public(&format!(
+                            "{} is named by both {other} and {}, and a hostname routes to one app",
+                            entry.hostname, instance.app_id
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Self {
+            host_id: fields.host_id,
+            revision: fields.revision,
+            volumes: fields.volumes,
+            instances: fields.instances,
+            checkpoints: fields.checkpoints,
+            exports: fields.exports,
+        })
+    }
 }
 
 /// A tenant restart as the host heard of it: what the guest said, and when it said it.
