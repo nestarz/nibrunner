@@ -71,6 +71,41 @@ cron jobs; a cron command still running when the revision goes idle holds it lik
 }
 ```
 
+## Frozen tier
+
+A host can pause quiet apps in place before their snapshot deadline:
+
+```toml
+[memory_admission]
+mode = "observe"
+headroom_mib = 1024
+freeze_after_ms = 60000
+```
+
+Only `on-request` apps with a `traffic-idle` policy qualify, and only once they have been quiet for
+`freeze_after_ms` (at least 30 seconds) and up for a minute, with no request open, no raw port and
+a fresh traffic reading. The tenant is held through the guest's own freeze, Firecracker's vCPUs
+are paused, and the kernel is asked to reclaim up to 64 MiB of the VMM's cgroup.
+
+| Reported state | What it costs, and what a request does |
+| --- | --- |
+| `running` | The app runs. |
+| `frozen` | Its memory stays resident (less what the kernel reclaimed); nothing is scheduled. A request resumes the VM in place and waits for its health check: no restore, and no clock step (kvmclock reads the host clock again on the first instruction after the resume). |
+| `idle` | The VM is snapshotted and stopped. A request restores the snapshot. |
+
+A frozen app still sleeps at its original deadline (the snapshot is taken from the paused VM, which
+is resumed for it), is never probed while frozen, and keeps its full admission budget under
+ceiling admission; adaptive admission counts what it holds. With `reclaim = true`, memory pressure
+freezes a running quiet app before it snapshots one. A document that makes an app run without
+sleeping, a cron job, or an export resumes a frozen app first. Omit `freeze_after_ms` to freeze
+nothing new; requests still resume those already frozen.
+
+Freezing pauses the VMM alone: a paused guest runs nothing, so its tenant is not held, and no
+lease can release it under a host that still holds it frozen. A frozen VM that will not resume is
+not left paused for the next request to find the same way: the host stops it and boots the app
+from cold, and the request waits for that boot. One whose deployment is being replaced is left to the
+replacement instead, and the request waits for the new deployment to answer.
+
 ## What wakes it
 
 Any inbound traffic: an HTTP request on one of its hostnames, or anything on a

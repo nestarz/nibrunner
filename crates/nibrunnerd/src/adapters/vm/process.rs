@@ -69,6 +69,10 @@ pub struct VmRecord {
     pub jail_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jail_uid: Option<u32>,
+    /// Set before the VMM is paused and cleared once it runs again, so a daemon that died in
+    /// between readopts it as paused rather than routing requests to a guest that cannot answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
 }
 
 impl VmRecord {
@@ -182,7 +186,16 @@ impl VmProcesses {
             failed: !active && !record.stop_requested && exit.is_some_and(|exit| exit != VmExit::Code(0)),
             started_this_boot,
             exit,
+            frozen: active && record.frozen,
         }
+    }
+
+    pub fn remember_frozen(&self, app_id: &AppId, frozen: bool) -> std::io::Result<()> {
+        let mut record = self
+            .read_record(app_id)
+            .ok_or_else(|| std::io::Error::other("the VM has no process record"))?;
+        record.frozen = frozen;
+        self.write_record(&record)
     }
 
     pub fn memory(&self, app_id: &AppId) -> Option<protocol::ReportedMemory> {
@@ -327,6 +340,7 @@ impl VmProcesses {
             stop_requested: false,
             jail_root: Some(jail.root.clone()),
             jail_uid: Some(jail.uid),
+            frozen: false,
         };
         self.write_record(&record)?;
 
@@ -438,6 +452,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         let status = processes.status(&app_id());
@@ -462,6 +477,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         let status = processes.status(&app_id());
@@ -484,6 +500,7 @@ mod tests {
             stop_requested: false,
             jail_root: None,
             jail_uid: None,
+            frozen: false,
         };
         processes.write_record(&record).unwrap();
         let crashed = processes.status(&app_id());
@@ -495,6 +512,7 @@ mod tests {
                 stop_requested: true,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
                 ..record.clone()
             })
             .unwrap();
@@ -572,6 +590,7 @@ mod tests {
                 stop_requested: true,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         std::fs::write(processes.console_path(&app_id()), b"[nibrun] gone\n").unwrap();
@@ -765,6 +784,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         processes.stop(&app_id()).await;

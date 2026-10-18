@@ -145,6 +145,19 @@ impl RuntimeControls {
     }
 }
 
+/// Asks the kernel to reclaim up to `bytes` from a cgroup. The write blocks for as long as the
+/// kernel works, so it runs off the runtime's threads and is given up on after half a second.
+pub(crate) async fn reclaim(cgroup: &Path, bytes: u64) -> std::io::Result<()> {
+    let path = cgroup.join("memory.reclaim");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::task::spawn_blocking(move || std::fs::write(path, bytes.to_string())),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "cgroup reclaim timed out"))?
+    .map_err(std::io::Error::other)?
+}
+
 /// `memory.high` lifted for as long as a snapshot is being written: the buffered writes are charged
 /// to the VMM's cgroup, and a throttled preview or build would take that much longer to sleep.
 pub(crate) struct MemoryHighLift {

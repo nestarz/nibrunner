@@ -693,6 +693,9 @@ pub enum InstanceState {
     Pending,
     Starting,
     Running,
+    /// Paused in place, its memory kept: a quiet app the host stopped scheduling before its sleep
+    /// deadline. A request resumes it without a restore.
+    Frozen,
     Unhealthy,
     Stopping,
     Stopped,
@@ -706,10 +709,11 @@ pub enum InstanceState {
     Exited,
 }
 
-pub const INSTANCE_STATES: [InstanceState; 10] = [
+pub const INSTANCE_STATES: [InstanceState; 11] = [
     InstanceState::Pending,
     InstanceState::Starting,
     InstanceState::Running,
+    InstanceState::Frozen,
     InstanceState::Unhealthy,
     InstanceState::Stopping,
     InstanceState::Stopped,
@@ -725,6 +729,7 @@ impl InstanceState {
             InstanceState::Pending => "pending",
             InstanceState::Starting => "starting",
             InstanceState::Running => "running",
+            InstanceState::Frozen => "frozen",
             InstanceState::Unhealthy => "unhealthy",
             InstanceState::Stopping => "stopping",
             InstanceState::Stopped => "stopped",

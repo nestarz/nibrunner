@@ -24,6 +24,9 @@ use guest_contract::instance_env::{render_instance_env, InstanceEnvContent};
 use guest_contract::paths::WritableRoot;
 
 pub const FIRECRACKER_CONFIG_FILENAME: &str = "firecracker.json";
+/// What the kernel is asked to reclaim from a VMM just paused: its idle file cache, and with a
+/// swap allowance the guest pages it can spare.
+const FROZEN_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
 pub const GUEST_KERNEL_FILENAME: &str = "vmlinux";
 pub const GUEST_ROOTFS_FILENAME: &str = "rootfs.ext4";
 pub const GUEST_MANIFEST_FILENAME: &str = "manifest.json";
@@ -558,7 +561,47 @@ impl Vmm for VmManager {
         Ok(())
     }
 
+    async fn freeze(&self, app_id: &AppId) -> Result<(), VmError> {
+        if !self
+            .processes
+            .read_record(app_id)
+            .is_some_and(|record| record.jail_root.is_some())
+            || !self.processes.status(app_id).active
+        {
+            return Err(VmError::Host(
+                "only a running jailed microVM can be frozen".into(),
+            ));
+        }
+        // Recorded first, so a daemon that dies half way readopts a guest it must not route to.
+        self.processes
+            .remember_frozen(app_id, true)
+            .map_err(|error| VmError::Host(error.to_string()))?;
+        // The VMM alone is paused: a paused guest runs nothing, so its tenant needs no hold, and
+        // kvmclock reads the host's clock again on the guest's first instruction after the
+        // resume, so the thaw needs no clock step either.
+        if let Err(error) = self.api(app_id).pause().await {
+            let _ = self.processes.remember_frozen(app_id, false);
+            return Err(error);
+        }
+        if let Some(cgroup) = self.processes.cgroup(app_id) {
+            if let Err(error) = super::limits::reclaim(&cgroup, FROZEN_RECLAIM_BYTES).await {
+                tracing::debug!(%app_id, %error, "a frozen microVM's memory reclaim was incomplete");
+            }
+        }
+        Ok(())
+    }
+
+    async fn thaw(&self, app_id: &AppId) -> Result<(), VmError> {
+        self.api(app_id).resume().await?;
+        self.processes
+            .remember_frozen(app_id, false)
+            .map_err(|error| VmError::Host(error.to_string()))
+    }
+
     async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError> {
+        if self.processes.status(&request.app_id).frozen {
+            self.thaw(&request.app_id).await?;
+        }
         // Held to the end, whichever way the snapshot goes: only once it is on the disk does
         // the next measurement count it, and only once it has failed is the room free again.
         let _share_of_the_disk = self
@@ -1839,6 +1882,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         let legacy_directory = fixture.manager.vm_dir.join(app_id().as_str());
@@ -1878,6 +1922,7 @@ mod tests {
                 stop_requested: false,
                 jail_root: Some(root.clone()),
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         fixture.manager.readopt(&app_id()).await.unwrap();
@@ -2114,6 +2159,7 @@ mod tests {
                 stop_requested: true,
                 jail_root: None,
                 jail_uid: None,
+                frozen: false,
             })
             .unwrap();
         let refused = fixture.manager.wake(request).await.unwrap_err();

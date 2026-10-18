@@ -650,6 +650,7 @@ mod tests {
 
         fn running_vm() -> VmStatus {
             VmStatus {
+                frozen: false,
                 loaded: true,
                 active: true,
                 failed: false,

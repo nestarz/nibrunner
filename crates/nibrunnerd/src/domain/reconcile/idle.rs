@@ -363,6 +363,7 @@ fn waited_out(snapshot: &HostSnapshot, app_id: &AppId, now: i64) -> bool {
 pub async fn apply_sleep(host: &std::sync::Arc<Host>) -> usize {
     super::expiry::apply(host, crate::clock::now_ms()).await;
     super::pressure::apply(host).await;
+    super::frozen::apply(host).await;
     let policies: BTreeMap<AppId, ActivationPolicy> = {
         let cache = host.cache.lock().await;
         cache

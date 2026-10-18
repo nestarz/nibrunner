@@ -171,6 +171,8 @@ pub enum WakeOutcome {
     Restored,
     AlreadyRunning,
     ColdBoot,
+    /// A frozen microVM resumed in place.
+    Thawed,
 }
 
 impl WakeOutcome {
@@ -179,6 +181,7 @@ impl WakeOutcome {
             WakeOutcome::Restored => "restored",
             WakeOutcome::AlreadyRunning => "already-running",
             WakeOutcome::ColdBoot => "cold-boot",
+            WakeOutcome::Thawed => "thawed",
         }
     }
 }
@@ -188,6 +191,14 @@ impl WakeOutcome {
 pub trait Vmm: Send + Sync {
     async fn boot(&self, request: BootRequest) -> Result<(), VmError>;
     async fn sleep(&self, request: SuspendRequest) -> Result<(), VmError>;
+    /// Pauses a running microVM in place, its memory kept, after the tenant has agreed to be held.
+    async fn freeze(&self, _app_id: &AppId) -> Result<(), VmError> {
+        Err(VmError::Host("this runtime cannot freeze a microVM".into()))
+    }
+    /// Resumes a frozen microVM and sets its clock, as a wake from a snapshot would.
+    async fn thaw(&self, _app_id: &AppId) -> Result<(), VmError> {
+        Err(VmError::Host("this runtime cannot thaw a microVM".into()))
+    }
     async fn wake(&self, request: SuspendRequest) -> Result<(), VmError>;
     async fn stop(&self, app_id: &AppId) -> Result<(), VmError>;
     async fn discard(&self, app_id: &AppId) -> Result<(), VmError>;
@@ -386,6 +397,8 @@ pub enum VmCall {
     Discard,
     DeleteTap,
     ApplyLimits,
+    Freeze,
+    Thaw,
 }
 
 #[cfg(test)]

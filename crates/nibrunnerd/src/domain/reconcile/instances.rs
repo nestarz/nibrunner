@@ -605,6 +605,78 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     }
 }
 
+/// Resumes a frozen microVM in place: no restore, its memory was never written out. It is
+/// `starting` again until its health check says otherwise, as a restored one is.
+async fn thaw_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
+    host.state.mark_active(&desired.app_id, now_ms()).await;
+    if let Err(error) = host.vms.thaw(&desired.app_id).await {
+        let reason = error.message();
+        tracing::warn!(app_id = %desired.app_id, reason, "a frozen microVM would not thaw");
+        return Err(WakeRefusal::Failed {
+            kind: WakeFailure::WouldNotStart,
+            reason,
+        });
+    }
+    host.state
+        .update_record(&desired.app_id, |record| {
+            record.state = InstanceState::Starting;
+            record.stop_requested = false;
+            record.message = None;
+        })
+        .await;
+    host.state.probe_at_once(&desired.app_id).await;
+    crate::domain::reconcile::network::apply_network(host).await;
+    Ok(WakeOutcome::Thawed)
+}
+
+/// Whether the record is of the deployment the document names: a frozen guest of an earlier one
+/// is the pass's to replace, and a boot here would race it.
+async fn serves(host: &Host, desired: &DesiredInstance) -> bool {
+    host.state
+        .record(&desired.app_id)
+        .await
+        .is_some_and(|record| record.deployment_id == desired.deployment_id)
+}
+
+/// A frozen guest that would not resume answers nothing, and left paused it would refuse every
+/// request after this one the same way, so it is taken down for a fresh boot. What it held in
+/// memory goes with it, as a restart's would.
+async fn let_go_of_unthawed_guest(host: &Host, app_id: &AppId) {
+    host.router.close_connections_to(app_id).await;
+    host.activator.close_connections_to(app_id).await;
+    if let Err(error) = host.vms.stop(app_id).await {
+        tracing::warn!(%app_id, error = %error.message(), "a frozen microVM that would not thaw would not stop");
+    }
+    let _ = host.vms.discard(app_id).await;
+    host.state
+        .update_record(app_id, |record| {
+            record.state = InstanceState::Stopped;
+            record.stop_requested = true;
+            record.start_attempts = NO_START_ATTEMPTS;
+        })
+        .await;
+    tracing::warn!(%app_id, "a frozen microVM that would not thaw was let go of; booting the app afresh");
+}
+
+async fn cold_boot(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
+    start_instance(host, desired).await;
+    let record = host.state.record(&desired.app_id).await;
+    if record
+        .as_ref()
+        .is_some_and(|record| matches!(record.state, InstanceState::Starting | InstanceState::Running))
+    {
+        return Ok(WakeOutcome::ColdBoot);
+    }
+    let reason = record.and_then(|record| record.message).map_or_else(
+        || "the cold boot did not start".to_string(),
+        |message| message.as_str().to_string(),
+    );
+    Err(WakeRefusal::Failed {
+        kind: WakeFailure::WouldNotStart,
+        reason,
+    })
+}
+
 pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
     let would_not_start = |reason: String| WakeRefusal::Failed {
         kind: WakeFailure::WouldNotStart,
@@ -622,8 +694,23 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         return Err(would_not_start("this host has no slot left".to_string()));
     };
 
-    let status = host.vms.statuses(std::slice::from_ref(&desired.app_id)).await;
-    if status.get(&desired.app_id).copied().unwrap_or(UNKNOWN_VM).active {
+    let status = host
+        .vms
+        .statuses(std::slice::from_ref(&desired.app_id))
+        .await
+        .get(&desired.app_id)
+        .copied()
+        .unwrap_or(UNKNOWN_VM);
+    if status.frozen {
+        return match thaw_instance(host, desired).await {
+            Err(_) if serves(host, desired).await => {
+                let_go_of_unthawed_guest(host, &desired.app_id).await;
+                cold_boot(host, desired).await
+            }
+            thawed => thawed,
+        };
+    }
+    if status.active {
         return Ok(WakeOutcome::AlreadyRunning);
     }
 
@@ -669,19 +756,7 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
         }
         Err(VmError::SnapshotUnusable { reason }) => {
             tracing::info!(app_id = %desired.app_id, reason, "nothing to wake this app from; booting it instead");
-            start_instance(host, desired).await;
-            let record = host.state.record(&desired.app_id).await;
-            if record.as_ref().is_some_and(|record| {
-                matches!(record.state, InstanceState::Starting | InstanceState::Running)
-            }) {
-                Ok(WakeOutcome::ColdBoot)
-            } else {
-                let reason = record.and_then(|record| record.message).map_or_else(
-                    || "the cold boot did not start".to_string(),
-                    |message| message.as_str().to_string(),
-                );
-                Err(would_not_start(reason))
-            }
+            cold_boot(host, desired).await
         }
         Err(error) => {
             let reason = error.message();
@@ -775,7 +850,8 @@ async fn settle(
     snapshotting: bool,
     now_ms: i64,
 ) {
-    if record.expired_at_ms.is_some() {
+    // An expired record is settled for good; a frozen guest answers nothing until it is thawed.
+    if record.expired_at_ms.is_some() || status.frozen {
         return;
     }
     let health = if status.active && due {
@@ -1110,6 +1186,7 @@ mod tests {
         host.vms.boot_error(Some(VmError::StartBusy));
         for exit in [VmExit::Code(0), VmExit::Code(1), VmExit::Signal(9)] {
             host.vms.set_status(VmStatus {
+                frozen: false,
                 loaded: true,
                 active: false,
                 failed: exit != VmExit::Code(0),
@@ -1812,6 +1889,7 @@ mod tests {
     async fn a_microvm_that_went_away_leaves_the_code_it_exited_with_on_the_record() {
         let host = test_host().await;
         host.vms.set_status(VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: false,
@@ -1845,6 +1923,7 @@ mod tests {
     async fn a_microvm_killed_from_outside_says_which_signal_and_leaves_no_code_behind() {
         let host = test_host().await;
         host.vms.set_status(VmStatus {
+            frozen: false,
             loaded: true,
             active: false,
             failed: true,
@@ -1876,6 +1955,7 @@ mod tests {
         let exited_after = |uptime_ms: i64| async move {
             let host = test_host().await;
             host.vms.set_status(VmStatus {
+                frozen: false,
                 loaded: true,
                 active: false,
                 failed: false,
@@ -1979,6 +2059,7 @@ mod tests {
 
     fn up() -> VmStatus {
         VmStatus {
+            frozen: false,
             loaded: true,
             active: true,
             failed: false,

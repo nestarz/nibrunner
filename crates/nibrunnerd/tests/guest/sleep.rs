@@ -30,7 +30,7 @@ async fn concurrent_requests_restore_one_guest_and_every_caller_is_answered() {
     assert_eq!(host.get(&app, "/remember").await.expect("an answer").body, "1");
     host.let_sleep(&app).await;
 
-    let [restores_before, _, cold_boots_before] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [restores_before, _, cold_boots_before, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     let barrier = tokio::sync::Barrier::new(CALLERS as usize);
     let requests = (0..CALLERS).map(|_| async {
         barrier.wait().await;
@@ -54,7 +54,7 @@ async fn concurrent_requests_restore_one_guest_and_every_caller_is_answered() {
         (2..=CALLERS + 1).collect::<Vec<_>>(),
         "the restored guest lost or duplicated state"
     );
-    let [restores_after, _, cold_boots_after] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    let [restores_after, _, cold_boots_after, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
     assert_eq!(
         restores_after - restores_before,
         1,
@@ -179,12 +179,12 @@ async fn a_corrupt_snapshot_cold_boots_the_app_and_still_answers_the_request() {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&byte).unwrap();
         drop(file);
-        let [restored_before, cold_before, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+        let [restored_before, cold_before, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
 
         let answer = host.get(&app, "/remember").await.expect("the cold boot answers");
         assert_eq!(answer.status, 200, "{answer:?}");
         assert_eq!(answer.body, "1", "the corrupted snapshot was restored");
-        let [restored_after, cold_after, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+        let [restored_after, cold_after, _, _] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
         assert_eq!(restored_after, restored_before);
         assert_eq!(cold_after, cold_before + 1);
         assert!(!paths.directory.exists());
@@ -265,5 +265,126 @@ async fn an_abandoned_tenant_freeze_expires_without_restarting_the_app() {
     drop(wire);
     tokio::time::sleep(Duration::from_millis(control::TENANT_FREEZE_LEASE_MS) + timeout).await;
     assert_eq!(host.get(&app, "/remember").await.unwrap().body, "2");
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frozen_guest_keeps_its_memory_in_place_and_answers_once_thawed() {
+    let Some(host) = crate::host().await else {
+        return;
+    };
+    let app = host.tenant(1);
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Running).await;
+    assert_eq!(host.get(&app, "/allocate?mib=32").await.unwrap().status, 200);
+    let pid = |host: &nibrunnerd::test_support::machine::RunningHost| {
+        nibrunnerd::adapters::vm::process::VmProcesses::new(host.host.config.runtime_dir.clone())
+            .read_record(&app.app_id)
+            .unwrap()
+            .pid
+    };
+    let before = pid(&host);
+
+    host.host.vms.freeze(&app.app_id).await.unwrap();
+    let statuses = host.host.vms.statuses(std::slice::from_ref(&app.app_id)).await;
+    assert!(statuses[&app.app_id].frozen);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), host.get(&app, "/"))
+            .await
+            .is_err(),
+        "a paused guest answers nothing"
+    );
+
+    host.host.vms.thaw(&app.app_id).await.unwrap();
+    assert!(!host.host.vms.statuses(std::slice::from_ref(&app.app_id)).await[&app.app_id].frozen);
+    assert_eq!(pid(&host), before, "thawed in place, not restored");
+    assert_eq!(
+        host.get(&app, "/allocated").await.unwrap().body,
+        format!("{}:1", 32 * 1024 * 1024)
+    );
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_frozen_past_the_snapshot_lease_with_production_limits_thaws_in_place_through_the_activator() {
+    use guest_contract::control::{TENANT_CONTROL_TIMEOUT_MS, TENANT_FREEZE_LEASE_MS};
+    use nibrunnerd::config::{MemoryAdmission, MemoryAdmissionMode};
+
+    let Some(host) = crate::host_with(|config| {
+        config.memory_admission = Some(MemoryAdmission {
+            mode: MemoryAdmissionMode::Observe,
+            pool: None,
+            // Under 30 000 is taken as 30 000: the shortest a host freezes after.
+            freeze_after_ms: std::num::NonZeroU64::new(1),
+            reclaim: false,
+            headroom_mib: 256.try_into().unwrap(),
+        });
+    })
+    .await
+    else {
+        return;
+    };
+    // What mf writes for a durable unit: swap as large as its memory, a production priority and a
+    // fraction of a core.
+    let app = host
+        .tenant(1)
+        .on_request(10 * IDLE_TIMEOUT_MS)
+        .edited(|instance| {
+            instance.limits = Some(protocol::InstanceLimits {
+                concurrent: None,
+                cpu_percent: Some(25.try_into().unwrap()),
+                memory: Some(protocol::MemoryPolicy {
+                    target_mib: instance.config.resources.memory_mib.try_into().unwrap(),
+                    swap_mib: instance.config.resources.memory_mib,
+                    priority: protocol::MemoryPriority::Production,
+                }),
+            });
+        });
+    host.deploy(std::slice::from_ref(&app)).await;
+    host.until_state(&app.app_id, InstanceState::Running).await;
+    assert_eq!(host.get(&app, "/remember").await.unwrap().body, "1");
+    let pid = |host: &crate::RunningHost| {
+        nibrunnerd::adapters::vm::process::VmProcesses::new(host.host.config.runtime_dir.clone())
+            .read_record(&app.app_id)
+            .unwrap()
+            .pid
+    };
+    let before = pid(&host);
+
+    host.until_state(&app.app_id, InstanceState::Frozen).await;
+    // Past the lease a snapshot sleep's guest would release its tenant under: a paused guest's
+    // clock keeps running, and nothing sets it on the thaw.
+    tokio::time::sleep(Duration::from_millis(
+        TENANT_FREEZE_LEASE_MS + TENANT_CONTROL_TIMEOUT_MS,
+    ))
+    .await;
+    let [_, cold_boots, _, thawed] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+
+    let asked = Instant::now();
+    let answer = host.get(&app, "/remember").await.unwrap();
+    let took = asked.elapsed();
+
+    assert_eq!(answer.body, "2", "the tenant kept its memory");
+    // A12 asked for 300 ms. Under a quarter of a core the guest is throttled while it catches up
+    // on a pause of over half a minute: 331 ms on a 2-vCPU VPS, under 300 ms without the cap.
+    assert!(took < Duration::from_millis(500), "the thaw took {took:?}");
+    assert_eq!(pid(&host), before, "thawed in place, not booted again");
+    let [_, cold_boots_after, _, thawed_after] = host.host.metrics.sleep_wake.of(&app.app_id).wakes;
+    assert_eq!(thawed_after, thawed + 1, "the wake was a thaw");
+    assert_eq!(cold_boots_after, cold_boots, "nothing fell back to a cold boot");
+    let (sent, guest_time, answered) = (
+        nibrunnerd::clock::now_ms(),
+        host.get(&app, "/time")
+            .await
+            .unwrap()
+            .body
+            .parse::<i64>()
+            .unwrap(),
+        nibrunnerd::clock::now_ms(),
+    );
+    assert!(
+        guest_time >= sent - 1_000 && guest_time <= answered + 1_000,
+        "the thawed guest reads {guest_time} against the host's {sent}..{answered}, with no clock step"
+    );
     host.stop().await;
 }
