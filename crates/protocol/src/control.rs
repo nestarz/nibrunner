@@ -423,6 +423,7 @@ impl DesiredInstance {
                 DesiredInstanceState::Running | DesiredInstanceState::Stopped => SleepPolicy::Never,
             },
             first_boot: FirstBoot::Eager,
+            snapshot_ttl_ms: None,
         })
     }
 
@@ -654,6 +655,8 @@ pub struct HostDesiredState {
 struct HostDesiredStateFields {
     host_id: HostId,
     revision: Revision,
+    #[serde(default)]
+    max_apps: Option<u32>,
     volumes: Vec<DesiredVolume>,
     instances: Vec<DesiredInstance>,
     checkpoints: Vec<DesiredCheckpoint>,
@@ -681,6 +684,7 @@ impl TryFrom<HostDesiredStateFields> for HostDesiredState {
         Ok(Self {
             host_id: fields.host_id,
             revision: fields.revision,
+            max_apps: fields.max_apps,
             volumes: fields.volumes,
             instances: fields.instances,
             checkpoints: fields.checkpoints,

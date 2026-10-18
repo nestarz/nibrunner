@@ -353,17 +353,24 @@ impl HostState {
     /// snapshot; and each app's own, so that the sleeps a pass runs side by side wait on nothing
     /// but the disk.
     pub async fn transition(&self, app_id: &AppId) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut transitions = self
-                .transitions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // A guard and a waiter each hold a reference, so an app's lock is kept only while
-            // something is at it, and the map does not grow by one for every app ever moved.
-            transitions.retain(|_, lock| Arc::strong_count(lock) > 1);
-            transitions.entry(app_id.clone()).or_default().clone()
-        };
-        lock.lock_owned().await
+        self.transition_lock(app_id).lock_owned().await
+    }
+
+    /// The transition lock when nothing holds it: a pass that would only tidy up after an app
+    /// leaves one mid-sleep or mid-wake to the next pass rather than waiting on it.
+    pub(crate) fn try_transition(&self, app_id: &AppId) -> Option<OwnedMutexGuard<()>> {
+        self.transition_lock(app_id).try_lock_owned().ok()
+    }
+
+    fn transition_lock(&self, app_id: &AppId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut transitions = self
+            .transitions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A guard and a waiter each hold a reference, so an app's lock is kept only while
+        // something is at it, and the map does not grow by one for every app ever moved.
+        transitions.retain(|_, lock| Arc::strong_count(lock) > 1);
+        transitions.entry(app_id.clone()).or_default().clone()
     }
 
     pub async fn snapshot(&self) -> HostSnapshot {

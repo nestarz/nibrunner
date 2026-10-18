@@ -742,6 +742,7 @@ mod tests {
                 instance.activation = Some(ActivationPolicy {
                     first_boot: protocol::FirstBoot::Eager,
                     sleep_when: SleepPolicy::Never,
+                    snapshot_ttl_ms: None,
                 });
                 instance.config.health_check = HealthCheck::BootCompleted;
             })];
