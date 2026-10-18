@@ -116,6 +116,12 @@
         "failed"
       ]
     },
+    "CronSchedule": {
+      "description": "a five-field cron expression or an alias such as @daily, as the crontab line gave it",
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
+    },
     "CutoverFallback": {
       "description": "Why a deployment that asked to be cut over to was started only once the old one was stopped.",
       "oneOf": [
@@ -372,6 +378,39 @@
         "state"
       ]
     },
+    "ReportedCronJob": {
+      "description": "A job a deployment registered from inside its guest with `crontab`, as this host schedules it.",
+      "type": "object",
+      "properties": {
+        "commandDigest": {
+          "description": "SHA-256 of the command line, in hex: the command itself may carry secrets, and a control\nplane that wrote the crontab can match it without reading it back.",
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "jobId": {
+          "description": "The `cronJobId` every line its runs write to the app's log carries.",
+          "type": "string"
+        },
+        "nextRun": {
+          "description": "When the host next runs it, in the host's `[cron] time_zone`. Absent when the schedule has\nno occurrence this host can find.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schedule": {
+          "$ref": "#/$defs/CronSchedule"
+        }
+      },
+      "required": [
+        "jobId",
+        "schedule",
+        "commandDigest"
+      ]
+    },
     "ReportedExport": {
       "type": "object",
       "properties": {
@@ -441,6 +480,13 @@
               "type": "null"
             }
           ]
+        },
+        "cron": {
+          "description": "The cron jobs this deployment registered, in its crontab's order. Empty for a deployment\nthat registered none, or one that is not the deployment the registry holds for the app.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReportedCronJob"
+          }
         },
         "cutover": {
           "description": "How this app's last new deployment went when it asked for a cut-over and did not get a\nclean one. Absent after a clean cut-over, and for an instance that never asked for one.",

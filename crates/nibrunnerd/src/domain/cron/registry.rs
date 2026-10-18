@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use protocol::{AppId, CronJobDefinitions, CronTable, Crontab, DeploymentId};
+use protocol::{AppId, CronJobDefinitions, CronTable, Crontab, DeploymentId, ReportedCronJob};
 use tokio::sync::{watch, Mutex};
 
 use crate::domain::store::StoreError;
@@ -70,6 +70,22 @@ impl CronRegistry {
     pub async fn tables(&self) -> Result<Vec<CronTable>, CronRegistryError> {
         let _mutation = self.mutation.lock().await;
         Ok(self.read().await?.into_values().collect())
+    }
+
+    /// Every app's registered jobs, under the deployment that registered them.
+    pub async fn reported(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<BTreeMap<AppId, (DeploymentId, Vec<ReportedCronJob>)>, CronRegistryError> {
+        Ok(self
+            .tables()
+            .await?
+            .into_iter()
+            .map(|table| {
+                let jobs = super::jobs::reported_jobs(&table, now, self.time_zone);
+                (table.app_id, (table.deployment_id, jobs))
+            })
+            .collect())
     }
 
     pub async fn validate_restored(&self, after: DateTime<Utc>) -> Result<(), CronRegistryError> {
