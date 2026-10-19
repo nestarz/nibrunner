@@ -56,11 +56,13 @@ jobs:
             "$RUNNER_TEMP/dist"/*
 
       - name: Install nibrun cli
+        if: github.repository == 'ilbertt/nibrunner'
         uses: nibrunhq/setup-cli@a753b7a37b34d0389298f6b1647cff63a3993724 # v1.0.1
         with:
           version: latest
 
       - name: Deploy the docs site
+        if: github.repository == 'ilbertt/nibrunner'
         run: |
           nib run docs/dist/app \
             --github-trusted-oidc \
