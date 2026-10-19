@@ -760,7 +760,8 @@ mod file {
         pub(super) listen_address: Option<String>,
         /// Optional. A control plane's `s3://<bucket>/fleets/<fleet>` (or a directory ending in
         /// `fleets/<fleet>`): every 300 s that a counter moved, each labelled unit's counters are
-        /// added to `metrics/<hostId>/<yyyymmddhh>.json` and `<yyyymmdd>.json` there.
+        /// added to `metrics/<hostId>/<yyyymmddhh>.json` and `<yyyymmdd>.json` there, with a slot
+        /// for each minute of the hour, and each hour of the day, that counted something.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) sink: Option<String>,
     }
