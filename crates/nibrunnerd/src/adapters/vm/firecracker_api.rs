@@ -29,6 +29,7 @@ struct CreateSnapshot<'a> {
     snapshot_path: &'a str,
     mem_file_path: &'a str,
     snapshot_type: &'static str,
+    sync_snapshot_files: bool,
 }
 
 #[derive(Serialize)]
@@ -160,6 +161,10 @@ impl FirecrackerApi {
                 snapshot_path: &state_path.display().to_string(),
                 mem_file_path: &memory_path.display().to_string(),
                 snapshot_type: "Full",
+                // A snapshot is a cache: a file a host crash tears fails its hash on wake and the
+                // unit boots afresh, so the files stay in the page cache rather than holding the
+                // freeze for an fsync of the whole guest memory.
+                sync_snapshot_files: false,
             },
         )
         .await
@@ -288,7 +293,7 @@ mod tests {
         assert_eq!(calls[0].1, "/snapshot/create");
         assert_eq!(
             calls[0].2,
-            r#"{"snapshot_path":"/snap/vmstate","mem_file_path":"/snap/memory","snapshot_type":"Full"}"#
+            r#"{"snapshot_path":"/snap/vmstate","mem_file_path":"/snap/memory","snapshot_type":"Full","sync_snapshot_files":false}"#
         );
         assert_eq!(calls[1].1, "/snapshot/load");
         assert!(!calls[1].2.contains("mem_file_path"));
