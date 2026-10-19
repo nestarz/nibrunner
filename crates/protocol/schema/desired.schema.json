@@ -253,7 +253,7 @@
       "type": "object",
       "properties": {
         "activation": {
-          "description": "What puts this instance to sleep and what tells the host it is ready. A `sleepWhen` other\nthan `never` is refused on anything but an `on-request` instance.",
+          "description": "What puts this instance to sleep and what tells the host it is ready. A `sleepWhen` other\nthan `never` is refused on anything but an `on-request` instance. A change under the same\n`deploymentId` restarts nothing: the next idle evaluation reads the new `sleepWhen`, a\nfrozen guest that may no longer sleep on traffic is thawed, the next pass applies\n`snapshotTtlMs`, and `cutoverTimeoutMs` is the next cut-over's (one under way keeps its\ndeadline). `firstBoot` only says how an instance this host has not booted yet comes up.",
           "anyOf": [
             {
               "$ref": "#/$defs/ActivationPolicy"
@@ -270,14 +270,14 @@
           "$ref": "#/$defs/AppConfig"
         },
         "deploymentId": {
-          "description": "A running instance is replaced when this changes, and only then: a new layer or config\nunder the same `deploymentId` is not picked up.",
+          "description": "A running instance is replaced when this changes, and only then: a new layer or config\nunder the same `deploymentId` is not picked up. `activation`, `expiry`, `limits`,\n`labels`, `hostnames` and `desiredState` are taken up in place.",
           "$ref": "#/$defs/DeploymentId"
         },
         "desiredState": {
           "$ref": "#/$defs/DesiredInstanceState"
         },
         "expiry": {
-          "description": "Optional terminal retention for on-request instances: expired hostnames answer HTTP 410.\nRemoving the policy or changing deploymentId revives the instance.",
+          "description": "Optional terminal retention for on-request instances: expired hostnames answer HTTP 410.\nRemoving the policy or changing deploymentId revives the instance. A changed `idleMs` or\n`deadline` under the same `deploymentId` is read by the next expiry check, measured from\nthe instant the policy was first named; it never revives an instance already expired.",
           "anyOf": [
             {
               "$ref": "#/$defs/ExpiryPolicy"
