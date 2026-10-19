@@ -918,6 +918,38 @@ mod sleep_tests {
     }
 
     #[tokio::test]
+    async fn an_idle_time_edited_under_the_same_deployment_is_the_one_the_next_pass_reads() {
+        let host = on_request_host(None).await;
+        last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 + 1).await;
+        let document = |timeout_ms: u64| {
+            desired_state(|state| {
+                state.instances = vec![desired_instance(|instance| {
+                    instance.desired_state = DesiredInstanceState::OnRequest;
+                    instance.activation = Some(ActivationPolicy {
+                        sleep_when: protocol::SleepPolicy::TrafficIdle {
+                            timeout_ms: IdleTimeoutMs::try_from(timeout_ms).unwrap(),
+                        },
+                        ..default_idle_policy()
+                    });
+                })]
+            })
+        };
+
+        host.cache.lock().await.accept(document(3_600_000));
+        apply_sleep(host.arc()).await;
+        assert!(host.vms.calls().is_empty(), "an hour has not passed");
+
+        host.cache.lock().await.accept(document(60_000));
+        apply_sleep(host.arc()).await;
+        assert_eq!(host.vms.calls(), vec![VmCall::Sleep]);
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().deployment_id,
+            deployment_id(),
+            "slept, not replaced"
+        );
+    }
+
+    #[tokio::test]
     async fn how_late_the_policy_was_acted_on_is_measured_against_what_it_allowed() {
         let host = on_request_host(None).await;
         last_reached(&host, DEFAULT_IDLE_TIMEOUT_MS as i64 + 4_000).await;

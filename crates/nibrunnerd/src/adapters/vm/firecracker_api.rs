@@ -6,6 +6,8 @@ use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 
+use guest_contract::firecracker::HugePages;
+
 use crate::ports::VmError;
 
 const VM_PATH: &str = "/vm";
@@ -29,6 +31,7 @@ struct CreateSnapshot<'a> {
     snapshot_path: &'a str,
     mem_file_path: &'a str,
     snapshot_type: &'static str,
+    sync_snapshot_files: bool,
 }
 
 #[derive(Serialize)]
@@ -42,6 +45,7 @@ struct LoadSnapshot<'a> {
     snapshot_path: &'a str,
     mem_backend: MemBackend<'a>,
     clock_realtime: bool,
+    huge_pages: HugePages,
 }
 
 pub struct FirecrackerApi {
@@ -160,6 +164,10 @@ impl FirecrackerApi {
                 snapshot_path: &state_path.display().to_string(),
                 mem_file_path: &memory_path.display().to_string(),
                 snapshot_type: "Full",
+                // A snapshot is a cache: a file a host crash tears fails its hash on wake and the
+                // unit boots afresh, so the files stay in the page cache rather than holding the
+                // freeze for an fsync of the whole guest memory.
+                sync_snapshot_files: false,
             },
         )
         .await
@@ -180,6 +188,9 @@ impl FirecrackerApi {
                 // virtual machine's kvm-clock the load is refused ("clock_realtime requested but
                 // not present in the snapshot"). The host's release sets the guest's clock instead.
                 clock_realtime: false,
+                // Left out, the load reuses whatever the snapshot recorded; a snapshot kept across
+                // a reboot from before huge pages were configured would wake on 4 KiB pages.
+                huge_pages: HugePages::Transparent,
             },
         )
         .await
@@ -288,13 +299,13 @@ mod tests {
         assert_eq!(calls[0].1, "/snapshot/create");
         assert_eq!(
             calls[0].2,
-            r#"{"snapshot_path":"/snap/vmstate","mem_file_path":"/snap/memory","snapshot_type":"Full"}"#
+            r#"{"snapshot_path":"/snap/vmstate","mem_file_path":"/snap/memory","snapshot_type":"Full","sync_snapshot_files":false}"#
         );
         assert_eq!(calls[1].1, "/snapshot/load");
         assert!(!calls[1].2.contains("mem_file_path"));
         assert_eq!(
             calls[1].2,
-            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":false}"#
+            r#"{"snapshot_path":"/snap/vmstate","mem_backend":{"backend_type":"File","backend_path":"/snap/memory"},"clock_realtime":false,"huge_pages":"Transparent"}"#
         );
     }
 

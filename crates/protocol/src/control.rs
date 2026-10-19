@@ -476,7 +476,8 @@ impl JsonSchema for InstanceLabels {
 pub struct DesiredInstance {
     pub app_id: AppId,
     /// A running instance is replaced when this changes, and only then: a new layer or config
-    /// under the same `deploymentId` is not picked up.
+    /// under the same `deploymentId` is not picked up. `activation`, `expiry`, `limits`,
+    /// `labels`, `hostnames` and `desiredState` are taken up in place.
     pub deployment_id: DeploymentId,
     /// One of this document's `volumes`, stacked writable over the layers. Absent when `scratch`
     /// is named instead; one of the two always is.
@@ -491,11 +492,17 @@ pub struct DesiredInstance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_ms: Option<IdleTimeoutMs>,
     /// What puts this instance to sleep and what tells the host it is ready. A `sleepWhen` other
-    /// than `never` is refused on anything but an `on-request` instance.
+    /// than `never` is refused on anything but an `on-request` instance. A change under the same
+    /// `deploymentId` restarts nothing: the next idle evaluation reads the new `sleepWhen`, a
+    /// frozen guest that may no longer sleep on traffic is thawed, the next pass applies
+    /// `snapshotTtlMs`, and `cutoverTimeoutMs` is the next cut-over's (one under way keeps its
+    /// deadline). `firstBoot` only says how an instance this host has not booted yet comes up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<ActivationPolicy>,
     /// Optional terminal retention for on-request instances: expired hostnames answer HTTP 410.
-    /// Removing the policy or changing deploymentId revives the instance.
+    /// Removing the policy or changing deploymentId revives the instance. A changed `idleMs` or
+    /// `deadline` under the same `deploymentId` is read by the next expiry check, measured from
+    /// the instant the policy was first named; it never revives an instance already expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry: Option<ExpiryPolicy>,
     /// What the host enforces beyond `config.resources`, applied without a new deployment.

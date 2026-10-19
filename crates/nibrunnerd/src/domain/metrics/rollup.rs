@@ -5,12 +5,17 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// How often the counters are written: at most once a window, and only when one moved.
 pub const ROLLUP_EVERY_S: i64 = 300;
+/// How often the counters are read into the minute that just ended, in memory.
+pub const COUNT_EVERY_S: i64 = 60;
 
 /// One unit's counters over an hour or a day.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct UnitMetrics {
+    /// Set on a unit's total, left out of its slots.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub app: String,
     pub requests: u64,
     pub by_status: BTreeMap<String, u64>,
@@ -66,6 +71,21 @@ impl UnitMetrics {
     }
 }
 
+/// One unit's counters over the hour (or the day), its total's fields at the top as before, and
+/// beside them the same counters for each minute of the hour (`"04"`), or each hour of the day
+/// (`"14"`), that counted something. Slots are sparse and add up to the total, so a reader sums
+/// whichever a range and a step need and derives percentiles from their buckets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UnitSlots {
+    #[serde(flatten)]
+    pub total: UnitMetrics,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub minutes: BTreeMap<String, UnitMetrics>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub hours: BTreeMap<String, UnitMetrics>,
+}
+
 /// The day file has this shape too, its day key under `hour`: what the readers expect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -73,8 +93,10 @@ pub struct MetricsHour {
     #[serde(alias = "day")]
     pub hour: String,
     pub at: String,
-    pub units: BTreeMap<String, UnitMetrics>,
+    pub units: BTreeMap<String, UnitSlots>,
 }
+
+type Slot = fn(&mut UnitSlots) -> &mut BTreeMap<String, UnitMetrics>;
 
 fn utc(secs: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default()
@@ -84,6 +106,14 @@ pub fn hour_key(secs: i64) -> String {
 }
 pub fn day_key(secs: i64) -> String {
     utc(secs).format("%Y%m%d").to_string()
+}
+/// A minute's slot in its hour file.
+pub fn minute_slot(secs: i64) -> String {
+    utc(secs).format("%M").to_string()
+}
+/// An hour's slot in its day file.
+pub fn hour_slot(secs: i64) -> String {
+    utc(secs).format("%H").to_string()
 }
 pub fn mmss(secs: i64) -> String {
     utc(secs).format("%M%S").to_string()
@@ -164,8 +194,8 @@ pub struct Counting {
     last: Option<Samples>,
     pub hour: String,
     pub day: String,
-    hours: BTreeMap<String, UnitMetrics>,
-    days: BTreeMap<String, UnitMetrics>,
+    hours: BTreeMap<String, UnitSlots>,
+    days: BTreeMap<String, UnitSlots>,
     /// A counter moved and the write that says so has not succeeded yet.
     pub dirty: bool,
 }
@@ -196,10 +226,11 @@ impl Counting {
         }
     }
 
-    /// Adds what each counter counted since the last scrape; whether one moved. A counter lower
-    /// than it was counts from zero (the daemon restarted); one first seen after the baseline
-    /// counts whole. Memory is a gauge: it rides along with counters and never causes a write.
-    pub fn count(&mut self, sampled: Samples, apps: &BTreeMap<String, String>) -> bool {
+    /// Adds what each counter counted since the last scrape to the totals and to the slots of
+    /// `t`, the minute that just ended; whether one moved. A counter lower than it was counts from
+    /// zero (the daemon restarted); one first seen after the baseline counts whole. Memory is a
+    /// gauge: it rides along with counters and never causes a write, nor a slot.
+    pub fn count(&mut self, sampled: Samples, apps: &BTreeMap<String, String>, t: i64) -> bool {
         let mut moved = false;
         for (unit, series) in &sampled {
             let Some(app) = apps.get(unit) else { continue };
@@ -281,11 +312,18 @@ impl Counting {
                 m.latency_hist.insert(le, n.saturating_sub(below));
                 below = below.max(n);
             }
-            for held in [&mut self.hours, &mut self.days] {
+            let tiers: [(&mut BTreeMap<String, UnitSlots>, String, Slot); 2] = [
+                (&mut self.hours, minute_slot(t), |u| &mut u.minutes),
+                (&mut self.days, hour_slot(t), |u| &mut u.hours),
+            ];
+            for (held, slot, slots) in tiers {
                 if unit_moved || held.contains_key(unit) {
                     let h = held.entry(unit.clone()).or_default();
-                    h.add(&m);
-                    h.app.clone_from(app);
+                    h.total.add(&m);
+                    h.total.app.clone_from(app);
+                    if unit_moved {
+                        slots(h).entry(slot).or_default().add(&m);
+                    }
                 }
             }
             moved |= unit_moved;
@@ -296,7 +334,7 @@ impl Counting {
 
     /// The hour and the day as they stand, keyed by their key.
     pub fn documents(&self, now: i64) -> [(String, MetricsHour); 2] {
-        let document = |key: &str, units: &BTreeMap<String, UnitMetrics>| MetricsHour {
+        let document = |key: &str, units: &BTreeMap<String, UnitSlots>| MetricsHour {
             hour: key.to_owned(),
             at: rfc3339(now),
             units: units.clone(),
@@ -356,12 +394,15 @@ mod tests {
     #[test]
     fn the_first_scrape_is_the_baseline_and_only_what_moved_after_it_is_counted() {
         let mut counting = Counting::carried(HOUR, None, None);
-        assert!(!counting.count(parse(&page(10, 4.0)), &units()));
-        assert!(!counting.count(parse(&page(10, 4.0)), &units()), "nothing moved");
-        assert!(counting.count(parse(&page(12, 5.5)), &units()));
+        assert!(!counting.count(parse(&page(10, 4.0)), &units(), HOUR + 240));
+        assert!(
+            !counting.count(parse(&page(10, 4.0)), &units(), HOUR + 240),
+            "nothing moved"
+        );
+        assert!(counting.count(parse(&page(12, 5.5)), &units(), HOUR + 240));
         let [(hour, document), (day, _)] = counting.documents(HOUR + 600);
         assert_eq!((hour.as_str(), day.as_str()), ("2026101612", "20261016"));
-        let site = &document.units["site"];
+        let site = &document.units["site"].total;
         assert_eq!(site.requests, 2);
         assert_eq!(
             site.by_status,
@@ -413,9 +454,9 @@ mod tests {
             )
         };
         let mut counting = Counting::carried(HOUR, None, None);
-        counting.count(parse(&page(0, 0)), &units());
-        assert!(counting.count(parse(&page(3, 1)), &units()));
-        let site = &counting.documents(HOUR)[0].1.units["site"];
+        counting.count(parse(&page(0, 0)), &units(), HOUR + 240);
+        assert!(counting.count(parse(&page(3, 1)), &units(), HOUR + 240));
+        let site = &counting.documents(HOUR)[0].1.units["site"].total;
         assert_eq!(site.requests, 4);
         assert_eq!(
             site.by_status,
@@ -436,49 +477,105 @@ mod tests {
     #[test]
     fn a_counter_that_went_down_counts_from_zero_and_a_new_hour_starts_empty() {
         let mut counting = Counting::carried(HOUR, None, None);
-        counting.count(parse(&page(10, 4.0)), &units());
-        assert!(counting.count(parse(&page(3, 1.0)), &units()));
-        assert_eq!(counting.documents(HOUR)[0].1.units["site"].requests, 3);
+        counting.count(parse(&page(10, 4.0)), &units(), HOUR + 240);
+        assert!(counting.count(parse(&page(3, 1.0)), &units(), HOUR + 240));
+        assert_eq!(counting.documents(HOUR)[0].1.units["site"].total.requests, 3);
         assert!(counting.ends_before(HOUR + 3600));
         counting.start(HOUR + 3600);
         assert!(counting.documents(HOUR + 3600)[0].1.units.is_empty());
-        assert_eq!(counting.documents(HOUR + 3600)[1].1.units["site"].requests, 3);
+        assert_eq!(
+            counting.documents(HOUR + 3600)[1].1.units["site"].total.requests,
+            3
+        );
     }
 
     #[test]
     fn the_hour_file_is_written_in_the_shape_the_control_plane_reads() {
-        let units = [(
-            "site".to_string(),
-            UnitMetrics {
+        let point = UnitMetrics {
+            app: String::new(),
+            requests: 3,
+            by_status: [("2xx".to_string(), 2), ("5xx".to_string(), 1)].into(),
+            latency_hist: [("0.005".to_string(), 2), ("+Inf".to_string(), 1)].into(),
+            cpu_s: 1.5,
+            mem_peak_mib: 64,
+            rx_bytes: 100,
+            tx_bytes: 200,
+            wakes: 1,
+            wakes_thawed: 1,
+            wakes_restored: 0,
+            wakes_booted: 0,
+            wakes_failed: 0,
+            sleeps: 0,
+            cache_hit: 2,
+            cache_stale: 0,
+            cache_miss: 1,
+            cache_bypass: 0,
+            encoded_bytes_in: 30_000,
+            encoded_bytes_out: 2_000,
+        };
+        let site = UnitSlots {
+            total: UnitMetrics {
                 app: "site".into(),
-                requests: 3,
-                by_status: [("2xx".to_string(), 2), ("5xx".to_string(), 1)].into(),
-                latency_hist: [("0.005".to_string(), 2), ("+Inf".to_string(), 1)].into(),
-                cpu_s: 1.5,
-                mem_peak_mib: 64,
-                rx_bytes: 100,
-                tx_bytes: 200,
-                wakes: 1,
-                wakes_thawed: 1,
-                wakes_restored: 0,
-                wakes_booted: 0,
-                wakes_failed: 0,
-                sleeps: 0,
-                cache_hit: 2,
-                cache_stale: 0,
-                cache_miss: 1,
-                cache_bypass: 0,
-                encoded_bytes_in: 30_000,
-                encoded_bytes_out: 2_000,
+                ..point.clone()
             },
-        )];
+            minutes: [("04".to_string(), point)].into(),
+            hours: BTreeMap::new(),
+        };
         let document = MetricsHour {
             hour: "2026101612".into(),
             at: rfc3339(HOUR + 600),
-            units: units.into(),
+            units: [("site".to_string(), site)].into(),
         };
         let expected = include_bytes!("../../../tests/fixtures/telemetry/metrics-hour.json");
         assert_eq!(serde_json::to_vec(&document).unwrap(), expected);
+    }
+
+    #[test]
+    fn each_minute_and_each_hour_that_counted_has_a_slot_and_the_slots_add_up_to_the_total() {
+        let mut counting = Counting::carried(HOUR, None, None);
+        counting.count(parse(&page(10, 4.0)), &units(), HOUR + 59);
+        assert!(counting.count(parse(&page(12, 4.5)), &units(), HOUR + 119));
+        assert!(
+            !counting.count(parse(&page(12, 4.5)), &units(), HOUR + 179),
+            "a quiet minute"
+        );
+        assert!(counting.count(parse(&page(15, 5.5)), &units(), HOUR + 239));
+        let [(_, hour), (_, day)] = counting.documents(HOUR + 240);
+        let site = &hour.units["site"];
+        assert_eq!(
+            site.minutes.keys().collect::<Vec<_>>(),
+            ["01", "03"],
+            "only the minutes that counted"
+        );
+        assert_eq!((site.minutes["01"].requests, site.minutes["03"].requests), (2, 3));
+        assert_eq!(site.total.requests, 5);
+        let mut summed = UnitMetrics::default();
+        site.minutes.values().for_each(|slot| summed.add(slot));
+        assert_eq!(
+            UnitMetrics {
+                app: "site".into(),
+                ..summed
+            },
+            site.total
+        );
+        assert!(site.hours.is_empty() && site.minutes["01"].app.is_empty());
+        let site = &day.units["site"];
+        assert_eq!(site.hours.keys().collect::<Vec<_>>(), ["12"]);
+        assert_eq!((site.hours["12"].requests, site.total.requests), (5, 5));
+        assert!(site.minutes.is_empty());
+    }
+
+    #[test]
+    fn a_file_written_before_the_slots_reads_as_its_totals() {
+        let old = br#"{"hour":"2026101612","at":"2026-10-16T12:10:00Z","units":{"site":{"app":"site","requests":3,"by_status":{"2xx":3}}}}"#;
+        let read: MetricsHour = serde_json::from_slice(old).unwrap();
+        assert_eq!(read.units["site"].total.requests, 3);
+        assert!(read.units["site"].minutes.is_empty());
+        let mut counting = Counting::carried(HOUR + 600, Some(read), None);
+        counting.count(parse(&page(10, 4.0)), &units(), HOUR + 659);
+        counting.count(parse(&page(11, 4.0)), &units(), HOUR + 719);
+        let site = &counting.documents(HOUR + 720)[0].1.units["site"];
+        assert_eq!((site.total.requests, site.minutes["11"].requests), (4, 1));
     }
 
     #[test]
@@ -486,6 +583,10 @@ mod tests {
         assert_eq!(hour_key(HOUR + 305), "2026101612");
         assert_eq!(day_key(HOUR + 305), "20261016");
         assert_eq!(mmss(HOUR + 305), "0505");
+        assert_eq!(
+            (minute_slot(HOUR + 305), hour_slot(HOUR + 305)),
+            ("05".into(), "12".into())
+        );
         assert_eq!(rfc3339(HOUR + 5), "2026-10-16T12:00:05Z");
         assert_eq!(
             micros_rfc3339(HOUR * 1_000_000 + 123_000),

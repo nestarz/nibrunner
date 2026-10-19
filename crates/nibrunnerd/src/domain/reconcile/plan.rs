@@ -1153,6 +1153,104 @@ mod tests {
         }
     }
 
+    mod a_policy_changed_under_the_same_deployment {
+        use super::*;
+        use protocol::{
+            ActivationPolicy, CutoverTimeoutMs, ExpiryIdleMs, ExpiryPolicy, FirstBoot, IdleTimeoutMs,
+            MaxLifetimeMs, SleepPolicy, SnapshotTtlMs, Timestamp, MIN_EXPIRY_IDLE_MS,
+        };
+
+        /// Every activation and expiry a document can name for an on-request app: what a control
+        /// plane moves when an idle time is edited or a revision changes rank in its pool.
+        fn policies() -> Vec<(ActivationPolicy, Option<ExpiryPolicy>)> {
+            let sleeps = [
+                SleepPolicy::Never,
+                SleepPolicy::TrafficIdle {
+                    timeout_ms: IdleTimeoutMs::try_from(60_000).unwrap(),
+                },
+                SleepPolicy::TrafficIdle {
+                    timeout_ms: IdleTimeoutMs::try_from(3_600_000).unwrap(),
+                },
+                SleepPolicy::MaxLifetime {
+                    ttl_ms: MaxLifetimeMs::try_from(600_000).unwrap(),
+                },
+            ];
+            let expiries = [
+                None,
+                Some(ExpiryPolicy {
+                    idle_ms: ExpiryIdleMs::try_from(MIN_EXPIRY_IDLE_MS).unwrap(),
+                    deadline: None,
+                }),
+                Some(ExpiryPolicy {
+                    idle_ms: ExpiryIdleMs::try_from(2 * MIN_EXPIRY_IDLE_MS).unwrap(),
+                    deadline: Some(Timestamp::from_epoch_ms(1_792_152_000_000)),
+                }),
+            ];
+            let mut all = Vec::new();
+            for sleep_when in sleeps {
+                for snapshot_ttl_ms in [None, Some(SnapshotTtlMs::try_from(86_400_000).unwrap())] {
+                    for cutover_timeout_ms in [None, Some(CutoverTimeoutMs::try_from(600_000).unwrap())] {
+                        for expiry in &expiries {
+                            let activation = ActivationPolicy {
+                                sleep_when,
+                                first_boot: FirstBoot::Eager,
+                                snapshot_ttl_ms,
+                                cutover_timeout_ms,
+                            };
+                            all.push((activation, expiry.clone()));
+                        }
+                    }
+                }
+            }
+            all
+        }
+
+        fn under((activation, expiry): &(ActivationPolicy, Option<ExpiryPolicy>)) -> DesiredInstance {
+            desired_instance(|instance| {
+                instance.desired_state = DesiredInstanceState::OnRequest;
+                instance.activation = Some(*activation);
+                instance.expiry = expiry.clone();
+            })
+        }
+
+        #[test]
+        fn one_that_is_up_is_left_alone_whatever_the_policy_now_says() {
+            for policy in policies() {
+                let result = plan(
+                    desired_state(|state| state.instances = vec![under(&policy)]),
+                    observed_state(|state| state.instances = vec![observed_instance(|_| {})]),
+                );
+                assert_eq!(
+                    result.instances,
+                    vec![InstancePlan::None { app_id: app_id() }],
+                    "{policy:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn one_that_is_asleep_stays_asleep_whatever_the_policy_now_says() {
+            for policy in policies() {
+                let result = plan(
+                    desired_state(|state| state.instances = vec![under(&policy)]),
+                    observed_state(|state| {
+                        state.instances = vec![observed_instance(|instance| {
+                            instance.running = false;
+                            instance.exited = false;
+                        })]
+                    }),
+                );
+                assert_eq!(
+                    result.instances,
+                    vec![InstancePlan::Sleep {
+                        desired: under(&policy)
+                    }],
+                    "{policy:?}"
+                );
+            }
+        }
+    }
+
     mod a_program_run_once {
         use super::*;
 

@@ -1411,6 +1411,88 @@ mod tests {
         assert!(stopped < booted);
     }
 
+    fn on_request_under(
+        activation: protocol::ActivationPolicy,
+        expiry: Option<protocol::ExpiryPolicy>,
+    ) -> protocol::HostDesiredState {
+        desired_state(|state| {
+            state.volumes = vec![desired_volume(|_| {})];
+            state.instances = vec![desired_instance(|instance| {
+                instance.desired_state = DesiredInstanceState::OnRequest;
+                instance.hostnames = vec![app_hostname()];
+                instance.activation = Some(activation);
+                instance.expiry = expiry;
+            })];
+        })
+    }
+
+    #[tokio::test]
+    async fn a_policy_changed_under_the_same_deployment_is_taken_up_in_place_rather_than_replaced() {
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let idle_for = |ms: u64| protocol::ActivationPolicy {
+            sleep_when: protocol::SleepPolicy::TrafficIdle {
+                timeout_ms: protocol::IdleTimeoutMs::try_from(ms).unwrap(),
+            },
+            first_boot: protocol::FirstBoot::Eager,
+            snapshot_ttl_ms: None,
+            cutover_timeout_ms: None,
+        };
+        let expiry = |hours: u64| protocol::ExpiryPolicy {
+            idle_ms: protocol::ExpiryIdleMs::try_from(hours * protocol::MIN_EXPIRY_IDLE_MS).unwrap(),
+            deadline: None,
+        };
+        reconcile(
+            host.arc(),
+            &on_request_under(idle_for(300_000), None),
+            Trigger::Change,
+        )
+        .await;
+        host.vms.set_status(running_vm());
+        let booted = host.vms.calls();
+        assert!(booted.contains(&VmCall::Boot));
+        let state = host.state.record(&app_id()).await.unwrap().state;
+
+        // An idle time edited, a snapshot TTL and a cut-over timeout added, an expiry begun.
+        let edited = protocol::ActivationPolicy {
+            snapshot_ttl_ms: Some(protocol::SnapshotTtlMs::try_from(86_400_000).unwrap()),
+            cutover_timeout_ms: Some(protocol::CutoverTimeoutMs::try_from(600_000).unwrap()),
+            ..idle_for(3_600_000)
+        };
+        reconcile(
+            host.arc(),
+            &on_request_under(edited, Some(expiry(1))),
+            Trigger::Change,
+        )
+        .await;
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(
+            host.vms.calls(),
+            booted,
+            "nothing was stopped, booted or replaced"
+        );
+        assert_eq!(record.deployment_id, deployment_id());
+        assert_eq!(record.state, state);
+        assert_eq!(record.expiry, Some(expiry(1)), "the next expiry check reads it");
+        let began = record
+            .expiry_since_ms
+            .expect("the expiry began with the pass that named it");
+
+        // A revision moving in its pool lengthens its expiry: the instant it began stands.
+        reconcile(
+            host.arc(),
+            &on_request_under(edited, Some(expiry(3))),
+            Trigger::Change,
+        )
+        .await;
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(host.vms.calls(), booted);
+        assert_eq!(
+            (record.expiry, record.expiry_since_ms),
+            (Some(expiry(3)), Some(began))
+        );
+    }
+
     #[tokio::test]
     async fn a_microvm_this_host_adopted_without_a_record_is_still_observed() {
         let host = test_host().await;

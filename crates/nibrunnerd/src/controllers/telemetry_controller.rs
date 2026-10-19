@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::adapters::logs::object_sink::{Bucket, TelemetryError};
 use crate::controllers::Controller;
-use crate::domain::metrics::rollup::{parse, Counting, MetricsHour, ROLLUP_EVERY_S};
+use crate::domain::metrics::rollup::{parse, Counting, MetricsHour, COUNT_EVERY_S, ROLLUP_EVERY_S};
 use crate::host::Host;
 
 /// How often a live tail of an app that printed is rewritten, and a full chunk written early.
@@ -57,17 +57,19 @@ impl Controller for TelemetryController {
     }
 }
 
-/// The hour and day being counted, rewritten at a [`ROLLUP_EVERY_S`] boundary only when a counter
-/// moved, and once more at the hour's end when a write failed.
+/// The hour and day being counted, each minute into its slot in memory, and rewritten at most once
+/// a [`ROLLUP_EVERY_S`] window, only when a counter moved, and once more at the hour's end when
+/// a write failed.
 #[derive(Default)]
 struct Rollup {
     slot: Option<i64>,
+    written: Option<i64>,
     counting: Option<Counting>,
 }
 
 impl Rollup {
     fn due(&mut self, now: i64) -> bool {
-        let slot = now.div_euclid(ROLLUP_EVERY_S) * ROLLUP_EVERY_S;
+        let slot = now.div_euclid(COUNT_EVERY_S) * COUNT_EVERY_S;
         self.slot.replace(slot) != Some(slot)
     }
 
@@ -82,16 +84,17 @@ impl Rollup {
         if host.is_empty() {
             return Ok(());
         }
-        let slot = now.div_euclid(ROLLUP_EVERY_S) * ROLLUP_EVERY_S;
-        // What the last interval counted belongs to the slot that just ended.
+        let slot = now.div_euclid(COUNT_EVERY_S) * COUNT_EVERY_S;
+        // What the last interval counted belongs to the minute that just ended.
         let ended = slot - 1;
         let counting = match &mut self.counting {
             Some(counting) => counting,
             None => self.counting.insert(carried(bucket, host, ended).await),
         };
         roll(bucket, host, counting, ended).await?;
-        counting.dirty |= counting.count(parse(page), units);
-        if counting.dirty {
+        counting.dirty |= counting.count(parse(page), units, ended);
+        let window = now.div_euclid(ROLLUP_EVERY_S);
+        if counting.dirty && self.written.replace(window) != Some(window) {
             write(bucket, host, counting, now).await?;
         }
         roll(bucket, host, counting, slot).await
@@ -190,6 +193,50 @@ mod tests {
         }
         let day = bucket.get("metrics/ovh-1/20261016.json").await.unwrap().unwrap();
         let day: MetricsHour = serde_json::from_slice(&day).unwrap();
-        assert_eq!((day.hour.as_str(), day.units["site"].requests), ("20261016", 5));
+        assert_eq!(
+            (day.hour.as_str(), day.units["site"].total.requests),
+            ("20261016", 5)
+        );
+    }
+
+    async fn hour_file(bucket: &Bucket) -> Option<crate::domain::metrics::rollup::UnitSlots> {
+        let body = bucket.get("metrics/ovh-1/2026101612.json").await.unwrap()?;
+        Some(serde_json::from_slice::<MetricsHour>(&body).unwrap().units["site"].clone())
+    }
+
+    #[tokio::test]
+    async fn each_minute_is_counted_into_its_slot_and_the_files_are_written_once_a_window() {
+        let store = Arc::new(InMemory::new());
+        let bucket = Bucket::new(store.clone(), None, "acme");
+        let units: BTreeMap<String, String> = [("site".to_string(), "site".to_string())].into();
+        let mut rollup = Rollup::default();
+        for (at, requests) in [(HOUR + 60, 1), (HOUR + 120, 3), (HOUR + 180, 6)] {
+            assert!(rollup.due(at));
+            rollup
+                .advance(&bucket, "ovh-1", &units, &page(requests), at)
+                .await
+                .unwrap();
+        }
+        let site = hour_file(&bucket)
+            .await
+            .expect("the window's first move is written");
+        assert_eq!(
+            (site.total.requests, site.minutes.into_keys().collect::<Vec<_>>()),
+            (2, vec!["01".to_string()]),
+            "the next minute of the same window waits in memory"
+        );
+        rollup
+            .advance(&bucket, "ovh-1", &units, &page(10), HOUR + 300)
+            .await
+            .unwrap();
+        let site = hour_file(&bucket).await.unwrap();
+        assert_eq!(site.total.requests, 9);
+        assert_eq!(
+            site.minutes
+                .iter()
+                .map(|(minute, slot)| (minute.as_str(), slot.requests))
+                .collect::<Vec<_>>(),
+            [("01", 2), ("02", 3), ("04", 4)]
+        );
     }
 }
