@@ -159,7 +159,7 @@ sink = "s3://my-bucket/fleets/my-fleet"
 |---|---|
 | `logs/<app>/live-<hostId>.jsonl.gz` | every 5 s that the app printed: its last 2 minutes, at most 256 KiB |
 | `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | every 5 minutes that it printed, and when `desired.json` stops naming it; named after its first line, never overwritten |
-| `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, cache outcomes and bytes compressed, per unit |
+| `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, cache outcomes and bytes compressed, per unit: the hour's or day's total, and beside it a slot for each minute of the hour (`minutes`) or hour of the day (`hours`) that counted something |
 
 Log objects are gzipped JSON lines sealed with XChaCha20-Poly1305 under the 32 raw bytes in
 `seal_key_file`, authenticated with `<fleet>/<key>`. A sink URL ends in `fleets/<fleet>`. A
