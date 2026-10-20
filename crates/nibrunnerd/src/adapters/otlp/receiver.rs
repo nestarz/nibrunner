@@ -38,8 +38,18 @@ struct Listener {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Who the guest at an address is right now, read from the host's slots and records.
+pub type SenderLookup =
+    Arc<dyn Fn(Ipv4Addr) -> futures::future::BoxFuture<'static, Option<OtlpSender>> + Send + Sync>;
+
+/// How long an export from an address no unit holds yet waits for one to: a slot is taken and its
+/// record written before the guest boots, so this is only ever a pass caught between the two.
+const UNKNOWN_SENDER_WAIT: Duration = Duration::from_secs(2);
+const UNKNOWN_SENDER_POLL: Duration = Duration::from_millis(50);
+
 pub struct OtlpReceiver {
     sink: Option<Arc<ObjectSink>>,
+    lookup: std::sync::OnceLock<SenderLookup>,
     port: u16,
     senders: std::sync::RwLock<Arc<BTreeMap<Ipv4Addr, OtlpSender>>>,
     listeners: tokio::sync::Mutex<BTreeMap<Ipv4Addr, Listener>>,
@@ -78,11 +88,24 @@ impl OtlpReceiver {
     pub fn new(sink: Option<Arc<ObjectSink>>, port: u16) -> Arc<Self> {
         Arc::new(Self {
             sink,
+            lookup: std::sync::OnceLock::new(),
             port,
             senders: std::sync::RwLock::default(),
             listeners: tokio::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
         })
+    }
+
+    /// Asks `lookup` who sent each export, so a guest is known from the moment its slot and record
+    /// are, rather than from the next pass that hands over the senders.
+    pub fn resolve_with(&self, lookup: SenderLookup) {
+        let _ = self.lookup.set(lookup);
+    }
+
+    /// Listens on `host`, a tap address a guest is about to boot behind, unless it already does.
+    pub async fn listen(self: &Arc<Self>, host: Ipv4Addr) {
+        let mut listeners = self.listeners.lock().await;
+        self.bind_missing(&mut listeners, [host]);
     }
 
     /// Listens on each sender's tap address, and on no other.
@@ -101,6 +124,14 @@ impl OtlpReceiver {
             }
             keep
         });
+        self.bind_missing(&mut listeners, hosts);
+    }
+
+    fn bind_missing(
+        self: &Arc<Self>,
+        listeners: &mut BTreeMap<Ipv4Addr, Listener>,
+        hosts: impl IntoIterator<Item = Ipv4Addr>,
+    ) {
         for host in hosts {
             if listeners.contains_key(&host) {
                 continue;
@@ -133,20 +164,41 @@ impl OtlpReceiver {
         self.listeners.lock().await.values().map(|l| l.local).collect()
     }
 
-    /// The unit of the guest at `peer`, when it reached the address of its own tap.
-    fn sender(&self, peer: IpAddr, local: IpAddr) -> Option<OtlpSender> {
+    /// The unit of the guest at `peer`, when it reached the address of its own tap: as the host
+    /// knows it now, else as the last pass said, waiting briefly for a unit being set up.
+    async fn sender(&self, peer: IpAddr, local: IpAddr) -> Option<OtlpSender> {
         let (IpAddr::V4(peer), IpAddr::V4(local)) = (peer, local) else {
             return None;
         };
-        let senders = self
-            .senders
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        senders.get(&peer).filter(|s| s.host_ipv4 == local).cloned()
+        let deadline = tokio::time::Instant::now() + UNKNOWN_SENDER_WAIT;
+        loop {
+            let live = match self.lookup.get() {
+                Some(lookup) => lookup(peer).await,
+                None => None,
+            };
+            let known = live.or_else(|| {
+                let senders = self
+                    .senders
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                senders.get(&peer).cloned()
+            });
+            if let Some(sender) = known.filter(|s| s.host_ipv4 == local) {
+                return Some(sender);
+            }
+            if self.lookup.get().is_none() || tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(UNKNOWN_SENDER_POLL).await;
+        }
     }
 
-    async fn answer(&self, sender: Option<&OtlpSender>, request: Request<Incoming>) -> Answer {
+    async fn answer(&self, peer: IpAddr, local: Option<IpAddr>, request: Request<Incoming>) -> Answer {
+        let sender = match local {
+            Some(local) => self.sender(peer, local).await,
+            None => None,
+        };
         let Some(sender) = sender else {
             return answer(StatusCode::FORBIDDEN, "This address is no guest of this host.\n");
         };
@@ -252,13 +304,14 @@ async fn accept(listener: TcpListener, receiver: Arc<OtlpReceiver>) {
         let Ok((stream, peer)) = listener.accept().await else {
             continue;
         };
-        let local = stream.local_addr().map(|a| a.ip());
+        let local = stream.local_addr().ok().map(|a| a.ip());
         let receiver = receiver.clone();
         tokio::spawn(async move {
-            let sender = local.ok().and_then(|local| receiver.sender(peer.ip(), local));
+            // Asked on every request: a guest booted beside its app under the staging id is the
+            // app itself once the cut-over hands it the slot.
             let service = service_fn(move |request| {
-                let (receiver, sender) = (receiver.clone(), sender.clone());
-                async move { Ok::<_, std::convert::Infallible>(receiver.answer(sender.as_ref(), request).await) }
+                let receiver = receiver.clone();
+                async move { Ok::<_, std::convert::Infallible>(receiver.answer(peer.ip(), local, request).await) }
             });
             let _ = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -370,6 +423,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_guests_first_export_is_filed_under_the_deployment_the_host_knows_it_as_before_any_pass() {
+        let (sink, store) = sink();
+        sink.learn(&crate::test_support::desired_state(|state| {
+            state.host_id = protocol::HostId::parse("ovh-1").unwrap();
+            state.instances = vec![crate::test_support::desired_instance(|instance| {
+                instance.deployment_id = DeploymentId::parse("dep-2").unwrap();
+                instance.labels = serde_json::from_value(serde_json::json!({
+                    "app": "site", "rev": "r-2", "context": "production"
+                }))
+                .unwrap();
+            })];
+        }));
+        let receiver = OtlpReceiver::new(Some(sink.clone()), 0);
+        let known_after = tokio::time::Instant::now() + Duration::from_millis(300);
+        receiver.resolve_with(Arc::new(move |guest| {
+            Box::pin(async move {
+                (tokio::time::Instant::now() >= known_after).then(|| OtlpSender {
+                    deployment_id: Some(DeploymentId::parse("dep-2").unwrap()),
+                    guest_ipv4: guest,
+                    ..loopback_sender()
+                })
+            })
+        }));
+        receiver.listen(LOOPBACK).await;
+        let at = receiver.listening_on().await[0];
+        let minted = TraceBook::host().mint(crate::clock::now_us()).to_string();
+        let answered = post(
+            at,
+            "/v1/traces",
+            "application/json",
+            DENO_TRACES.replace(DENO_TRACE, &minted),
+        )
+        .await;
+        assert_eq!(
+            answered.status(),
+            200,
+            "a unit being set up is waited for, not refused"
+        );
+        sink.forget(&app_id()).await.unwrap();
+        let traces: Vec<TraceLine> = read_lines(&store, "traces/site/2026102009/2152-ovh-1.jsonl.gz").await;
+        assert!(traces
+            .iter()
+            .all(|line| matches!(line, TraceLine::Span(span) if span.rev == "r-2")));
+    }
+
+    #[tokio::test]
     async fn an_address_that_is_no_guest_or_reached_another_taps_address_is_refused() {
         let elsewhere = OtlpSender {
             guest_ipv4: Ipv4Addr::new(10, 201, 0, 2),
@@ -380,7 +479,7 @@ mod tests {
         assert_eq!(answered.status(), 403);
 
         let receiver = OtlpReceiver::new(None, 0);
-        assert!(receiver.sender(LOOPBACK.into(), LOOPBACK.into()).is_none());
+        assert!(receiver.sender(LOOPBACK.into(), LOOPBACK.into()).await.is_none());
         receiver
             .serve(vec![OtlpSender {
                 host_ipv4: Ipv4Addr::new(10, 201, 0, 1),
@@ -388,11 +487,12 @@ mod tests {
             }])
             .await;
         assert!(
-            receiver.sender(LOOPBACK.into(), LOOPBACK.into()).is_none(),
+            receiver.sender(LOOPBACK.into(), LOOPBACK.into()).await.is_none(),
             "a guest reaches only its own tap's address"
         );
         assert!(receiver
             .sender(LOOPBACK.into(), Ipv4Addr::new(10, 201, 0, 1).into())
+            .await
             .is_some());
     }
 

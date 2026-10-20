@@ -268,6 +268,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         config,
     });
     let _ = waker_slot.set(AppWaker::new(host.clone()));
+    crate::domain::reconcile::network::resolve_exporters(&host);
     Ok(host)
 }
 

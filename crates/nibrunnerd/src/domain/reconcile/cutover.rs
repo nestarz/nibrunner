@@ -367,6 +367,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_deployments_exports_are_its_apps_from_its_first_boot_through_the_cutover() {
+        let host = test_host().await;
+        host.state.modify(|snapshot| snapshot.isolated = true).await;
+        serving(&host).await;
+        apply_cutovers(
+            host.arc(),
+            &plan_of(InstancePlan::Stage {
+                desired: wanted(),
+                timeout_ms: 600_000,
+            }),
+        )
+        .await;
+        let staged_slot = host.slot_of(&staging()).await.unwrap();
+        let guest = staged_slot.guest_ipv4.addr();
+        let booting = super::super::network::exporter(&host, guest).await.unwrap();
+        assert_eq!(
+            (booting.app_id.clone(), booting.deployment_id.clone()),
+            (app_id(), Some(new_deployment())),
+            "booting beside the app, before any pass hands the receiver its senders"
+        );
+        assert_eq!(booting.host_ipv4, staged_slot.host_ipv4.addr());
+
+        host.state
+            .update_record(&staging(), |record| record.state = InstanceState::Running)
+            .await;
+        apply_cutovers(host.arc(), &plan_of(InstancePlan::Promote { desired: wanted() })).await;
+        let promoted = super::super::network::exporter(&host, guest).await.unwrap();
+        assert_eq!(
+            (promoted.app_id, promoted.deployment_id),
+            (app_id(), Some(new_deployment())),
+            "the same guest, now the app's, right after the cut-over"
+        );
+        assert_eq!(promoted.host_ipv4, staged_slot.host_ipv4.addr());
+    }
+
+    #[tokio::test]
     async fn a_healthy_new_deployment_takes_the_app_its_hostnames_and_its_slot_and_the_old_one_is_stopped() {
         let host = test_host().await;
         serving(&host).await;

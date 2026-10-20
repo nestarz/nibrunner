@@ -573,6 +573,7 @@ pub async fn start_instance(host: &Host, desired: &DesiredInstance) {
     );
     host.state.put_record(attempted.clone()).await;
     host.state.mark_active(&desired.app_id, now).await;
+    crate::domain::reconcile::network::admit_exporter(host, &slot).await;
 
     let booted = match host.payloads.prepare(&desired.layers).await {
         Err(error) => Err((Failure::Layers, error.message())),

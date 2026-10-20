@@ -58,6 +58,41 @@ pub async fn otlp_senders(host: &Host) -> Vec<crate::adapters::otlp::OtlpSender>
         .collect()
 }
 
+/// The unit the guest at `guest` exports for, as the host's records say now: a deployment booted
+/// beside its app under the staging id is filed under the app it is about to become.
+pub async fn exporter(host: &Host, guest: std::net::Ipv4Addr) -> Option<crate::adapters::otlp::OtlpSender> {
+    let record = host
+        .state
+        .snapshot()
+        .await
+        .records
+        .into_values()
+        .find(|record| record.guest_ipv4.as_ref().is_some_and(|ip| ip.addr() == guest))?;
+    let slot = host.slot_of(&record.app_id).await?;
+    Some(crate::adapters::otlp::OtlpSender {
+        app_id: record.staging_for.unwrap_or(record.app_id),
+        deployment_id: Some(record.deployment_id),
+        host_ipv4: slot.host_ipv4.addr(),
+        guest_ipv4: guest,
+    })
+}
+
+/// Has the receiver ask the host itself who sent an export.
+pub fn resolve_exporters(host: &Arc<Host>) {
+    let weak = Arc::downgrade(host);
+    host.otlp.resolve_with(Arc::new(move |guest| {
+        let weak = weak.clone();
+        Box::pin(async move { exporter(&*weak.upgrade()?, guest).await })
+    }));
+}
+
+/// Before a guest boots behind `slot`: the receiver listens on its tap address and the firewall
+/// lets it through, so its first export, sent within a second of starting, is taken.
+pub async fn admit_exporter(host: &Host, slot: &nft_render::AppSlot) {
+    host.otlp.listen(slot.host_ipv4.addr()).await;
+    apply_network(host).await;
+}
+
 pub async fn apply_network(host: &Host) {
     let state = FirewallState {
         instances: forwarded_instances(host).await,
