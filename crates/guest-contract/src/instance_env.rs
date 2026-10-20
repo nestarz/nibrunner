@@ -1,6 +1,6 @@
 use protocol::{
-    runtime_references, AppHostname, AppHostnameKind, GuestPath, Hostname, HttpPort, RestartPolicy,
-    TenantArguments, TenantEnvironment, RUNTIME_VALUE_NAMES,
+    is_environment_name, runtime_references, AppHostname, AppHostnameKind, GuestPath, Hostname, HttpPort,
+    RestartPolicy, TenantArguments, TenantEnvironment, TenantValue, RUNTIME_VALUE_NAMES,
 };
 
 use crate::paths::WritableRoot;
@@ -28,9 +28,51 @@ pub struct InstanceEnvContent<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{variable_name} has no representation on the config drive")]
-pub struct UnrepresentableEnvironment {
-    pub variable_name: String,
+pub enum UnrepresentableEnvironment {
+    #[error("{variable_name} has no representation on the config drive")]
+    Value { variable_name: String },
+    #[error("the environment has {count} variables, more than the {MAX_TENANT_VARIABLES} a guest takes")]
+    TooMany { count: usize },
+    #[error("the instance's configuration is {bytes} bytes, more than the {CONFIG_MAX_BYTES} a guest reads")]
+    TooLarge { bytes: usize },
+}
+
+/// The `PATH` of the guest's Debian base, exactly as `debian:trixie-slim`'s image gives it.
+pub const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// What a tenant and its cron jobs are launched with, each later source over the earlier: the
+/// base's `PATH` and `HOME` (the working directory), the host's `defaults`, each OCI layer's
+/// image `Env` in document order, then the document's own environment. The platform's `PORT`
+/// and `NIBRUN_HTTP_PORT` go over all of it in the guest. An image entry that is no `NAME=value`
+/// the document could have written is left out.
+pub fn launch_environment(
+    working_directory: &GuestPath,
+    defaults: &[(String, String)],
+    images: &[Vec<String>],
+    document: &TenantEnvironment,
+) -> TenantEnvironment {
+    let base = [
+        ("PATH".to_string(), BASE_PATH.to_string()),
+        ("HOME".to_string(), working_directory.to_string()),
+    ]
+    .into_iter()
+    .chain(defaults.iter().cloned());
+    let from_images = images
+        .iter()
+        .flatten()
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(name, value)| is_environment_name(name) && !has_forbidden_character(value))
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+    let mut merged = std::collections::BTreeMap::new();
+    for (name, value) in base.chain(from_images) {
+        if let Ok(value) = TenantValue::parse(value) {
+            merged.insert(name, value);
+        }
+    }
+    for (name, value) in document.iter() {
+        merged.insert(name.to_string(), value.clone());
+    }
+    merged.into_iter().collect()
 }
 
 fn has_forbidden_character(value: &str) -> bool {
@@ -86,7 +128,7 @@ pub fn render_instance_env(content: &InstanceEnvContent<'_>) -> Result<String, U
     lines.push(format!("{RUNTIME_PREFIX}DNS={}", DNS_SERVERS.join(",")));
     for (index, argument) in content.args.iter().enumerate() {
         if has_forbidden_character(argument) {
-            return Err(UnrepresentableEnvironment {
+            return Err(UnrepresentableEnvironment::Value {
                 variable_name: format!("{RUNTIME_PREFIX}ARG_{index}"),
             });
         }
@@ -94,13 +136,24 @@ pub fn render_instance_env(content: &InstanceEnvContent<'_>) -> Result<String, U
     }
     for (name, value) in content.environment.iter() {
         if has_forbidden_character(value.expose()) {
-            return Err(UnrepresentableEnvironment {
+            return Err(UnrepresentableEnvironment::Value {
                 variable_name: name.to_string(),
             });
         }
         lines.push(format!("{TENANT_PREFIX}{name}={}", value.expose()));
     }
-    Ok(format!("{}\n", lines.join("\n")))
+    if content.environment.len() > MAX_TENANT_VARIABLES {
+        return Err(UnrepresentableEnvironment::TooMany {
+            count: content.environment.len(),
+        });
+    }
+    let rendered = format!("{}\n", lines.join("\n"));
+    if rendered.len() > CONFIG_MAX_BYTES {
+        return Err(UnrepresentableEnvironment::TooLarge {
+            bytes: rendered.len(),
+        });
+    }
+    Ok(rendered)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -464,14 +517,24 @@ mod tests {
                 ..Default::default()
             })
             .unwrap_err();
-            assert_eq!(refused.variable_name, "BAD");
+            assert_eq!(
+                refused,
+                UnrepresentableEnvironment::Value {
+                    variable_name: "BAD".into()
+                }
+            );
         }
         let refused = attempt(Overrides {
             environment: environment(&[("API_KEY", "secret-value\nmore")]),
             ..Default::default()
         })
         .unwrap_err();
-        assert_eq!(refused.variable_name, "API_KEY");
+        assert_eq!(
+            refused,
+            UnrepresentableEnvironment::Value {
+                variable_name: "API_KEY".into()
+            }
+        );
         assert!(!format!("{refused:?}").contains("secret-value"));
     }
 
@@ -489,7 +552,193 @@ mod tests {
             ..Default::default()
         })
         .unwrap_err();
-        assert_eq!(refused.variable_name, "NIBRUN_ARG_0");
+        assert_eq!(
+            refused,
+            UnrepresentableEnvironment::Value {
+                variable_name: "NIBRUN_ARG_0".into()
+            }
+        );
+    }
+
+    fn exposed(environment: &TenantEnvironment) -> Vec<(String, String)> {
+        environment
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.expose().to_string()))
+            .collect()
+    }
+
+    fn launched(
+        defaults: &[(&str, &str)],
+        images: &[&[&str]],
+        document: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        let defaults: Vec<_> = defaults
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        let images: Vec<Vec<String>> = images
+            .iter()
+            .map(|image| image.iter().map(|entry| entry.to_string()).collect())
+            .collect();
+        exposed(&launch_environment(
+            &GuestPath::parse("/app").unwrap(),
+            &defaults,
+            &images,
+            &environment(document),
+        ))
+    }
+
+    fn value<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        environment
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_unit_without_an_image_gets_the_bases_path_and_its_working_directory_as_home() {
+        let environment = launched(&[], &[], &[("MODE", "production")]);
+        assert_eq!(value(&environment, "PATH"), Some(BASE_PATH));
+        assert_eq!(value(&environment, "HOME"), Some("/app"));
+        assert_eq!(value(&environment, "MODE"), Some("production"));
+        assert_eq!(environment.len(), 3);
+    }
+
+    #[test]
+    fn an_oci_layers_env_reaches_the_tenant_beneath_the_documents() {
+        let environment = launched(
+            &[("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"), ("NODE_ENV", "host")],
+            &[
+                &[
+                    "PATH=/usr/local/go/bin:/usr/bin:/bin",
+                    "GOPATH=/go",
+                    "NODE_ENV=image",
+                ],
+                &["PATH=/opt/node/bin:/usr/bin:/bin", "LANG=C.UTF-8"],
+            ],
+            &[
+                ("LANG", "en_US.UTF-8"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+            ],
+        );
+        assert_eq!(
+            value(&environment, "PATH"),
+            Some("/opt/node/bin:/usr/bin:/bin"),
+            "the later layer wins"
+        );
+        assert_eq!(value(&environment, "GOPATH"), Some("/go"));
+        assert_eq!(
+            value(&environment, "NODE_ENV"),
+            Some("image"),
+            "an image is over the host's defaults"
+        );
+        assert_eq!(
+            value(&environment, "LANG"),
+            Some("en_US.UTF-8"),
+            "the document is over every image"
+        );
+        assert_eq!(
+            value(&environment, "OTEL_EXPORTER_OTLP_PROTOCOL"),
+            Some("http/protobuf")
+        );
+        assert_eq!(value(&environment, "HOME"), Some("/app"));
+    }
+
+    #[test]
+    fn an_image_entry_the_document_could_not_have_written_is_left_out() {
+        let environment = launched(
+            &[],
+            &[&[
+                "NOEQUALS",
+                "1BAD=x",
+                "BAD-NAME=x",
+                "MULTI=a\nb",
+                "REF=${NIBRUN_NOPE}",
+                "OK=a=b",
+            ]],
+            &[],
+        );
+        let names: Vec<&str> = environment.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["HOME", "OK", "PATH"]);
+        assert_eq!(value(&environment, "OK"), Some("a=b"));
+    }
+
+    #[test]
+    fn a_cron_job_reads_the_same_launch_environment_back_from_the_config_drive() {
+        let launched = launch_environment(
+            &GuestPath::parse("/app").unwrap(),
+            &[("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/json".into())],
+            &[vec![
+                "PATH=/usr/local/go/bin:/usr/bin:/bin".into(),
+                "PORT=1".into(),
+            ]],
+            &environment(&[("MODE", "production")]),
+        );
+        let rendered = render(Overrides {
+            environment: launched,
+            ..Default::default()
+        });
+        let config = parse_instance_env(&rendered).unwrap();
+        let tenant = config.tenant_environment();
+        let value = |name: &str| tenant.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+        assert_eq!(value("PATH"), Some("/usr/local/go/bin:/usr/bin:/bin"));
+        assert_eq!(value("HOME"), Some("/app"));
+        assert_eq!(value("OTEL_EXPORTER_OTLP_PROTOCOL"), Some("http/json"));
+        assert_eq!(value("MODE"), Some("production"));
+        assert_eq!(
+            value("PORT"),
+            Some(DEFAULT_HTTP_PORT.to_string().as_str()),
+            "the platform's port is over an image's"
+        );
+        assert_eq!(tenant.iter().filter(|(n, _)| n == "PORT").count(), 1);
+    }
+
+    #[test]
+    fn the_tenant_variable_limit_counts_what_the_images_and_the_host_add() {
+        let names: Vec<String> = (0..MAX_TENANT_VARIABLES - 2).map(|n| format!("V{n}")).collect();
+        let document: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "x")).collect();
+        let fits = launch_environment(
+            &GuestPath::parse("/app").unwrap(),
+            &[],
+            &[],
+            &environment(&document),
+        );
+        assert_eq!(fits.len(), MAX_TENANT_VARIABLES);
+        assert!(attempt(Overrides {
+            environment: fits,
+            ..Default::default()
+        })
+        .is_ok());
+        let over = launch_environment(
+            &GuestPath::parse("/app").unwrap(),
+            &[("OTEL_BSP_SCHEDULE_DELAY".into(), "1000".into())],
+            &[],
+            &environment(&document),
+        );
+        assert_eq!(
+            attempt(Overrides {
+                environment: over,
+                ..Default::default()
+            }),
+            Err(UnrepresentableEnvironment::TooMany {
+                count: MAX_TENANT_VARIABLES + 1
+            })
+        );
+        let big = "x".repeat(protocol::MAX_SECRET_LENGTH);
+        let large = environment(&[
+            ("B1", &big),
+            ("B2", &big),
+            ("B3", &big),
+            ("B4", &big),
+            ("B5", &big),
+        ]);
+        assert!(matches!(
+            attempt(Overrides {
+                environment: large,
+                ..Default::default()
+            }),
+            Err(UnrepresentableEnvironment::TooLarge { .. })
+        ));
     }
 }
 

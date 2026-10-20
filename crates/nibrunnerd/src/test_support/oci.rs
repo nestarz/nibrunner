@@ -27,6 +27,9 @@ fn append(archive: &mut tar::Builder<Vec<u8>>, path: &str, bytes: &[u8], mode: u
     archive.append_data(&mut header, path, bytes).unwrap();
 }
 
+/// The `Env` every image made here carries.
+pub const IMAGE_ENV: [&str; 2] = ["PATH=/usr/local/bin:/usr/bin:/bin", "IMAGE_VERSION=1.2.3"];
+
 pub fn archive(program: &[u8]) -> Vec<u8> {
     let mut filesystem = tar::Builder::new(Vec::new());
     append(&mut filesystem, "./", b"", 0o755);
@@ -41,7 +44,7 @@ pub fn from_filesystem(filesystem: &[u8]) -> Vec<u8> {
     let config = serde_json::to_vec(&json!({
         "architecture": "amd64", "os": "linux",
         "rootfs": { "type": "layers", "diff_ids": [digest(filesystem)] },
-        "config": { "Cmd": ["/this/command/is/not/used"], "User": "root" }
+        "config": { "Cmd": ["/this/command/is/not/used"], "User": "root", "Env": IMAGE_ENV }
     }))
     .unwrap();
     let manifest = serde_json::to_vec(&json!({

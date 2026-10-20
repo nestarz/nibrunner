@@ -162,18 +162,24 @@ Use the OCI exporter shown above. Archives from `docker save` or `docker export`
 
 ### Image configuration
 
-The image supplies files. Set how the app runs in `desired.json`. Copy any image defaults your
-app needs, including those inherited from its base image:
+The image supplies files and its environment. Set how the app runs in `desired.json`. Copy any
+other image defaults your app needs, including those inherited from its base image:
 
 | Image setting | nibrunner setting |
 | --- | --- |
 | `ENTRYPOINT`, `CMD` | `config.command.program` and `args`. Preserve the entrypoint and its arguments, including wrapper scripts. Use an absolute program path. |
 | `WORKDIR` | `config.command.workingDirectory`. Use `/` if the image has none. |
-| `ENV` | `config.command.environment`. Include inherited variables the app needs. |
+| `ENV` | Applied beneath `config.command.environment`, inherited variables included; with several `oci` layers, a later layer's value wins. |
 | `EXPOSE` | `config.httpPort` or [`config.ports`](/docs/guides/raw-ports). |
 | `HEALTHCHECK` | [`config.healthCheck`](/docs/guides/health-checks). Docker's check is not imported. |
 | `USER` | The app runs as uid/gid 65534. Files must be readable and programs executable by that account. |
 | `VOLUME` | The app uses its nibrunner volume. Image volume declarations and host mounts are not imported. |
+
+The app is launched with, lowest first: `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+(the Debian base's) and `HOME` set to `config.command.workingDirectory`; the
+[OpenTelemetry variables](/docs/guides/logs-and-metrics#traces); each `oci` layer's `ENV`, in the
+order the layers are listed; `config.command.environment`; then `PORT` and `NIBRUN_HTTP_PORT`.
+Cron jobs get the same. At most 256 variables in all, counted after this merge.
 
 The server must listen on `0.0.0.0`. Writable directories must allow uid 65534 access. Entrypoints
 that require root or Docker-specific mounts need adapting.

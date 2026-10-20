@@ -327,14 +327,17 @@ impl PayloadBuilder for LayerImages {
     async fn prepare(&self, layers: &[DesiredLayer]) -> Result<PreparedPayload, ArtifactError> {
         let _access = self.access.read().await;
         let mut layer_image_paths = Vec::with_capacity(layers.len());
+        let mut image_environments = Vec::new();
         let mut fetched_bytes = 0;
         for layer in layers {
             let image = ensure_layer_image(&self.store, &self.cache_dir, layer, &self.commands).await?;
             layer_image_paths.push(image.path);
+            image_environments.extend(image.env);
             fetched_bytes += image.fetched_bytes;
         }
         Ok(PreparedPayload {
             layer_image_paths,
+            image_environments,
             fetched_bytes,
         })
     }
@@ -475,6 +478,8 @@ fn pack_program(staged: &Staged, destination_path: &protocol::ExecutablePath) ->
 pub struct LayerImage {
     pub path: PathBuf,
     pub fetched_bytes: u64,
+    /// An OCI layer's image `Env`; none for any other kind.
+    pub env: Option<Vec<String>>,
 }
 
 pub async fn ensure_layer_image(
@@ -484,7 +489,12 @@ pub async fn ensure_layer_image(
     commands: &Arc<dyn CommandRunner>,
 ) -> Result<LayerImage, ArtifactError> {
     let image_path = layer_image_path(cache_dir, layer);
-    if image_path.exists() {
+    let env = match layer {
+        DesiredLayer::Oci { .. } => oci::cached_env(&image_path),
+        _ => None,
+    };
+    let held = image_path.exists() && (env.is_some() || !matches!(layer, DesiredLayer::Oci { .. }));
+    if held {
         let _ = std::fs::File::open(&image_path).and_then(|file| {
             file.set_times(
                 std::fs::FileTimes::new()
@@ -495,6 +505,7 @@ pub async fn ensure_layer_image(
         return Ok(LayerImage {
             path: image_path,
             fetched_bytes: 0,
+            env,
         });
     }
 
@@ -510,10 +521,11 @@ pub async fn ensure_layer_image(
             source: OciSource::Registry { repository, digest },
         } => {
             let pulled = registry::pull(repository, digest).await?;
-            oci::prepare(pulled.archive, image_path.clone(), commands).await?;
+            let env = oci::prepare(pulled.archive, image_path.clone(), commands).await?;
             return Ok(LayerImage {
                 path: image_path,
                 fetched_bytes: pulled.fetched_bytes,
+                env: Some(env),
             });
         }
         DesiredLayer::Oci {
@@ -521,10 +533,11 @@ pub async fn ensure_layer_image(
         } => {
             let bytes = store.read_verified(object).await?;
             let fetched_bytes = bytes.len() as u64;
-            oci::prepare(bytes, image_path.clone(), commands).await?;
+            let env = oci::prepare(bytes, image_path.clone(), commands).await?;
             return Ok(LayerImage {
                 path: image_path,
                 fetched_bytes,
+                env: Some(env),
             });
         }
         DesiredLayer::DownloadedExecutable {
@@ -577,6 +590,7 @@ pub async fn ensure_layer_image(
     Ok(LayerImage {
         path: image_path,
         fetched_bytes,
+        env: None,
     })
 }
 
