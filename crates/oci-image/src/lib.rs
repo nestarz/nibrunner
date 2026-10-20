@@ -32,6 +32,8 @@ pub struct Filesystem {
     pub tar: Vec<u8>,
     pub data_bytes: u64,
     pub entries: u64,
+    /// The image configuration's `Env`, `NAME=value` entries in the order the image gives them.
+    pub env: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +83,16 @@ struct Config {
     #[serde(flatten)]
     platform: Platform,
     rootfs: Rootfs,
+    #[serde(default)]
+    config: Option<RunConfig>,
+}
+
+/// The one part of the image's run configuration a host applies; `Entrypoint`, `Cmd`,
+/// `WorkingDir` and `User` are the document's to state.
+#[derive(Deserialize)]
+struct RunConfig {
+    #[serde(rename = "Env", default)]
+    env: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -266,7 +278,10 @@ pub fn flatten(archive: &[u8]) -> Result<Filesystem, Error> {
         }
         filesystem.apply(&decoded)?;
     }
-    filesystem.finish()
+    Ok(Filesystem {
+        env: config.config.and_then(|run| run.env).unwrap_or_default(),
+        ..filesystem.finish()?
+    })
 }
 
 #[cfg(test)]
@@ -290,6 +305,10 @@ mod tests {
         }
 
         fn new(compression: &str, platform: &str, diff_id: Option<&str>) -> Self {
+            Self::configured(compression, platform, diff_id, Value::Null)
+        }
+
+        fn configured(compression: &str, platform: &str, diff_id: Option<&str>, run: Value) -> Self {
             let mut layer = tar::Builder::new(Vec::new());
             let mut header = tar::Header::new_gnu();
             header.set_size(7);
@@ -320,7 +339,7 @@ mod tests {
                 index: Value::Null,
             };
             let layer = image.descriptor(encoded, media_type);
-            let config = json!({"os": "linux", "architecture": platform, "rootfs": {"type": "layers", "diff_ids": [diff_id.unwrap_or(&digest)]}});
+            let config = json!({"os": "linux", "architecture": platform, "config": run, "rootfs": {"type": "layers", "diff_ids": [diff_id.unwrap_or(&digest)]}});
             let config = image.descriptor(
                 serde_json::to_vec(&config).unwrap(),
                 "application/vnd.oci.image.config.v1+json",
@@ -348,6 +367,28 @@ mod tests {
             }
             tar.into_inner().unwrap()
         }
+    }
+
+    #[test]
+    fn an_images_env_is_read_in_its_order_and_nothing_else_of_its_run_configuration() {
+        let run = json!({
+            "Env": ["PATH=/usr/local/bin:/usr/bin:/bin", "NODE_VERSION=24.1.0", "EMPTY="],
+            "Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["node"], "WorkingDir": "/srv", "User": "node",
+        });
+        let filesystem = flatten(&Image::configured("plain", "amd64", None, run).archive()).unwrap();
+        assert_eq!(
+            filesystem.env,
+            [
+                "PATH=/usr/local/bin:/usr/bin:/bin",
+                "NODE_VERSION=24.1.0",
+                "EMPTY="
+            ]
+        );
+        let plain = flatten(&Image::new("plain", "amd64", None).archive()).unwrap();
+        assert!(plain.env.is_empty(), "a null config is no Env");
+        let without =
+            flatten(&Image::configured("plain", "amd64", None, json!({"Cmd": ["sh"]})).archive()).unwrap();
+        assert!(without.env.is_empty());
     }
 
     #[test]

@@ -407,6 +407,8 @@ impl<T: ArtifactStore + ?Sized> ArtifactStoreExt for T {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedPayload {
     pub layer_image_paths: Vec<PathBuf>,
+    /// Each OCI layer's image `Env`, in the order the document listed the layers.
+    pub image_environments: Vec<Vec<String>>,
     /// What was pulled from the store to prepare these, as the store sized it. 0 when every
     /// layer was already in the cache.
     pub fetched_bytes: u64,

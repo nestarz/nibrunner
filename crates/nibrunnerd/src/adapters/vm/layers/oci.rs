@@ -24,6 +24,7 @@ fn unpackable(error: impl std::fmt::Display) -> ArtifactError {
 
 struct StagedImage {
     directory: tempfile::TempDir,
+    env: Vec<String>,
     image: PathBuf,
     root: PathBuf,
     inodes: u64,
@@ -69,6 +70,7 @@ impl StagedImage {
             .map_err(unpackable)?;
         Ok(Self {
             directory,
+            env: filesystem.env,
             image,
             root,
             inodes,
@@ -89,7 +91,13 @@ impl StagedImage {
         request
     }
 
-    fn publish(self, destination: &Path) -> Result<(), ArtifactError> {
+    /// The image's `Env` first, so that an image in the cache always has its environment beside it.
+    fn publish(self, destination: &Path) -> Result<Vec<String>, ArtifactError> {
+        let env = self.directory.path().join("env.json");
+        fs::write(&env, serde_json::to_vec(&self.env).map_err(unpackable)?)
+            .and_then(|()| File::open(&env)?.sync_all())
+            .map_err(unpackable)?;
+        fs::rename(&env, env_path(destination)).map_err(unpackable)?;
         File::open(&self.image)
             .and_then(|file| file.sync_all())
             .map_err(unpackable)?;
@@ -102,8 +110,19 @@ impl StagedImage {
         .and_then(|file| file.sync_all())
         .map_err(unpackable)?;
         self.directory.close().map_err(unpackable)?;
-        Ok(())
+        Ok(self.env)
     }
+}
+
+/// Where an OCI layer's image `Env` is kept: `<image>.env.json` beside its ext4.
+pub(super) fn env_path(image: &Path) -> PathBuf {
+    image.with_extension("env.json")
+}
+
+/// The `Env` kept beside a cached image; none for an image cached before it was kept, which is
+/// then prepared again.
+pub(super) fn cached_env(image: &Path) -> Option<Vec<String>> {
+    serde_json::from_slice(&fs::read(env_path(image)).ok()?).ok()
 }
 
 struct RootMetadata {
@@ -271,7 +290,7 @@ pub(super) async fn prepare(
     bytes: Vec<u8>,
     destination: PathBuf,
     commands: &Arc<dyn CommandRunner>,
-) -> Result<(), ArtifactError> {
+) -> Result<Vec<String>, ArtifactError> {
     let cache = destination
         .parent()
         .expect("the image is held inside its cache directory")
@@ -293,8 +312,7 @@ pub(super) async fn prepare(
     }
     tokio::task::spawn_blocking(move || staged.publish(&destination))
         .await
-        .map_err(unpackable)??;
-    Ok(())
+        .map_err(unpackable)?
 }
 
 #[cfg(test)]
@@ -432,12 +450,29 @@ mod tests {
             .unwrap();
         assert!(first.path.ends_with("oci.ext4"));
         assert!(first.fetched_bytes > 0);
+        let image_env: Vec<String> = crate::test_support::oci::IMAGE_ENV.map(String::from).to_vec();
+        assert_eq!(first.env.as_ref(), Some(&image_env));
         let second = super::super::ensure_layer_image(&store, cache.path(), &layer, &commands)
             .await
             .unwrap();
         assert_eq!(second.fetched_bytes, 0);
+        assert_eq!(
+            second.env,
+            Some(image_env),
+            "the image's Env is read back from beside it"
+        );
         assert_eq!(log.executables(), ["mke2fs", "debugfs"]);
-        assert_eq!(fs::read_dir(first.path.parent().unwrap()).unwrap().count(), 1);
+        assert!(first.path.with_extension("env.json").exists());
+        assert_eq!(fs::read_dir(first.path.parent().unwrap()).unwrap().count(), 2);
+
+        fs::remove_file(first.path.with_extension("env.json")).unwrap();
+        let third = super::super::ensure_layer_image(&store, cache.path(), &layer, &commands)
+            .await
+            .unwrap();
+        assert!(
+            third.fetched_bytes > 0 && third.env.is_some(),
+            "an image cached before its Env was kept is prepared again"
+        );
     }
 
     #[tokio::test]

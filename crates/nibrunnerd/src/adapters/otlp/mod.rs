@@ -1,8 +1,6 @@
 //! Traces and log records a guest's runtime exports over OTLP/HTTP, received on its own tap's
 //! host address and filed under the unit that tap belongs to.
-use std::borrow::Cow;
-
-use protocol::{Ipv4Address, TenantEnvironment, TenantValue};
+use protocol::Ipv4Address;
 
 pub mod receiver;
 pub(crate) mod trace;
@@ -10,70 +8,83 @@ pub(crate) mod wire;
 
 pub use receiver::{OtlpReceiver, OtlpSender};
 
-const ENDPOINT_VARIABLE: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
-
-/// The environment a guest is launched with: its own, and where its tap's receiver is unless it
-/// names an endpoint itself or has no room left for one.
-pub fn with_endpoint<'a>(
-    environment: &'a TenantEnvironment,
-    host_ipv4: &Ipv4Address,
-) -> Cow<'a, TenantEnvironment> {
-    let named = environment.iter().any(|(name, _)| name == ENDPOINT_VARIABLE);
-    let full = environment.len() >= guest_contract::instance_env::MAX_TENANT_VARIABLES;
-    let endpoint = format!("http://{host_ipv4}:{}", nft_render::OTLP_RECEIVER_PORT);
-    match TenantValue::parse(endpoint) {
-        Ok(endpoint) if !named && !full => Cow::Owned(
-            environment
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.clone()))
-                .chain([(ENDPOINT_VARIABLE.to_string(), endpoint)])
-                .collect(),
+/// What every guest is told about the receiver on its own tap, beneath anything its images or its
+/// document set: where it is, the one protocol it takes, and a one-second batch so that a trace is
+/// readable while its request is still fresh. The runtime's own exporter is the app's to turn on.
+pub fn exporter_defaults(host_ipv4: &Ipv4Address) -> Vec<(String, String)> {
+    [
+        (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://{host_ipv4}:{}", nft_render::OTLP_RECEIVER_PORT),
         ),
-        _ => Cow::Borrowed(environment),
-    }
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json".to_string()),
+        ("OTEL_BSP_SCHEDULE_DELAY", "1000".to_string()),
+        ("OTEL_BLRP_SCHEDULE_DELAY", "1000".to_string()),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guest_contract::instance_env::launch_environment;
+    use protocol::{GuestPath, TenantEnvironment, TenantValue};
 
-    fn environment(pairs: &[(&str, &str)]) -> TenantEnvironment {
-        pairs
+    const FOUR: [&str; 4] = [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_BSP_SCHEDULE_DELAY",
+        "OTEL_BLRP_SCHEDULE_DELAY",
+    ];
+
+    fn launched(document: &[(&str, &str)]) -> Vec<(String, String)> {
+        let document: TenantEnvironment = document
             .iter()
             .map(|(name, value)| (name.to_string(), TenantValue::parse(*value).unwrap()))
-            .collect()
+            .collect();
+        let tap = Ipv4Address::parse("10.201.0.5").unwrap();
+        launch_environment(
+            &GuestPath::parse("/app").unwrap(),
+            &exporter_defaults(&tap),
+            &[],
+            &document,
+        )
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.expose().to_string()))
+        .collect()
     }
 
-    fn endpoint(environment: &TenantEnvironment) -> Option<String> {
+    fn value<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
         environment
             .iter()
-            .find(|(name, _)| *name == ENDPOINT_VARIABLE)
-            .map(|(_, value)| value.expose().to_string())
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 
     #[test]
-    fn a_guest_is_told_its_taps_receiver_unless_its_environment_names_an_endpoint() {
-        let tap = Ipv4Address::parse("10.201.0.5").unwrap();
-        let given = environment(&[("MODE", "production")]);
-        let launched = with_endpoint(&given, &tap);
-        assert_eq!(endpoint(&launched).as_deref(), Some("http://10.201.0.5:4318"));
-        assert_eq!(launched.len(), 2);
-
-        let own = environment(&[(ENDPOINT_VARIABLE, "https://collector.example.com")]);
-        assert!(matches!(with_endpoint(&own, &tap), Cow::Borrowed(_)));
+    fn a_unit_is_told_its_taps_receiver_in_the_four_standard_variables() {
+        let environment = launched(&[("MODE", "production")]);
         assert_eq!(
-            endpoint(&with_endpoint(&own, &tap)).as_deref(),
-            Some("https://collector.example.com")
+            value(&environment, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            Some("http://10.201.0.5:4318")
         );
+        assert_eq!(
+            value(&environment, "OTEL_EXPORTER_OTLP_PROTOCOL"),
+            Some("http/json")
+        );
+        assert_eq!(value(&environment, "OTEL_BSP_SCHEDULE_DELAY"), Some("1000"));
+        assert_eq!(value(&environment, "OTEL_BLRP_SCHEDULE_DELAY"), Some("1000"));
+        assert_eq!(environment.len(), 2 + 4 + 1);
     }
 
     #[test]
-    fn a_guest_whose_environment_is_full_is_launched_with_it_unchanged() {
-        let names: Vec<String> = (0..guest_contract::instance_env::MAX_TENANT_VARIABLES)
-            .map(|n| format!("V{n}"))
-            .collect();
-        let full = environment(&names.iter().map(|n| (n.as_str(), "x")).collect::<Vec<_>>());
-        let tap = Ipv4Address::parse("10.201.0.1").unwrap();
-        assert!(matches!(with_endpoint(&full, &tap), Cow::Borrowed(_)));
+    fn the_document_overrides_each_of_the_four() {
+        for name in FOUR {
+            let environment = launched(&[(name, "the app's")]);
+            assert_eq!(value(&environment, name), Some("the app's"), "{name}");
+            assert_eq!(environment.len(), 2 + 4);
+        }
     }
 }

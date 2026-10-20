@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use guest_contract::cron_execution::{self, ExecutionFrame, ExecutionRequest, Rejection};
-use guest_contract::instance_env::InstanceConfig;
+use guest_contract::instance_env::{InstanceConfig, BASE_PATH};
 use guest_contract::paths;
 use nix::sys::signal::{kill, killpg, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -370,7 +370,7 @@ fn environment(config: &InstanceConfig, request: &ExecutionRequest) -> Vec<(Stri
     let mut environment = vec![
         ("HOME".to_string(), config.working_directory.clone()),
         ("TMPDIR".to_string(), "/tmp".to_string()),
-        ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ("PATH".to_string(), BASE_PATH.to_string()),
     ];
     let overrides = config
         .tenant_environment()
@@ -643,7 +643,7 @@ mod tests {
         let value = |name: &str| exported.iter().find(|(key, _)| key == name).unwrap().1.as_str();
         assert_eq!(value("HOME"), "/app/custom");
         assert_eq!(value("TMPDIR"), "/tmp");
-        assert_eq!(value("PATH"), "/usr/bin:/bin");
+        assert_eq!(value("PATH"), BASE_PATH);
         assert_eq!(value("PORT"), "8080");
         request.environment = vec![
             "HOME=/app/job".into(),
