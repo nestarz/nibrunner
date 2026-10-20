@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -17,12 +18,13 @@ use crate::config::{Compression, HttpCache, HttpEncode};
 use crate::domain::metrics::{CacheOutcome, HostMetrics, Outcome};
 use tokio::sync::RwLock;
 
+use crate::adapters::otlp::trace::{RequestTrace, TraceBook};
 use crate::adapters::proxy::cache::{self, Asked, Origin, ResponseCache};
 use crate::adapters::proxy::encode::{self, Encoding, Metered};
 use crate::adapters::proxy::forward::{
     forward, hostname_of, note_the_hop, say, ProxyBody, Unreachable, Upstreams,
 };
-use crate::adapters::proxy::http_log::{HttpRequestLog, HttpRequestRecord, HttpRequestScope};
+use crate::adapters::proxy::http_log::{HttpRequestLog, HttpRequestRecord, HttpRequestScope, Wake};
 use crate::adapters::proxy::pem;
 use crate::domain::metrics::proxy::Handshake;
 use crate::domain::report::routes::RouteTarget;
@@ -124,7 +126,7 @@ struct Busy;
 
 /// On a response the activator held for a wake, how long it held it.
 #[derive(Debug, Clone, Copy)]
-struct Woken(u64);
+struct Woken(Wake);
 
 fn busy() -> Response<ProxyBody> {
     let mut response = say(
@@ -321,15 +323,23 @@ impl Router {
             };
             (route, logging)
         };
+        let traced = Traced {
+            trace: RequestTrace::begin(request.headers_mut(), TraceBook::host(), crate::clock::now_us()),
+            received: Arc::default(),
+            logging,
+            started,
+        };
         if self
             .state
             .record(&route.app_id)
             .await
             .is_some_and(|record| record.expired_at_ms.is_some())
         {
-            return self.logged(expired(), Outcome::Refused, route, logging, started, None, None);
+            return self.logged(expired(), Outcome::Refused, route, traced, None, None);
         }
         note_the_hop(request.headers_mut(), arrival.peer, arrival.secure, &hostname);
+        let received = traced.received.clone();
+        let request = request.map(|body| Counted { body, received });
         let (response, cache, encoding) = self.exchange(request, &route, &hostname).await;
         let outcome = if response.extensions().get::<Busy>().is_some() {
             self.metrics.proxy.app_refused(&route.app_id);
@@ -350,48 +360,64 @@ impl Router {
         if let Some(cache) = cache {
             self.metrics.proxy.cached(&route.app_id, cache);
         }
-        self.logged(response, outcome, route, logging, started, cache, encoding)
+        self.logged(response, outcome, route, traced, cache, encoding)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The answer, carrying its `traceparent` back to the caller; its record and root span are
+    /// written once the last of it has been sent or the caller has gone.
     fn logged(
         &self,
-        response: Response<ProxyBody>,
+        mut response: Response<ProxyBody>,
         outcome: Outcome,
         route: Route,
-        logging: Option<(HttpRequestScope, String, hyper::Uri)>,
-        started: std::time::Instant,
+        traced: Traced,
         cache: Option<CacheOutcome>,
         encoding: Option<Encoding>,
     ) -> (Response<ProxyBody>, Outcome, Option<Route>) {
-        let wake_micros = response.extensions().get::<Woken>().map(|woken| woken.0);
-        if let (Some(log), Some((scope, method, uri))) = (&self.http_log, logging) {
-            log.record(
-                scope,
-                HttpRequestRecord::new(
-                    &method,
-                    &uri,
-                    response.status().as_u16(),
-                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    route.deployment_id.clone(),
-                )
-                .woken_for(wake_micros)
-                .served_as(cache, encoding)
-                .labelled(route.labels.clone()),
-            );
-        }
+        traced.trace.answer(response.headers_mut());
+        let (Some(log), Some((scope, method, uri))) = (self.http_log.clone(), traced.logging) else {
+            return (response, outcome, Some(route));
+        };
+        let wake = response.extensions().get::<Woken>().map(|woken| woken.0);
+        let record = HttpRequestRecord::new(
+            &method,
+            &uri,
+            response.status().as_u16(),
+            u64::try_from(traced.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            route.deployment_id.clone(),
+        )
+        .woken(wake)
+        .served_as(cache, encoding)
+        .labelled(route.labels.clone())
+        .traced(traced.trace);
+        let received = traced.received;
+        let finish = move |sent| {
+            let received = received.load(std::sync::atomic::Ordering::Relaxed);
+            log.record(scope, record.finished(received, sent, crate::clock::now_us()));
+        };
+        let response = response.map(|body| {
+            Finishing {
+                body,
+                sent: 0,
+                finish: Some(Box::new(finish)),
+            }
+            .boxed()
+        });
         (response, outcome, Some(route))
     }
 
     /// The request answered: from the response cache before the app is asked, which is what lets
     /// a hit be served while the app sleeps without waking it; from the app otherwise, compressed
     /// on the way out. A host with neither section relays the app's answer as it came.
-    async fn exchange(
+    async fn exchange<B>(
         self: &Arc<Self>,
-        mut request: Request<Incoming>,
+        mut request: Request<B>,
         route: &Route,
         hostname: &str,
-    ) -> (Response<ProxyBody>, Option<CacheOutcome>, Option<Encoding>) {
+    ) -> (Response<ProxyBody>, Option<CacheOutcome>, Option<Encoding>)
+    where
+        B: hyper::body::Body<Data = bytes::Bytes, Error = hyper::Error> + Send + Sync + Unpin + 'static,
+    {
         if self.cache.is_none() && self.encode.is_none() {
             return (self.ask_the_app(route, request).await, None, None);
         }
@@ -455,10 +481,99 @@ impl Router {
         };
         let upstream = self.upstreams.to(&route.app_id).await;
         let mut response = forward(&upstream, request, LOOPBACK, route.host_port.get(), true, open).await;
-        if let Some(micros) = super::http_log::take_wake_micros(response.headers_mut()) {
-            response.extensions_mut().insert(Woken(micros));
+        if let Some(wake) = super::http_log::take_wake(response.headers_mut()) {
+            response.extensions_mut().insert(Woken(wake));
         }
         response
+    }
+}
+
+/// The trace a routed request is in, and what its record is waiting on.
+struct Traced {
+    trace: RequestTrace,
+    received: Arc<std::sync::atomic::AtomicU64>,
+    logging: Option<(HttpRequestScope, String, hyper::Uri)>,
+    started: std::time::Instant,
+}
+
+/// A visitor's upload, counted as it is read.
+struct Counted<B> {
+    body: B,
+    received: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<B: hyper::body::Body<Data = bytes::Bytes> + Unpin> hyper::body::Body for Counted<B> {
+    type Data = bytes::Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.body).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                this.received.fetch_add(
+                    u64::try_from(data.len()).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+type Finish = Box<dyn FnOnce(u64) + Send + Sync>;
+
+/// An answer, counted as it is sent, that says how much went once it is done with: sent whole,
+/// or dropped by a visitor who left.
+struct Finishing {
+    body: ProxyBody,
+    sent: u64,
+    finish: Option<Finish>,
+}
+
+impl hyper::body::Body for Finishing {
+    type Data = bytes::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.body).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                this.sent += u64::try_from(data.len()).unwrap_or(u64::MAX);
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.take() {
+            finish(self.sent);
+        }
     }
 }
 
@@ -2056,6 +2171,72 @@ mod tests {
             )])))
             .await;
         serving_as(router, arriving(None, secure)).await
+    }
+
+    /// A tenant that answers with the trace headers it was sent, after reading the whole upload.
+    async fn echoing_its_trace_headers() -> HostPort {
+        let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let host_port = HostPort::new(upstream.local_addr().unwrap().port()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(|request: Request<Incoming>| async move {
+                        let read = |name: &str| {
+                            request
+                                .headers()
+                                .get(name)
+                                .map_or("(none)".to_string(), |v| v.to_str().unwrap().to_string())
+                        };
+                        let heard = format!("{} {}", read("traceparent"), read("tracestate"));
+                        let _ = request.into_body().collect().await;
+                        Ok::<_, std::convert::Infallible>(say(StatusCode::OK, &heard))
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        host_port
+    }
+
+    #[tokio::test]
+    async fn every_request_starts_a_trace_the_guest_is_handed_and_the_caller_is_answered_with() {
+        let directory = tempfile::tempdir().unwrap();
+        let http_log = Arc::new(HttpRequestLog::new(directory.path().to_path_buf()).unwrap());
+        let router = Router::new(Arc::new(HostMetrics::new()), Some(http_log));
+        routed_at(&router, echoing_its_trace_headers().await).await;
+        let port = serving(router).await;
+        let answered = asked(
+            port,
+            "POST / HTTP/1.0\r\nHost: app-1.apps.example.com\r\nContent-Length: 5\r\n\
+             traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n\
+             tracestate: vendor=secret\r\n\r\nhello",
+        )
+        .await;
+        let (head, body) = answered.split_once("\r\n\r\n").unwrap();
+        let returned = head
+            .lines()
+            .find_map(|line| line.strip_prefix("traceparent: "))
+            .expect("the caller is handed the trace");
+        let (heard, state) = body.split_once(' ').unwrap();
+        assert_eq!(heard, returned, "the guest is in the trace the caller is told");
+        assert_eq!(state, "(none)");
+        let fields: Vec<&str> = returned.split('-').collect();
+        assert_eq!((fields[0], fields[3]), ("00", "01"));
+        assert_ne!(fields[1], "4bf92f3577b34da6a3ce929d0e0e4736");
+        let minted_us = i64::from_str_radix(&fields[1][..12], 16).unwrap() << 4;
+        assert!((crate::clock::now_us() - minted_us).abs() < 60_000_000);
+
+        let record = once_recorded(&directory, 1).await.remove(0);
+        assert_eq!(record["traceId"], fields[1]);
+        assert_eq!(record["requestBytes"], 5);
+        assert_eq!(record["responseBytes"], body.len());
     }
 
     #[tokio::test]

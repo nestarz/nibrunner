@@ -36,6 +36,8 @@ pub struct Host {
     /// What a control plane's bucket is sent of every labelled instance, when `[logs] sink` or
     /// `[metrics] sink` names one.
     pub telemetry: Option<Arc<crate::adapters::logs::ObjectSink>>,
+    /// What every guest's runtime exports to, on its own tap's host address.
+    pub otlp: Arc<crate::adapters::otlp::OtlpReceiver>,
     pub volumes: Arc<dyn VolumeBackend>,
     pub artifacts: Arc<dyn ArtifactStore>,
     pub payloads: Arc<dyn PayloadBuilder>,

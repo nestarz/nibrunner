@@ -17,9 +17,10 @@ use tokio::sync::{
 
 use hyper::Uri;
 use protocol::{AppId, DeploymentId, InstanceLabels, Timestamp};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::adapters::logs::ObjectSink;
+use crate::adapters::otlp::trace::RequestTrace;
 use crate::adapters::proxy::encode::Encoding;
 use crate::domain::metrics::CacheOutcome;
 use crate::json_store::make_directory;
@@ -36,7 +37,7 @@ pub struct HttpRequestRecord {
     pub(crate) path: String,
     pub(crate) status: u16,
     pub(crate) duration_micros: u64,
-    deployment_id: DeploymentId,
+    pub(crate) deployment_id: DeploymentId,
     #[serde(skip_serializing_if = "InstanceLabels::is_empty")]
     pub(crate) labels: InstanceLabels,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,6 +46,58 @@ pub struct HttpRequestRecord {
     pub(crate) cache: Option<CacheOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) encoding: Option<Encoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) wake: Option<WakeKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<String>,
+    pub(crate) request_bytes: u64,
+    pub(crate) response_bytes: u64,
+    #[serde(skip)]
+    pub(crate) trace: Option<RequestTrace>,
+    #[serde(skip)]
+    pub(crate) ended_us: i64,
+}
+
+/// How a request's app was brought up for it; absent when it was already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WakeKind {
+    Thawed,
+    Restored,
+    Booted,
+}
+
+impl WakeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            WakeKind::Thawed => "thawed",
+            WakeKind::Restored => "restored",
+            WakeKind::Booted => "booted",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [WakeKind::Thawed, WakeKind::Restored, WakeKind::Booted]
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+    }
+}
+
+/// How long the activator held a request for its app to come up, and how it came up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wake {
+    pub(crate) micros: u64,
+    pub(crate) kind: Option<WakeKind>,
+}
+
+impl Wake {
+    pub(super) fn header_value(self) -> hyper::header::HeaderValue {
+        let value = match self.kind {
+            Some(kind) => format!("{} {}", self.micros, kind.as_str()),
+            None => self.micros.to_string(),
+        };
+        hyper::header::HeaderValue::try_from(value).expect("digits and a word are a header value")
+    }
 }
 
 /// The header on which the activator hands back how long it held a request for its app to wake,
@@ -60,10 +113,14 @@ pub(super) fn wake_header() -> &'static hyper::header::HeaderName {
 
 /// How long the activator held the response's request for a wake, taken off the response so that
 /// no client sees it.
-pub(super) fn take_wake_micros(headers: &mut hyper::HeaderMap) -> Option<u64> {
-    headers
-        .remove(wake_header())
-        .and_then(|value| value.to_str().ok()?.parse().ok())
+pub(super) fn take_wake(headers: &mut hyper::HeaderMap) -> Option<Wake> {
+    let value = headers.remove(wake_header())?;
+    let mut words = value.to_str().ok()?.split(' ');
+    let micros = words.next()?.parse().ok()?;
+    Some(Wake {
+        micros,
+        kind: words.next().and_then(WakeKind::parse),
+    })
 }
 
 impl HttpRequestRecord {
@@ -85,7 +142,28 @@ impl HttpRequestRecord {
             wake_micros: None,
             cache: None,
             encoding: None,
+            wake: None,
+            trace_id: None,
+            request_bytes: 0,
+            response_bytes: 0,
+            trace: None,
+            ended_us: 0,
         }
+    }
+
+    /// The trace the proxy started for the request, of which this record is the root span.
+    pub(crate) fn traced(mut self, trace: RequestTrace) -> Self {
+        self.trace_id = Some(trace.trace.to_string());
+        self.trace = Some(trace);
+        self
+    }
+
+    /// The bodies' sizes, and when the last of the answer was sent or the visitor left.
+    pub(crate) fn finished(mut self, request_bytes: u64, response_bytes: u64, ended_us: i64) -> Self {
+        self.request_bytes = request_bytes;
+        self.response_bytes = response_bytes;
+        self.ended_us = ended_us;
+        self
     }
 
     /// What the response cache did with the request, and the coding its body left in: `None` for
@@ -96,9 +174,10 @@ impl HttpRequestRecord {
         self
     }
 
-    /// The part of `duration_micros` the request spent held for a restore or a cold boot.
-    pub fn woken_for(mut self, wake_micros: Option<u64>) -> Self {
-        self.wake_micros = wake_micros;
+    /// The part of `duration_micros` the request spent held for its app to come up, and how it did.
+    pub(crate) fn woken(mut self, wake: Option<Wake>) -> Self {
+        self.wake_micros = wake.map(|wake| wake.micros);
+        self.wake = wake.and_then(|wake| wake.kind);
         self
     }
 
@@ -122,7 +201,7 @@ pub(super) struct HttpRequestScope {
 }
 
 enum HttpLogCommand {
-    Record(HttpRequestScope, HttpRequestRecord),
+    Record(HttpRequestScope, Box<HttpRequestRecord>),
     Discard(AppId, oneshot::Sender<()>),
 }
 
@@ -169,7 +248,7 @@ impl HttpRequestLog {
         let Some(sender) = &self.sender else {
             return;
         };
-        match sender.try_send(HttpLogCommand::Record(scope, record)) {
+        match sender.try_send(HttpLogCommand::Record(scope, Box::new(record))) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -310,7 +389,7 @@ fn write_records(mut receiver: Receiver<HttpLogCommand>, directory: PathBuf) {
             match command {
                 HttpLogCommand::Record(scope, record) => {
                     if scope.active.load(Ordering::Acquire) {
-                        if let Err(error) = writer.write(scope.app_id.clone(), record) {
+                        if let Err(error) = writer.write(scope.app_id.clone(), *record) {
                             tracing::warn!(app_id = %scope.app_id, %error, "HTTP request log could not be written");
                         }
                     }
@@ -333,15 +412,23 @@ mod tests {
     #[test]
     fn a_record_says_how_long_its_request_waited_for_a_wake_only_when_it_did() {
         let uri: Uri = "/".parse().expect("a request URI");
-        let record = |wake_micros| {
+        let record = |wake| {
             serde_json::to_value(
                 HttpRequestRecord::new("GET", &uri, 200, 312_000, crate::test_support::deployment_id())
-                    .woken_for(wake_micros),
+                    .woken(wake),
             )
             .expect("a record")
         };
-        assert_eq!(record(Some(240_000))["wakeMicros"], 240_000);
-        assert!(record(None).get("wakeMicros").is_none());
+        let restored = record(Some(Wake {
+            micros: 240_000,
+            kind: Some(WakeKind::Restored),
+        }));
+        assert_eq!(
+            (&restored["wakeMicros"], &restored["wake"]),
+            (&240_000.into(), &"restored".into())
+        );
+        let none = record(None);
+        assert!(none.get("wakeMicros").is_none() && none.get("wake").is_none());
     }
 
     #[test]
@@ -363,12 +450,16 @@ mod tests {
     #[test]
     fn the_wake_a_response_carries_is_taken_off_it_before_any_client_sees_it() {
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(wake_header(), hyper::header::HeaderValue::from(240_000u64));
+        let thawed = Wake {
+            micros: 240_000,
+            kind: Some(WakeKind::Thawed),
+        };
+        headers.insert(wake_header(), thawed.header_value());
         headers.insert("x-nibrunner-wake", hyper::header::HeaderValue::from_static("1"));
-        assert_eq!(take_wake_micros(&mut headers), Some(240_000));
+        assert_eq!(take_wake(&mut headers), Some(thawed));
         assert!(headers.get(wake_header()).is_none());
         assert_eq!(
-            take_wake_micros(&mut headers),
+            take_wake(&mut headers),
             None,
             "a name a guest could guess is not it"
         );

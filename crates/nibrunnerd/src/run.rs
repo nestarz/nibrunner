@@ -241,6 +241,7 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
         cache: Mutex::new(DesiredStateCache::new()),
         vms,
         logs: files,
+        otlp: crate::adapters::otlp::OtlpReceiver::new(telemetry.clone(), nft_render::OTLP_RECEIVER_PORT),
         telemetry,
         volumes,
         artifacts,

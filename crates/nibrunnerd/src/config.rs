@@ -791,10 +791,10 @@ mod file {
         #[schemars(range(min = 1))]
         pub(super) keep_mib_per_app: Option<u64>,
         /// Optional, with `seal_key_file`. A control plane's `s3://<bucket>/fleets/<fleet>` (or a
-        /// directory ending in `fleets/<fleet>`): the output and requests of every instance whose
+        /// directory ending in `fleets/<fleet>`): the output and traces of every instance whose
         /// document labels it with an `app` are shipped there, sealed, as
         /// `logs/<app>/live-<hostId>.jsonl.gz` every 5 s and `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz`
-        /// every 300 s and when the instance is forgotten.
+        /// every 300 s and when the instance is forgotten, and the same two under `traces/`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) sink: Option<String>,
         /// The fleet key the objects are sealed under: a file of exactly 32 raw bytes.

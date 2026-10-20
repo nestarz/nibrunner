@@ -1,7 +1,8 @@
-//! Tenant output and requests, shipped to a control plane's bucket in the objects it reads
-//! (`logs/<app>/live-<host>.jsonl.gz`, `logs/<app>/<yyyymmddhh>/<mmss>-<host>.jsonl.gz`): gzipped
-//! JSON lines, sealed under its fleet key. An instance is shipped only once its document labels it
-//! with an `app`; every line carries that label, `rev` and `context`, and its unit (the app id).
+//! Tenant output and traces, shipped to a control plane's bucket in the objects it reads
+//! (`logs/<app>/live-<host>.jsonl.gz`, `logs/<app>/<yyyymmddhh>/<mmss>-<host>.jsonl.gz`, and the
+//! same two under `traces/`): gzipped JSON lines, sealed under its fleet key. An instance is
+//! shipped only once its document labels it with an `app`; every line carries that label, `rev`
+//! and `context`, and its unit (the app id).
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::adapters::proxy::encode::Encoding;
-use crate::adapters::proxy::http_log::HttpRequestRecord;
+use crate::adapters::proxy::http_log::{HttpRequestRecord, WakeKind};
 use crate::domain::metrics::rollup::{hour_key, micros_rfc3339, mmss};
 use crate::domain::metrics::CacheOutcome;
 use crate::ports::{TenantLogBody, TenantLogEvent};
@@ -160,7 +161,7 @@ fn fleet_of(url: &str) -> Option<String> {
 }
 
 /// One line as the control plane reads it: field order and omissions are the wire.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LogLine {
     pub t: String,
     pub host: String,
@@ -192,6 +193,15 @@ pub struct LogLine {
     /// The coding the response left the proxy in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) encoding: Option<Encoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
+    /// The trace and span the guest's runtime put on the record; never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<Attributes>,
 }
 
 impl LogLine {
@@ -212,11 +222,223 @@ pub enum LogKind {
     #[default]
     Stdout,
     Stderr,
+    /// A log record the guest's runtime exported over OTLP.
+    Otel,
+    /// A request, as hosts before traces wrote it; a reader still meets it in older chunks.
     Req,
     Gap,
 }
 
-pub fn encode(lines: &[LogLine]) -> Vec<u8> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Severity {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+}
+
+/// Allow-listed span and record attributes: strings, numbers and booleans only.
+pub type Attributes = BTreeMap<String, serde_json::Value>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpanKind {
+    Server,
+    Client,
+    #[default]
+    Internal,
+    Producer,
+    Consumer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OtelStatus {
+    Unset,
+    Ok,
+    Error,
+}
+
+/// The proxy's root span carries the HTTP status; a guest's span its OpenTelemetry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SpanStatus {
+    Http(u16),
+    Otel(OtelStatus),
+}
+
+/// One span as the control plane reads it under `traces/`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpanLine {
+    pub trace: String,
+    pub span: String,
+    pub parent: Option<String>,
+    pub kind: SpanKind,
+    pub name: String,
+    pub t: String,
+    pub end: String,
+    pub host: String,
+    pub unit: String,
+    pub rev: String,
+    pub context: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub root: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SpanStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_msg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) wake: Option<WakeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache: Option<CacheOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) encoding: Option<Encoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx: Option<u64>,
+    /// The trace the caller said it was in, which the proxy never continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_trace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<Attributes>,
+    /// A trace id this proxy did not mint within the last hour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub foreign: bool,
+}
+
+/// What a bound dropped: the chunk's cap, or, with `trace`, one trace's spans or attributes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceGap {
+    pub t: String,
+    pub host: String,
+    pub unit: String,
+    pub rev: String,
+    pub context: String,
+    pub dropped: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "k", rename_all = "lowercase")]
+pub enum TraceLine {
+    Span(Box<SpanLine>),
+    Gap(TraceGap),
+}
+
+impl TraceLine {
+    fn labelled(self, host: &str, unit: &str, labels: &Unit) -> Self {
+        let (host, unit, rev, context) = (
+            host.into(),
+            unit.into(),
+            labels.rev.clone(),
+            labels.context.clone(),
+        );
+        match self {
+            TraceLine::Span(span) => TraceLine::Span(Box::new(SpanLine {
+                host,
+                unit,
+                rev,
+                context,
+                ..*span
+            })),
+            TraceLine::Gap(gap) => TraceLine::Gap(TraceGap {
+                host,
+                unit,
+                rev,
+                context,
+                ..gap
+            }),
+        }
+    }
+
+    fn ended_micros(&self) -> i64 {
+        match self {
+            TraceLine::Span(span) => micros_of(&span.end),
+            TraceLine::Gap(gap) => micros_of(&gap.t),
+        }
+    }
+}
+
+/// A line of one of the two families: the chunks of each are written and capped alike.
+pub(crate) trait Line: Serialize + Clone {
+    const FAMILY: &'static str;
+    fn t(&self) -> &str;
+    /// The line saying `dropped` lines past the cap were let go, labelled as `self` is.
+    fn gap(&self, t: String, dropped: u64) -> Self;
+    fn shipping(state: &mut Shipping) -> &mut BTreeMap<String, AppLogs<Self>>;
+}
+
+impl Line for LogLine {
+    const FAMILY: &'static str = "logs";
+
+    fn t(&self) -> &str {
+        &self.t
+    }
+
+    fn gap(&self, t: String, dropped: u64) -> Self {
+        LogLine {
+            t,
+            k: LogKind::Gap,
+            dropped: Some(dropped),
+            ..LogLine::labelled(
+                self.host.clone(),
+                self.unit.clone(),
+                self.rev.clone(),
+                self.context.clone(),
+            )
+        }
+    }
+
+    fn shipping(state: &mut Shipping) -> &mut BTreeMap<String, AppLogs<Self>> {
+        &mut state.apps
+    }
+}
+
+impl Line for TraceLine {
+    const FAMILY: &'static str = "traces";
+
+    fn t(&self) -> &str {
+        match self {
+            TraceLine::Span(span) => &span.t,
+            TraceLine::Gap(gap) => &gap.t,
+        }
+    }
+
+    fn gap(&self, t: String, dropped: u64) -> Self {
+        let (host, unit, rev, context) = match self {
+            TraceLine::Span(s) => (&s.host, &s.unit, &s.rev, &s.context),
+            TraceLine::Gap(g) => (&g.host, &g.unit, &g.rev, &g.context),
+        };
+        TraceLine::Gap(TraceGap {
+            t,
+            host: host.clone(),
+            unit: unit.clone(),
+            rev: rev.clone(),
+            context: context.clone(),
+            dropped,
+            trace: None,
+        })
+    }
+
+    fn shipping(state: &mut Shipping) -> &mut BTreeMap<String, AppLogs<Self>> {
+        &mut state.traces
+    }
+}
+
+pub fn encode<L: Serialize>(lines: &[L]) -> Vec<u8> {
     let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
     for line in lines {
         let _ = serde_json::to_writer(&mut gz, line);
@@ -252,21 +474,35 @@ impl Unit {
 /// A deployment being replaced may still be writing while its successor starts.
 const DEPLOYMENTS_PER_APP: usize = 2;
 
-#[derive(Default)]
-struct AppLogs {
-    pending: Vec<LogLine>,
+pub(crate) struct AppLogs<L> {
+    pending: Vec<L>,
     pending_bytes: usize,
     /// A chunk that filled before its five minutes were up, waiting for the next write.
-    full: Option<Vec<LogLine>>,
+    full: Option<Vec<L>>,
     dropped: u64,
-    dropped_label: Option<LogLine>,
-    live: VecDeque<(i64, usize, LogLine)>,
+    dropped_label: Option<L>,
+    live: VecDeque<(i64, usize, L)>,
     live_bytes: usize,
     printed: bool,
 }
 
-impl AppLogs {
-    fn push(&mut self, micros: i64, line: LogLine) {
+impl<L> Default for AppLogs<L> {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            pending_bytes: 0,
+            full: None,
+            dropped: 0,
+            dropped_label: None,
+            live: VecDeque::new(),
+            live_bytes: 0,
+            printed: false,
+        }
+    }
+}
+
+impl<L: Line> AppLogs<L> {
+    fn push(&mut self, micros: i64, line: L) {
         let size = serde_json::to_vec(&line).map_or(0, |b| b.len() + 1);
         if self.pending_bytes + size > PENDING_MAX_BYTES && self.full.is_none() {
             self.full = Some(std::mem::take(&mut self.pending));
@@ -302,7 +538,7 @@ impl AppLogs {
 
     /// The next chunk to write: a full one first, then (when `pending` is due) the lines gathered
     /// since, ended by one gap line for whatever the cap dropped.
-    fn take(&mut self, pending: bool, now: i64) -> Option<Vec<LogLine>> {
+    fn take(&mut self, pending: bool, now: i64) -> Option<Vec<L>> {
         if let Some(full) = self.full.take() {
             return Some(full);
         }
@@ -312,17 +548,12 @@ impl AppLogs {
         let mut lines = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
         if let (n @ 1.., Some(label)) = (std::mem::take(&mut self.dropped), self.dropped_label.take()) {
-            lines.push(LogLine {
-                t: micros_rfc3339(now * 1_000_000),
-                k: LogKind::Gap,
-                dropped: Some(n),
-                ..LogLine::labelled(label.host, label.unit, label.rev, label.context)
-            });
+            lines.push(label.gap(micros_rfc3339(now * 1_000_000), n));
         }
         (!lines.is_empty()).then_some(lines)
     }
 
-    fn put_back(&mut self, mut lines: Vec<LogLine>) {
+    fn put_back(&mut self, mut lines: Vec<L>) {
         self.pending_bytes += lines
             .iter()
             .map(|l| serde_json::to_vec(l).map_or(0, |b| b.len() + 1))
@@ -341,12 +572,25 @@ impl AppLogs {
 }
 
 #[derive(Default)]
-struct Shipping {
+pub(crate) struct Shipping {
     host: String,
     /// Each app id's labelled deployments, newest first.
     units: BTreeMap<AppId, Vec<(DeploymentId, Unit)>>,
-    apps: BTreeMap<String, AppLogs>,
+    apps: BTreeMap<String, AppLogs<LogLine>>,
+    traces: BTreeMap<String, AppLogs<TraceLine>>,
     chunk_slot: Option<i64>,
+}
+
+impl Shipping {
+    /// The labels `deployment` of `app_id` wrote under, or its newest when that is not said.
+    fn unit(&self, app_id: &AppId, deployment: Option<&DeploymentId>) -> Option<Unit> {
+        let deployments = self.units.get(app_id)?;
+        let wrote = match deployment {
+            Some(deployment) => deployments.iter().find(|(d, _)| d == deployment),
+            None => deployments.first(),
+        };
+        wrote.map(|(_, unit)| unit.clone())
+    }
 }
 
 pub struct ObjectSink {
@@ -415,10 +659,7 @@ impl ObjectSink {
     }
 
     pub fn output(&self, event: &TenantLogEvent) {
-        let unit = self.lock().units.get(&event.app_id).and_then(|deployments| {
-            let wrote = deployments.iter().find(|(d, _)| *d == event.deployment_id);
-            wrote.map(|(_, unit)| unit.clone())
-        });
+        let unit = self.lock().unit(&event.app_id, Some(&event.deployment_id));
         let (stream, msg, job, run) = match &event.body {
             TenantLogBody::CronData {
                 stream,
@@ -451,50 +692,110 @@ impl ObjectSink {
         });
     }
 
-    /// Labelled with what the route it took carried, so a deployment being replaced keeps its own.
+    /// The proxy's root span of a request, labelled with what the route it took carried, so a
+    /// deployment being replaced keeps its own.
     pub fn request(&self, app_id: &AppId, record: &HttpRequestRecord) {
-        self.push(
+        let Some(trace) = &record.trace else {
+            return;
+        };
+        let span = SpanLine {
+            trace: trace.trace.to_string(),
+            span: trace.span.to_string(),
+            parent: None,
+            kind: SpanKind::Server,
+            name: format!("{} {}", record.method, record.path),
+            t: micros_rfc3339(trace.started_us),
+            end: micros_rfc3339(record.ended_us.max(trace.started_us)),
+            root: true,
+            method: Some(record.method.clone()),
+            path: Some(record.path.clone()),
+            status: Some(SpanStatus::Http(record.status)),
+            deployment: Some(record.deployment_id.to_string()),
+            wake: record.wake,
+            wake_us: record.wake_micros,
+            cache: record.cache,
+            encoding: record.encoding,
+            rx: Some(record.request_bytes),
+            tx: Some(record.response_bytes),
+            parent_trace: trace.parent_trace.map(|t| t.to_string()),
+            ..SpanLine::default()
+        };
+        self.traced(
             app_id,
             Unit::of(&record.labels),
-            record.at.epoch_ms() * 1000,
-            |l| LogLine {
-                k: LogKind::Req,
-                method: Some(record.method.clone()),
-                path: Some(record.path.clone()),
-                status: Some(record.status),
-                dur_us: Some(record.duration_micros),
-                wake_us: record.wake_micros,
-                cache: record.cache,
-                encoding: record.encoding,
-                ..l
-            },
+            vec![TraceLine::Span(Box::new(span))],
         );
+    }
+
+    /// What a guest exported over OTLP, labelled as the deployment that sent it.
+    pub(crate) fn exported(
+        &self,
+        app_id: &AppId,
+        deployment: Option<&DeploymentId>,
+        spans: Vec<TraceLine>,
+        records: Vec<(i64, LogLine)>,
+    ) {
+        let unit = self.lock().unit(app_id, deployment);
+        self.traced(app_id, unit.clone(), spans);
+        for (micros, record) in records {
+            self.push(app_id, unit.clone(), micros, |labelled| LogLine {
+                t: labelled.t,
+                host: labelled.host,
+                unit: labelled.unit,
+                rev: labelled.rev,
+                context: labelled.context,
+                k: LogKind::Otel,
+                ..record
+            });
+        }
+    }
+
+    fn traced(&self, app_id: &AppId, unit: Option<Unit>, lines: Vec<TraceLine>) {
+        let (Some(_), Some(unit)) = (&self.logs, unit) else {
+            return;
+        };
+        let mut state = self.lock();
+        let host = state.host.clone();
+        let traces = state.traces.entry(unit.app.clone()).or_default();
+        for line in lines {
+            let line = line.labelled(&host, app_id.as_str(), &unit);
+            traces.push(line.ended_micros(), line);
+        }
     }
 
     /// The live tail of every app that printed since the last; every app's chunk at a 5-minute
     /// boundary, and a chunk that filled early whenever. A write that fails keeps its lines.
     pub async fn ship(&self, now: i64) -> Result<(), TelemetryError> {
-        let (printed, apps, boundary) = {
+        let boundary = {
             let mut state = self.lock();
-            state.apps.values_mut().for_each(|a| a.prune(now));
             let slot = now.div_euclid(CHUNK_S);
-            let boundary = state.chunk_slot.replace(slot).is_some_and(|s| s != slot);
-            let printed: Vec<String> = state
-                .apps
+            state.chunk_slot.replace(slot).is_some_and(|s| s != slot)
+        };
+        let logs = self.ship_family::<LogLine>(boundary, now).await;
+        let traces = self.ship_family::<TraceLine>(boundary, now).await;
+        logs.and(traces)
+    }
+
+    async fn ship_family<L: Line>(&self, boundary: bool, now: i64) -> Result<(), TelemetryError> {
+        let (printed, apps) = {
+            let mut state = self.lock();
+            let family = L::shipping(&mut state);
+            family.values_mut().for_each(|a| a.prune(now));
+            let printed: Vec<String> = family
                 .iter()
                 .filter(|(_, a)| a.printed)
                 .map(|(n, _)| n.clone())
                 .collect();
-            (printed, state.apps.keys().cloned().collect::<Vec<_>>(), boundary)
+            (printed, family.keys().cloned().collect::<Vec<_>>())
         };
         let mut first = Ok(());
         for app in printed {
-            first = first.and(self.write_live(&app, now).await);
+            first = first.and(self.write_live::<L>(&app, now).await);
         }
         for app in apps {
-            first = first.and(self.flush(&app, boundary, now).await);
+            first = first.and(self.flush::<L>(&app, boundary, now).await);
         }
-        self.lock().apps.retain(|_, a| !a.idle());
+        L::shipping(&mut self.lock()).retain(|_, a| !a.idle());
         first
     }
 
@@ -504,13 +805,15 @@ impl ObjectSink {
             return Ok(());
         };
         let apps: std::collections::BTreeSet<String> = deployments.into_iter().map(|(_, u)| u.app).collect();
+        let now = crate::clock::now_ms() / 1000;
         for app in apps {
-            self.flush(&app, true, crate::clock::now_ms() / 1000).await?;
+            self.flush::<LogLine>(&app, true, now).await?;
+            self.flush::<TraceLine>(&app, true, now).await?;
         }
         Ok(())
     }
 
-    async fn flush(&self, app: &str, pending: bool, now: i64) -> Result<(), TelemetryError> {
+    async fn flush<L: Line>(&self, app: &str, pending: bool, now: i64) -> Result<(), TelemetryError> {
         let Some((bucket, seal)) = &self.logs else {
             return Ok(());
         };
@@ -518,27 +821,33 @@ impl ObjectSink {
             let (host, lines) = {
                 let mut state = self.lock();
                 let host = state.host.clone();
-                match state.apps.get_mut(app).and_then(|a| a.take(pending, now)) {
+                match L::shipping(&mut state)
+                    .get_mut(app)
+                    .and_then(|a| a.take(pending, now))
+                {
                     Some(lines) => (host, lines),
                     None => return Ok(()),
                 }
             };
             if let Err(error) = write_chunk(bucket, seal, app, &host, &lines).await {
-                self.lock().apps.entry(app.into()).or_default().put_back(lines);
+                L::shipping(&mut self.lock())
+                    .entry(app.into())
+                    .or_default()
+                    .put_back(lines);
                 return Err(error);
             }
         }
     }
 
     /// `app`'s last [`LIVE_WINDOW_S`], at most [`LIVE_MAX_BYTES`] compressed, oldest lines first out.
-    async fn write_live(&self, app: &str, now: i64) -> Result<(), TelemetryError> {
+    async fn write_live<L: Line>(&self, app: &str, now: i64) -> Result<(), TelemetryError> {
         let Some((bucket, seal)) = &self.logs else {
             return Ok(());
         };
         let (host, mut lines) = {
             let mut state = self.lock();
             let host = state.host.clone();
-            let Some(a) = state.apps.get_mut(app) else {
+            let Some(a) = L::shipping(&mut state).get_mut(app) else {
                 return Ok(());
             };
             a.prune(now);
@@ -548,7 +857,7 @@ impl ObjectSink {
                 budget = budget.saturating_sub(*n);
                 budget > 0
             });
-            let mut lines: Vec<LogLine> = newest.map(|(_, _, l)| l.clone()).collect();
+            let mut lines: Vec<L> = newest.map(|(_, _, l)| l.clone()).collect();
             lines.reverse();
             (host, lines)
         };
@@ -557,10 +866,10 @@ impl ObjectSink {
             lines.drain(..lines.len().div_ceil(4));
             body = encode(&lines);
         }
-        let key = format!("logs/{app}/live-{host}.jsonl.gz");
+        let key = format!("{}/{app}/live-{host}.jsonl.gz", L::FAMILY);
         let written = bucket.put_sealed(&key, &body, seal, false).await;
         if written.is_err() {
-            if let Some(a) = self.lock().apps.get_mut(app) {
+            if let Some(a) = L::shipping(&mut self.lock()).get_mut(app) {
                 a.printed = true;
             }
         }
@@ -569,17 +878,19 @@ impl ObjectSink {
 }
 
 /// Created once, named after its first line's second, or one of the few after it if taken.
-async fn write_chunk(
+async fn write_chunk<L: Line>(
     bucket: &Bucket,
     seal: &SealKey,
     app: &str,
     host: &str,
-    lines: &[LogLine],
+    lines: &[L],
 ) -> Result<(), TelemetryError> {
-    let start = lines.first().map_or(0, |l| micros_of(&l.t).div_euclid(1_000_000));
+    let start = lines
+        .first()
+        .map_or(0, |l| micros_of(l.t()).div_euclid(1_000_000));
     let body = encode(lines);
     for t in start..start + NAME_TRIES {
-        let key = format!("logs/{app}/{}/{}-{host}.jsonl.gz", hour_key(t), mmss(t));
+        let key = format!("{}/{app}/{}/{}-{host}.jsonl.gz", L::FAMILY, hour_key(t), mmss(t));
         if bucket.put_sealed(&key, &body, seal, true).await? {
             return Ok(());
         }
@@ -595,8 +906,10 @@ fn micros_of(t: &str) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::adapters::otlp::trace::{RequestTrace, TraceBook};
+    use crate::adapters::proxy::http_log::{Wake, WakeKind};
     use crate::test_support::{app_id, deployment_id, desired_instance, desired_state};
     use object_store::memory::InMemory;
 
@@ -615,7 +928,7 @@ mod tests {
             .unwrap()
     }
 
-    fn decode(gz: &[u8]) -> Vec<LogLine> {
+    fn decode<L: serde::de::DeserializeOwned>(gz: &[u8]) -> Vec<L> {
         let mut text = String::new();
         std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz), &mut text).unwrap();
         text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
@@ -671,10 +984,95 @@ mod tests {
         let plain = include_bytes!("../../../tests/fixtures/telemetry/chunk.jsonl.gz");
         let sealed = include_bytes!("../../../tests/fixtures/telemetry/chunk.sealed");
         assert_eq!(
-            decode(&unseal(&seal, &format!("acme/{key}"), sealed)),
+            decode::<LogLine>(&unseal(&seal, &format!("acme/{key}"), sealed)),
             fixture_lines()
         );
         assert_eq!(encode(&fixture_lines()), plain);
+        assert_eq!(seal.seal(&format!("acme/{key}"), plain), sealed);
+    }
+
+    fn fixture_traces() -> Vec<TraceLine> {
+        let labelled = |span: SpanLine| SpanLine {
+            host: "ovh-1".into(),
+            unit: "site".into(),
+            rev: "0123456789ab".into(),
+            context: "production".into(),
+            ..span
+        };
+        vec![
+            TraceLine::Span(Box::new(labelled(SpanLine {
+                trace: "065fe0a2c3f8a1b2c3d4e5f60718293a".into(),
+                span: "00f067aa0ba902b7".into(),
+                parent: None,
+                kind: SpanKind::Server,
+                name: "GET /checkout".into(),
+                t: "2026-10-16T12:05:02.188000Z".into(),
+                end: "2026-10-16T12:05:02.500000Z".into(),
+                root: true,
+                method: Some("GET".into()),
+                path: Some("/checkout".into()),
+                status: Some(SpanStatus::Http(500)),
+                deployment: Some("dep-1".into()),
+                wake: Some(WakeKind::Restored),
+                wake_us: Some(240_000),
+                cache: Some(CacheOutcome::Miss),
+                encoding: Some(Encoding::Br),
+                rx: Some(0),
+                tx: Some(1_234),
+                parent_trace: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
+                ..SpanLine::default()
+            }))),
+            TraceLine::Span(Box::new(labelled(SpanLine {
+                trace: "065fe0a2c3f8a1b2c3d4e5f60718293a".into(),
+                span: "b0709fad9766112d".into(),
+                parent: Some("00f067aa0ba902b7".into()),
+                kind: SpanKind::Server,
+                name: "GET".into(),
+                t: "2026-10-16T12:05:02.430000Z".into(),
+                end: "2026-10-16T12:05:02.499000Z".into(),
+                status: Some(SpanStatus::Otel(OtelStatus::Error)),
+                status_msg: Some("upstream refused".into()),
+                attrs: Some(Attributes::from([
+                    ("http.response.status_code".into(), 500.into()),
+                    ("url.path".into(), "/checkout".into()),
+                ])),
+                ..SpanLine::default()
+            }))),
+            TraceLine::Span(Box::new(labelled(SpanLine {
+                trace: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+                span: "b7ad6b7169203331".into(),
+                parent: Some("00f067aa0ba902b7".into()),
+                kind: SpanKind::Client,
+                name: "pg.query".into(),
+                t: "2026-10-16T12:05:03.000000Z".into(),
+                end: "2026-10-16T12:05:03.010000Z".into(),
+                status: Some(SpanStatus::Otel(OtelStatus::Unset)),
+                foreign: true,
+                ..SpanLine::default()
+            }))),
+            TraceLine::Gap(TraceGap {
+                t: "2026-10-16T12:05:04.000000Z".into(),
+                host: "ovh-1".into(),
+                unit: "site".into(),
+                rev: "0123456789ab".into(),
+                context: "production".into(),
+                dropped: 44,
+                trace: Some("065fe0a2c3f8a1b2c3d4e5f60718293a".into()),
+            }),
+        ]
+    }
+
+    #[test]
+    fn a_trace_chunk_is_the_very_bytes_the_control_plane_seals_and_reads() {
+        let seal = SealKey([7; 32]);
+        let key = "traces/site/2026101612/0502-ovh-1.jsonl.gz";
+        let plain = include_bytes!("../../../tests/fixtures/telemetry/trace-chunk.jsonl.gz");
+        let sealed = include_bytes!("../../../tests/fixtures/telemetry/trace-chunk.sealed");
+        assert_eq!(
+            decode::<TraceLine>(&unseal(&seal, &format!("acme/{key}"), sealed)),
+            fixture_traces()
+        );
+        assert_eq!(encode(&fixture_traces()), plain);
         assert_eq!(seal.seal(&format!("acme/{key}"), plain), sealed);
     }
 
@@ -690,7 +1088,7 @@ mod tests {
             .unwrap()
     }
 
-    fn sink() -> (Arc<ObjectSink>, Arc<InMemory>) {
+    pub(crate) fn sink() -> (Arc<ObjectSink>, Arc<InMemory>) {
         let store = Arc::new(InMemory::new());
         let bucket = Bucket::new(store.clone(), Some("fleets/acme".into()), "acme");
         let sink = ObjectSink::new(Some((bucket, SealKey([7; 32]))), None);
@@ -718,6 +1116,10 @@ mod tests {
     }
 
     async fn read(store: &InMemory, key: &str) -> Option<Vec<LogLine>> {
+        read_family(store, key).await
+    }
+
+    async fn read_family<L: serde::de::DeserializeOwned>(store: &InMemory, key: &str) -> Option<Vec<L>> {
         let got = store.get(&format!("fleets/acme/{key}").into()).await.ok()?;
         let sealed = got.bytes().await.unwrap();
         Some(decode(&unseal(
@@ -725,6 +1127,21 @@ mod tests {
             &format!("acme/{key}"),
             &sealed,
         )))
+    }
+
+    /// The lines of the sealed object at `key`, which must be there.
+    pub(crate) async fn read_lines<L: serde::de::DeserializeOwned>(store: &InMemory, key: &str) -> Vec<L> {
+        use futures::StreamExt;
+        let found = read_family(store, key).await;
+        let Some(lines) = found else {
+            let keys: Vec<_> = store
+                .list(None)
+                .map(|meta| meta.unwrap().location.to_string())
+                .collect::<Vec<_>>()
+                .await;
+            panic!("no {key} among {keys:?}");
+        };
+        lines
     }
 
     #[tokio::test]
@@ -769,8 +1186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_line_carries_the_labels_of_the_deployment_that_wrote_it_a_cron_run_its_ids_and_a_request_what_the_proxy_did(
-    ) {
+    async fn a_line_carries_the_labels_of_the_deployment_that_wrote_it_and_a_cron_run_its_ids() {
         let (sink, store) = sink();
         let cron = TenantLogEvent {
             body: TenantLogBody::CronData {
@@ -786,17 +1202,11 @@ mod tests {
             deployment_id: protocol::DeploymentId::parse("dep-unlabelled").unwrap(),
             ..event(NOW * 1000, "unlabelled")
         });
-        let uri: hyper::Uri = "/checkout".parse().unwrap();
-        let record = HttpRequestRecord::new("GET", &uri, 500, 312_000, deployment_id())
-            .labelled(labels("r-2"))
-            .woken_for(Some(240_000))
-            .served_as(Some(CacheOutcome::Stale), Some(Encoding::Gzip));
-        sink.request(&app_id(), &record);
         sink.forget(&app_id()).await.unwrap();
         let chunk = read(&store, "logs/site/2026101612/0500-ovh-1.jsonl.gz")
             .await
             .unwrap();
-        assert_eq!(chunk.len(), 2);
+        assert_eq!(chunk.len(), 1);
         assert_eq!(
             (
                 chunk[0].msg.as_deref(),
@@ -805,13 +1215,83 @@ mod tests {
             ),
             (Some("tick"), Some("nightly"), Some("r-1"))
         );
-        assert_eq!(
-            (chunk[1].k, chunk[1].rev.as_str(), chunk[1].status),
-            (LogKind::Req, "r-2", Some(500))
+    }
+
+    fn checkout(started_us: i64, caller: Option<&str>) -> (HttpRequestRecord, RequestTrace) {
+        let mut headers = hyper::HeaderMap::new();
+        if let Some(caller) = caller {
+            headers.insert("traceparent", caller.parse().unwrap());
+        }
+        let trace = RequestTrace::begin(&mut headers, &TraceBook::default(), started_us);
+        let uri: hyper::Uri = "/checkout?token=private".parse().unwrap();
+        let record = HttpRequestRecord::new("POST", &uri, 500, 312_000, deployment_id())
+            .labelled(labels("r-2"))
+            .woken(Some(Wake {
+                micros: 240_000,
+                kind: Some(WakeKind::Restored),
+            }))
+            .served_as(Some(CacheOutcome::Bypass), Some(Encoding::Gzip))
+            .traced(trace)
+            .finished(1_200, 3_400, started_us + 312_500);
+        (record, trace)
+    }
+
+    #[tokio::test]
+    async fn a_request_is_a_root_span_under_traces_and_no_longer_a_line_under_logs() {
+        let (sink, store) = sink();
+        let (record, trace) = checkout(
+            NOW * 1_000_000 + 7,
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
         );
+        sink.request(&app_id(), &record);
+        sink.ship(NOW + 1).await.unwrap();
+        assert!(read(&store, "logs/site/live-ovh-1.jsonl.gz").await.is_none());
+        let live: Vec<TraceLine> = read_lines(&store, "traces/site/live-ovh-1.jsonl.gz").await;
+        sink.forget(&app_id()).await.unwrap();
+        let chunk: Vec<TraceLine> = read_lines(&store, "traces/site/2026101612/0500-ovh-1.jsonl.gz").await;
+        assert_eq!(live, chunk);
+        let [TraceLine::Span(root)] = chunk.as_slice() else {
+            panic!("one root span: {chunk:?}");
+        };
         assert_eq!(
-            (chunk[1].wake_us, chunk[1].cache, chunk[1].encoding),
-            (Some(240_000), Some(CacheOutcome::Stale), Some(Encoding::Gzip))
+            serde_json::to_value(root).unwrap(),
+            serde_json::json!({
+                "trace": trace.trace.to_string(), "span": trace.span.to_string(), "parent": null,
+                "kind": "server", "name": "POST /checkout",
+                "t": "2026-10-16T12:05:00.000007Z", "end": "2026-10-16T12:05:00.312507Z",
+                "host": "ovh-1", "unit": app_id().to_string(), "rev": "r-2", "context": "production",
+                "root": true, "method": "POST", "path": "/checkout", "status": 500,
+                "deployment": deployment_id().to_string(), "wake": "restored", "wake_us": 240_000,
+                "cache": "bypass", "encoding": "gzip", "rx": 1_200, "tx": 3_400,
+                "parent_trace": "4bf92f3577b34da6a3ce929d0e0e4736",
+            })
+        );
+        let line = serde_json::to_string(&chunk[0]).unwrap();
+        assert!(line.starts_with(r#"{"k":"span","trace":""#), "{line}");
+    }
+
+    #[test]
+    fn past_the_cap_a_trace_chunk_waits_and_the_rest_is_one_gap_line_of_no_trace() {
+        let mut traces = AppLogs::<TraceLine>::default();
+        let (record, trace) = checkout(NOW * 1_000_000, None);
+        let span = TraceLine::Span(Box::new(SpanLine {
+            trace: trace.trace.to_string(),
+            name: "x".repeat(1 << 20),
+            host: "ovh-1".into(),
+            unit: record.path,
+            ..SpanLine::default()
+        }));
+        for _ in 0..9 {
+            traces.push(0, span.clone());
+        }
+        assert_eq!(traces.take(false, NOW).unwrap().len(), 3);
+        let rest = traces.take(true, NOW).unwrap();
+        let Some(TraceLine::Gap(gap)) = rest.last() else {
+            panic!("a gap line");
+        };
+        assert_eq!(
+            (gap.dropped, gap.trace.as_deref(), gap.host.as_str()),
+            (3, None, "ovh-1")
         );
     }
 

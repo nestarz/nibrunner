@@ -186,12 +186,6 @@ pub enum WakeOutcome {
 }
 
 impl WakeOutcome {
-    /// Whether the request was held while a microVM was brought back from disk or booted, which is
-    /// the wait its HTTP request record attributes to it.
-    pub fn held_the_request(self) -> bool {
-        matches!(self, WakeOutcome::Restored | WakeOutcome::ColdBoot)
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             WakeOutcome::Restored => "restored",
