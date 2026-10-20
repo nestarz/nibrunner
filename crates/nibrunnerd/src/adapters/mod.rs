@@ -7,6 +7,7 @@ pub mod filesystem;
 pub mod guest_measurements;
 pub mod logs;
 pub mod net;
+pub mod otlp;
 pub mod proxy;
 pub mod vm;
 pub mod volumes;

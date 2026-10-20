@@ -191,7 +191,10 @@ impl VmManager {
             program: &request.desired.config.command.program,
             working_directory: &request.desired.config.command.working_directory,
             args: &request.desired.config.command.args,
-            environment: &request.desired.config.command.environment,
+            environment: &crate::adapters::otlp::with_endpoint(
+                &request.desired.config.command.environment,
+                &slot.host_ipv4,
+            ),
             restart_policy: &request.desired.config.restart_policy,
         })
         .map_err(|error| VmError::Host(error.to_string()))?;

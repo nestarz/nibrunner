@@ -31,6 +31,9 @@ const RULE_INDENT: &str = "    ";
 
 const DENY: &str = "reject";
 
+/// Where a guest sends its OpenTelemetry export: its own tap's host address, on the OTLP/HTTP port.
+pub const OTLP_RECEIVER_PORT: u16 = 4318;
+
 pub fn app_received_counter_name(app_id: &AppId) -> String {
     format!("{APP_RECEIVED_COUNTER_PREFIX}{app_id}")
 }
@@ -77,6 +80,13 @@ pub struct ForwardedInstance {
     pub guest_ipv4: Ipv4Address,
 }
 
+/// A guest that may reach the OTLP receiver on its own tap's host address, and nothing else there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtlpSender {
+    pub host_ipv4: Ipv4Address,
+    pub guest_ipv4: Ipv4Address,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FirewallState {
     pub allowed_host_tcp_endpoints: Vec<SocketAddr>,
@@ -84,6 +94,8 @@ pub struct FirewallState {
     /// operator's own network. Every other private destination stays denied.
     pub allowed_egress_endpoints: Vec<SocketAddr>,
     pub instances: Vec<ForwardedInstance>,
+    /// Every slot's guest, booting ones included: a runtime exports what it printed while starting.
+    pub otlp_senders: Vec<OtlpSender>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
 }
@@ -313,6 +325,14 @@ fn input_chain(state: &FirewallState, ipv4: bool) -> Vec<String> {
             endpoint.port()
         ));
     }
+    if ipv4 {
+        rules.extend(state.otlp_senders.iter().map(|sender| {
+            format!(
+                "iifname {tap} ip saddr {} ip daddr {} tcp dport {OTLP_RECEIVER_PORT} accept comment \"otlp receiver\"",
+                sender.guest_ipv4, sender.host_ipv4
+            )
+        }));
+    }
     rules.push(format!("iifname {tap} {DENY} comment \"guest to host\""));
     chain("input {", &rules)
 }
@@ -429,6 +449,7 @@ mod tests {
     fn state(instances: Vec<ForwardedInstance>, v4: &[&str], v6: &[&str]) -> FirewallState {
         FirewallState {
             instances,
+            otlp_senders: vec![],
             allowed_host_tcp_endpoints: vec![],
             allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: v4.iter().map(|s| s.to_string()).collect(),
@@ -498,6 +519,30 @@ mod tests {
             "iifname \"nbr*\" ip6 daddr fd00::5 tcp dport 9000 accept comment \"allowed egress endpoint\"",
             &["denied egress", "instance metadata endpoint", "guest to guest"],
         );
+    }
+
+    #[test]
+    fn a_guest_reaches_the_otlp_receiver_on_its_own_tap_address_and_nothing_else_of_the_host() {
+        let mut configured = state(vec![], &["203.0.113.0/24"], &[]);
+        configured.otlp_senders = vec![OtlpSender {
+            host_ipv4: Ipv4Address::parse("10.201.0.1").unwrap(),
+            guest_ipv4: Ipv4Address::parse("10.201.0.2").unwrap(),
+        }];
+        let rules = input_chain(&configured, true).join("\n");
+        let allowed = "iifname \"nbr*\" ip saddr 10.201.0.2 ip daddr 10.201.0.1 tcp dport 4318 accept comment \"otlp receiver\"";
+        let allow_at = rules.find(allowed).unwrap();
+        assert!(rules.find("denied egress").unwrap() < allow_at);
+        assert!(allow_at < rules.find("guest to host").unwrap());
+        let accepting = rules
+            .lines()
+            .filter(|line| line.trim_start().starts_with("iifname") && line.contains(" accept"))
+            .count();
+        assert_eq!(accepting, 2, "{rules}");
+        assert!(!input_chain(&configured, false).join("\n").contains("4318"));
+        assert!(!forward_chain_v4(&configured).join("\n").contains("4318"));
+        assert!(!input_chain(&FirewallState::default(), true)
+            .join("\n")
+            .contains("otlp receiver"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::adapters::proxy::forward::{forward, say, ProxyBody, Upstreams};
-use crate::adapters::proxy::http_log::wake_header;
+use crate::adapters::proxy::http_log::{wake_header, Wake, WakeKind};
 use crate::domain::metrics::sleep_wake::Answer;
 use crate::domain::metrics::HostMetrics;
 use crate::ports::{WakeFailure, WakeRefusal, Waker};
@@ -141,7 +141,7 @@ impl AppActivator {
         };
 
         let started = std::time::Instant::now();
-        let mut held_for_a_wake = false;
+        let mut woke_as = None;
         // An idle guest is asleep and has to be woken. Any other guest that reaches the activator
         // is one the firewall stopped forwarding because it is no longer Running, yet it may well
         // still be serving its port — an app the health tracker moved to Unhealthy is the case that
@@ -157,7 +157,7 @@ impl AppActivator {
         if record.is_idle() || self.state.is_snapshotting(&app_id).await || !accepts_a_connection(guest).await
         {
             match self.waker.wake(&app_id).await {
-                Ok(outcome) => held_for_a_wake = outcome.held_the_request(),
+                Ok(outcome) => woke_as = woken_as(outcome),
                 Err(refusal) => match refusal {
                     WakeRefusal::NoRoom { shortfall_mib } => {
                         tracing::warn!(%app_id, shortfall_mib, "a request could not be given an app");
@@ -203,11 +203,12 @@ impl AppActivator {
         .await;
         self.metrics.sleep_wake.first_response(served.elapsed());
         response.headers_mut().remove(wake_header());
-        if held_for_a_wake {
-            response.headers_mut().insert(
-                wake_header(),
-                hyper::header::HeaderValue::from(u64::try_from(woke.as_micros()).unwrap_or(u64::MAX)),
-            );
+        if let Some(kind) = woke_as {
+            let wake = Wake {
+                micros: u64::try_from(woke.as_micros()).unwrap_or(u64::MAX),
+                kind: Some(kind),
+            };
+            response.headers_mut().insert(wake_header(), wake.header_value());
         }
         tracing::debug!(
             %app_id,
@@ -222,6 +223,19 @@ impl AppActivator {
 /// Whether the guest is already listening. The kernel completes this connection even while the
 /// app behind the port is unhealthy, and the wait is bounded so an unreachable guest does not hold
 /// the request up before it falls through to the wake path.
+/// How the app was brought up for the request, which its root span and record name; nothing when
+/// it already was.
+fn woken_as(outcome: crate::ports::WakeOutcome) -> Option<WakeKind> {
+    use crate::ports::WakeOutcome;
+    match outcome {
+        WakeOutcome::Thawed => Some(WakeKind::Thawed),
+        WakeOutcome::Restored => Some(WakeKind::Restored),
+        // A thaw that failed was answered by the cold boot that replaced it.
+        WakeOutcome::ColdBoot | WakeOutcome::ThawFailed => Some(WakeKind::Booted),
+        WakeOutcome::AlreadyRunning => None,
+    }
+}
+
 async fn accepts_a_connection(address: SocketAddr) -> bool {
     matches!(
         tokio::time::timeout(
@@ -416,11 +430,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_held_for_a_restore_or_a_cold_boot_is_handed_back_with_how_long_it_waited() {
+    async fn a_request_held_for_a_wake_is_handed_back_with_how_long_it_waited_and_how_the_app_came_up() {
         for (outcome, attributed) in [
-            (WakeOutcome::Restored, true),
-            (WakeOutcome::ColdBoot, true),
-            (WakeOutcome::AlreadyRunning, false),
+            (WakeOutcome::Restored, Some(WakeKind::Restored)),
+            (WakeOutcome::ColdBoot, Some(WakeKind::Booted)),
+            (WakeOutcome::Thawed, Some(WakeKind::Thawed)),
+            (WakeOutcome::ThawFailed, Some(WakeKind::Booted)),
+            (WakeOutcome::AlreadyRunning, None),
         ] {
             let state = HostState::shared();
             let port = free_port().await;
@@ -442,7 +458,7 @@ mod tests {
 
             let mut headers = get(host_port).await.headers().clone();
             assert_eq!(
-                crate::adapters::proxy::http_log::take_wake_micros(&mut headers).is_some(),
+                crate::adapters::proxy::http_log::take_wake(&mut headers).and_then(|wake| wake.kind),
                 attributed,
                 "{outcome:?}"
             );

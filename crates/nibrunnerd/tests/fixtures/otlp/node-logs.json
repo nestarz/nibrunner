@@ -1,0 +1,78 @@
+{
+ "resourceLogs": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "shop"
+      }
+     }
+    ]
+   },
+   "scopeLogs": [
+    {
+     "scope": {
+      "name": "pino"
+     },
+     "logRecords": [
+      {
+       "timeUnixNano": 1792488112000200000,
+       "severityNumber": "SEVERITY_NUMBER_WARN",
+       "severityText": "warn",
+       "body": {
+        "kvlistValue": {
+         "values": [
+          {
+           "key": "event",
+           "value": {
+            "stringValue": "checkout"
+           }
+          },
+          {
+           "key": "items",
+           "value": {
+            "intValue": "3"
+           }
+          },
+          {
+           "key": "ok",
+           "value": {
+            "boolValue": false
+           }
+          }
+         ]
+        }
+       },
+       "attributes": [
+        {
+         "key": "http.route",
+         "value": {
+          "stringValue": "/checkout"
+         }
+        },
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "u-1"
+         }
+        }
+       ],
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+       "spanId": "00f067aa0ba902b7"
+      },
+      {
+       "timeUnixNano": "0",
+       "observedTimeUnixNano": 1792488112500000000,
+       "severityText": "debug",
+       "body": {
+        "stringValue": "cache warm"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
