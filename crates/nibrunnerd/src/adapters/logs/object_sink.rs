@@ -735,7 +735,13 @@ impl ObjectSink {
         spans: Vec<TraceLine>,
         records: Vec<(i64, LogLine)>,
     ) {
-        let unit = self.lock().unit(app_id, deployment);
+        // A deployment the document no longer names still has its app's labels to file under.
+        let unit = {
+            let state = self.lock();
+            state
+                .unit(app_id, deployment)
+                .or_else(|| state.unit(app_id, None))
+        };
         self.traced(app_id, unit.clone(), spans);
         for (micros, record) in records {
             self.push(app_id, unit.clone(), micros, |labelled| LogLine {
