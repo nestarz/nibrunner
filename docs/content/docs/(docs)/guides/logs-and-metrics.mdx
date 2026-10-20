@@ -99,11 +99,11 @@ The proxy starts a trace for every request it routes. It removes any `traceparen
 the same header:
 
 ```
-traceparent: 00-0659e0c4d1a3f2b7c9d04e1a6b5f8c21-00f067aa0ba902b7-01
+traceparent: 00-01a14499f26ca1b2c3d4e5f60718293a-00f067aa0ba902b7-01
 ```
 
-The trace id's first twelve hex digits are the microsecond the request arrived, shifted right by
-four, so the id says which hour holds it. A caller's own trace is never continued; its id is
+The trace id's first twelve hex digits are the Unix millisecond the request arrived, so the id
+says which hour holds it; the root span's `t` is that same millisecond. A caller's own trace is never continued; its id is
 kept as the root span's `parent_trace`.
 
 Every guest may also export OpenTelemetry traces and logs to the host, over OTLP/HTTP with JSON
