@@ -2230,7 +2230,7 @@ mod tests {
         let fields: Vec<&str> = returned.split('-').collect();
         assert_eq!((fields[0], fields[3]), ("00", "01"));
         assert_ne!(fields[1], "4bf92f3577b34da6a3ce929d0e0e4736");
-        let minted_us = i64::from_str_radix(&fields[1][..12], 16).unwrap() << 4;
+        let minted_us = i64::from_str_radix(&fields[1][..12], 16).unwrap() * 1000;
         assert!((crate::clock::now_us() - minted_us).abs() < 60_000_000);
 
         let record = once_recorded(&directory, 1).await.remove(0);

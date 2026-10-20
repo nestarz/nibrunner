@@ -1001,7 +1001,7 @@ pub(crate) mod tests {
         };
         vec![
             TraceLine::Span(Box::new(labelled(SpanLine {
-                trace: "065fe0a2c3f8a1b2c3d4e5f60718293a".into(),
+                trace: "01a14499f26ca1b2c3d4e5f60718293a".into(),
                 span: "00f067aa0ba902b7".into(),
                 parent: None,
                 kind: SpanKind::Server,
@@ -1023,7 +1023,7 @@ pub(crate) mod tests {
                 ..SpanLine::default()
             }))),
             TraceLine::Span(Box::new(labelled(SpanLine {
-                trace: "065fe0a2c3f8a1b2c3d4e5f60718293a".into(),
+                trace: "01a14499f26ca1b2c3d4e5f60718293a".into(),
                 span: "b0709fad9766112d".into(),
                 parent: Some("00f067aa0ba902b7".into()),
                 kind: SpanKind::Server,
@@ -1057,7 +1057,7 @@ pub(crate) mod tests {
                 rev: "0123456789ab".into(),
                 context: "production".into(),
                 dropped: 44,
-                trace: Some("065fe0a2c3f8a1b2c3d4e5f60718293a".into()),
+                trace: Some("01a14499f26ca1b2c3d4e5f60718293a".into()),
             }),
         ]
     }
@@ -1258,13 +1258,19 @@ pub(crate) mod tests {
             serde_json::json!({
                 "trace": trace.trace.to_string(), "span": trace.span.to_string(), "parent": null,
                 "kind": "server", "name": "POST /checkout",
-                "t": "2026-10-16T12:05:00.000007Z", "end": "2026-10-16T12:05:00.312507Z",
+                "t": "2026-10-16T12:05:00.000000Z", "end": "2026-10-16T12:05:00.312507Z",
                 "host": "ovh-1", "unit": app_id().to_string(), "rev": "r-2", "context": "production",
                 "root": true, "method": "POST", "path": "/checkout", "status": 500,
                 "deployment": deployment_id().to_string(), "wake": "restored", "wake_us": 240_000,
                 "cache": "bypass", "encoding": "gzip", "rx": 1_200, "tx": 3_400,
                 "parent_trace": "4bf92f3577b34da6a3ce929d0e0e4736",
             })
+        );
+        let id_ms = i64::from_str_radix(&root.trace[..12], 16).unwrap();
+        assert_eq!(
+            micros_rfc3339(id_ms * 1000),
+            root.t,
+            "the id and the root's t name one instant"
         );
         let line = serde_json::to_string(&chunk[0]).unwrap();
         assert!(line.starts_with(r#"{"k":"span","trace":""#), "{line}");
