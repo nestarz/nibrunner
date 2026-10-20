@@ -540,6 +540,7 @@ async fn test_host_over(
         commands: commands.clone(),
         firewall: Arc::new(HostFirewall::new(commands.clone())),
         telemetry: None,
+        otlp: crate::adapters::otlp::OtlpReceiver::new(None, 0),
         router: Router::with_state(metrics.clone(), None, None, state.clone()),
         tls: None,
         waker: Arc::new(NeverWoken),

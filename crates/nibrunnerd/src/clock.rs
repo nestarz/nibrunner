@@ -4,6 +4,10 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+pub fn now_us() -> i64 {
+    chrono::Utc::now().timestamp_micros()
+}
+
 pub fn now_timestamp() -> Timestamp {
     Timestamp::from_epoch_ms(now_ms())
 }

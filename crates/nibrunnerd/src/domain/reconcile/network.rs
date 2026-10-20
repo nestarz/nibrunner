@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use nft_render::{FirewallState, ForwardedInstance, ForwardedPort};
+use nft_render::{FirewallState, ForwardedInstance, ForwardedPort, OtlpSender};
 use protocol::InstanceState;
 
 use crate::adapters::proxy::stream_activator::StreamBinding;
@@ -42,9 +42,33 @@ pub async fn forwarded_instances(host: &Host) -> Vec<ForwardedInstance> {
     forwarded
 }
 
+/// Every slot's guest and the tap address it may export to, labelled with the deployment its
+/// record names.
+pub async fn otlp_senders(host: &Host) -> Vec<crate::adapters::otlp::OtlpSender> {
+    let records = host.state.snapshot().await.records;
+    host.slots()
+        .await
+        .into_iter()
+        .map(|slot| crate::adapters::otlp::OtlpSender {
+            deployment_id: records.get(&slot.app_id).map(|r| r.deployment_id.clone()),
+            app_id: slot.app_id,
+            host_ipv4: slot.host_ipv4.addr(),
+            guest_ipv4: slot.guest_ipv4.addr(),
+        })
+        .collect()
+}
+
 pub async fn apply_network(host: &Host) {
     let state = FirewallState {
         instances: forwarded_instances(host).await,
+        otlp_senders: otlp_senders(host)
+            .await
+            .into_iter()
+            .map(|sender| OtlpSender {
+                host_ipv4: sender.host_ipv4.into(),
+                guest_ipv4: sender.guest_ipv4.into(),
+            })
+            .collect(),
         allowed_host_tcp_endpoints: host.config.allowed_host_tcp_endpoints.clone(),
         allowed_egress_endpoints: host.config.allowed_egress_endpoints.clone(),
         denied_egress_addresses_v4: host.config.denied_egress_addresses_v4.clone(),
@@ -93,6 +117,7 @@ pub async fn apply_activators(host: &Arc<Host>) {
         .map(|slot| (slot.app_id, slot.host_port))
         .collect();
     host.activator.serve(&slots).await;
+    host.otlp.serve(otlp_senders(host).await).await;
 
     // Every raw port is bound both ways: a port carries whatever arrives on it, and which of the
     // two a sleeping guest is woken by is not the host's to guess.

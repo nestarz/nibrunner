@@ -65,11 +65,15 @@ path excludes its query string; headers and request
 bodies are not kept. `at` is when the proxy had the response headers;
 `durationMicros` measures the wait for those headers, including a cold wake, rather than the
 transfer of the response body.
-A request the proxy held while its app was restored from a snapshot or booted also has
-`wakeMicros`, the part of `durationMicros` it waited for that. The field is absent for every other
-request, one held only while the host was already booting a `running` app included.
+A request the proxy held while its app was thawed, restored from a snapshot or booted also has
+`wakeMicros`, the part of `durationMicros` it waited for that, and `wake`: `thawed`, `restored` or
+`booted`. Both are absent for every other request, one held only while the host was already
+booting a `running` app included.
 On a host with [`[proxy.http.cache]` or `[proxy.http.encode]`](/docs/guides/response-cache), a
-line also has `cache` and `encoding`.
+line also has `cache` and `encoding`. Every line also has `traceId`, the trace the proxy started
+for the request (see [Traces](#traces)), and `requestBytes` and `responseBytes`, the body bytes
+read from and sent to the visitor. A line is written once the response has been sent or the
+visitor has gone.
 The proxy keeps at most 1 MiB in this file and 1 MiB in `.http.jsonl.1` for each app. When
 proxy traffic outruns the bounded writer queue, it drops HTTP request records and warns in the daemon
 journal. An app's HTTP request logs go when `desired.json` stops naming it.
@@ -87,6 +91,46 @@ Two libraries the daemon uses are held below that: `backhand`, which narrates ev
 layer it packs, and `rustls`, which warns about clients that put an IP address where a hostname
 belongs. Errors from both still reach the journal, and naming either in `NIBRUNNER_LOG` —
 `backhand=info` — brings the rest back.
+
+## Traces
+
+The proxy starts a trace for every request it routes. It removes any `traceparent` and
+`tracestate` the caller sent, hands the app a new W3C `traceparent`, and answers the caller with
+the same header:
+
+```
+traceparent: 00-0659e0c4d1a3f2b7c9d04e1a6b5f8c21-00f067aa0ba902b7-01
+```
+
+The trace id's first twelve hex digits are the microsecond the request arrived, shifted right by
+four, so the id says which hour holds it. A caller's own trace is never continued; its id is
+kept as the root span's `parent_trace`.
+
+Every guest may also export OpenTelemetry traces and logs to the host, over OTLP/HTTP with JSON
+bodies, at its own tap's address on port 4318. The host adds
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://<that address>:4318` to an app's environment unless the app
+sets it. The firewall opens that one address and port to the guest and nothing else of the host.
+
+| Request | Answer |
+|---|---|
+| `POST /v1/traces`, `POST /v1/logs`, `content-type: application/json`, plain or gzipped | `200 {}` |
+| `POST /v1/metrics` | `204`, discarded: the proxy's own counters are the metrics |
+| protobuf, or any other content type | `415`: set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` |
+| a body over 4 MiB, compressed or not | `413` |
+| from an address that is no guest's, or to another tap's address | `403` |
+
+Spans and records are filed under the app whose tap the export came over, whatever the export
+says it is. For Deno, `OTEL_DENO=true`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` and
+`OTEL_DENO_CONSOLE=replace` are enough: every request's server span, its `fetch` spans and its
+`console` lines arrive attributed to the trace the proxy started.
+
+<Callout title="Bounds">
+  A span keeps at most 32 attributes whose keys start with `http.`, `url.`, `db.`, `rpc.`,
+  `exception.` or `server.`, strings cut to 1 KiB; captured request and response headers are never
+  kept. A trace keeps its first 256 spans from guests. What is cut is counted in a `gap` line that
+  names the trace. A span whose trace id the proxy did not start in the last hour is kept and
+  marked `foreign`.
+</Callout>
 
 ## Metrics
 
@@ -136,12 +180,18 @@ a warning once when usage reaches 80%, and once more when it drops back below.
 
 ## Ship logs and metrics to a bucket
 
-A host can also send each app's output, its requests and an hourly rollup of its counters to an
+A host can also send each app's output, its traces and an hourly rollup of its counters to an
 object store, in the objects a control plane reads. Only an instance whose `desired.json` entry carries `labels.app` is shipped; its
 `labels.rev` and `labels.context` and its `appId` (as `unit`) go on every line and counter, and a
-cron run's output carries its `job` and `run` ids. A request line carries `wake_us` when it waited
-for a wake, and `cache` and `encoding` on a host with
-[`[proxy.http.cache]` or `[proxy.http.encode]`](/docs/guides/response-cache).
+cron run's output carries its `job` and `run` ids. A log record a guest exported is a line of `k`
+`otel`, with its `severity`, and its `trace` and `span` when the runtime gave them.
+
+Each request is a root span under `traces/`: `trace`, `span`, `parent: null`, `kind: "server"`,
+`name`, `t` and `end`, `method`, `path`, the HTTP `status`, `deployment`, `rx` and `tx`, `wake`
+and `wake_us` when it waited for a wake, `cache` and `encoding` on a host with
+[`[proxy.http.cache]` or `[proxy.http.encode]`](/docs/guides/response-cache), and `parent_trace`
+when the caller sent a `traceparent`. A guest's spans follow with their `parent`, `kind`, `name`,
+`status` (`unset`, `ok` or `error`) and `status_msg`, and their allow-listed `attrs`.
 
 ```toml
 [logs]
@@ -159,14 +209,15 @@ sink = "s3://my-bucket/fleets/my-fleet"
 |---|---|
 | `logs/<app>/live-<hostId>.jsonl.gz` | every 5 s that the app printed: its last 2 minutes, at most 256 KiB |
 | `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | every 5 minutes that it printed, and when `desired.json` stops naming it; named after its first line, never overwritten |
+| `traces/<app>/live-<hostId>.jsonl.gz`, `traces/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | the same, for its spans |
 | `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, cache outcomes and bytes compressed, per unit: the hour's or day's total, and beside it a slot for each minute of the hour (`minutes`) or hour of the day (`hours`) that counted something |
 
-Log objects are gzipped JSON lines sealed with XChaCha20-Poly1305 under the 32 raw bytes in
+Log and trace objects are gzipped JSON lines sealed with XChaCha20-Poly1305 under the 32 raw bytes in
 `seal_key_file`, authenticated with `<fleet>/<key>`. A sink URL ends in `fleets/<fleet>`. A
 quiet host writes nothing.
 
 <Callout title="Bounded memory">
-  An app's unsent lines are capped at 4 MiB. A chunk that fills early is written at the next
+  An app's unsent lines are capped at 4 MiB, its spans at another 4 MiB. A chunk that fills early is written at the next
   5-second tick; past that, lines are counted and the chunk ends with one
   `{"k":"gap","dropped":N}` line.
 </Callout>
