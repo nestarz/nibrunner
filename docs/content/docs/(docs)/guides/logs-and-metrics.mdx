@@ -107,9 +107,19 @@ says which hour holds it; the root span's `t` is that same millisecond. A caller
 kept as the root span's `parent_trace`.
 
 Every guest may also export OpenTelemetry traces and logs to the host, over OTLP/HTTP with JSON
-bodies, at its own tap's address on port 4318. The host adds
-`OTEL_EXPORTER_OTLP_ENDPOINT=http://<that address>:4318` to an app's environment unless the app
-sets it. The firewall opens that one address and port to the guest and nothing else of the host.
+bodies, at its own tap's address on port 4318. The firewall opens that one address and port to
+the guest and nothing else of the host. Every app is launched with four standard variables that
+point an OpenTelemetry exporter there, beneath its images' and its own environment, so an app
+that sets one keeps its value:
+
+| Variable | Value |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://<the tap's host address>:4318` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` |
+| `OTEL_BSP_SCHEDULE_DELAY` | `1000`: spans are sent within a second |
+| `OTEL_BLRP_SCHEDULE_DELAY` | `1000`: log records likewise |
+
+They only say where to send. The app switches its own exporter on.
 
 | Request | Answer |
 |---|---|
@@ -120,9 +130,9 @@ sets it. The firewall opens that one address and port to the guest and nothing e
 | from an address that is no guest's, or to another tap's address | `403` |
 
 Spans and records are filed under the app whose tap the export came over, whatever the export
-says it is. For Deno, `OTEL_DENO=true`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` and
-`OTEL_DENO_CONSOLE=replace` are enough: every request's server span, its `fetch` spans and its
-`console` lines arrive attributed to the trace the proxy started.
+says it is. For Deno, `OTEL_DENO=true` and `OTEL_DENO_CONSOLE=replace` in the app's environment
+are enough (Deno 2.9.7 refuses `OTEL_DENO=1`): every request's server span, its `fetch` spans and
+its `console` lines arrive attributed to the trace the proxy started.
 
 <Callout title="Bounds">
   A span keeps at most 32 attributes whose keys start with `http.`, `url.`, `db.`, `rpc.`,

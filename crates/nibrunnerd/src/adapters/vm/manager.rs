@@ -191,9 +191,11 @@ impl VmManager {
             program: &request.desired.config.command.program,
             working_directory: &request.desired.config.command.working_directory,
             args: &request.desired.config.command.args,
-            environment: &crate::adapters::otlp::with_endpoint(
+            environment: &guest_contract::instance_env::launch_environment(
+                &request.desired.config.command.working_directory,
+                &crate::adapters::otlp::exporter_defaults(&slot.host_ipv4),
+                &request.payload.image_environments,
                 &request.desired.config.command.environment,
-                &slot.host_ipv4,
             ),
             restart_policy: &request.desired.config.restart_policy,
         })
@@ -1593,6 +1595,7 @@ mod tests {
             },
             payload: crate::ports::PreparedPayload {
                 layer_image_paths: vec![PathBuf::from("/cache/abc/executable-0123456789abcdef.squashfs")],
+                image_environments: vec![],
                 fetched_bytes: 0,
             },
         }
@@ -2506,6 +2509,35 @@ mod tests {
         let written = config_drive(&fixture.manager.vm_dir.join(app_id().as_str()));
         assert!(written.contains("MODE"), "{written}");
         assert_eq!(fixture.manager.logs.attached().await, vec![app_id()]);
+    }
+
+    #[tokio::test]
+    async fn a_guest_is_launched_with_its_images_env_and_the_receivers_four_beneath_its_documents() {
+        let fixture = fixture();
+        let mut request = boot_request(desired_instance(|instance| {
+            instance.config.command.environment =
+                tenant_environment(&[("MODE", "production"), ("OTEL_BSP_SCHEDULE_DELAY", "250")])
+        }));
+        request.payload.image_environments = vec![vec![
+            "PATH=/usr/local/go/bin:/usr/bin:/bin".into(),
+            "MODE=image".into(),
+        ]];
+        fixture.manager.stage(&request).await.unwrap();
+        let written = config_drive(&fixture.manager.vm_dir.join(app_id().as_str()));
+        for line in [
+            "ENV_PATH=/usr/local/go/bin:/usr/bin:/bin\n".to_string(),
+            format!("ENV_HOME={}\n", request.desired.config.command.working_directory),
+            "ENV_MODE=production\n".to_string(),
+            format!(
+                "ENV_OTEL_EXPORTER_OTLP_ENDPOINT=http://{}:4318\n",
+                request.slot.host_ipv4
+            ),
+            "ENV_OTEL_EXPORTER_OTLP_PROTOCOL=http/json\n".to_string(),
+            "ENV_OTEL_BSP_SCHEDULE_DELAY=250\n".to_string(),
+            "ENV_OTEL_BLRP_SCHEDULE_DELAY=1000\n".to_string(),
+        ] {
+            assert!(written.contains(&line), "{line} in {written}");
+        }
     }
 
     fn image(directory: &Path, kernel: &[u8], rootfs: &[u8]) -> String {

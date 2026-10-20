@@ -357,6 +357,7 @@ impl Filesystem {
             tar: archive.into_inner()?,
             data_bytes,
             entries: self.nodes.len() as u64,
+            env: Vec::new(),
         })
     }
 }
