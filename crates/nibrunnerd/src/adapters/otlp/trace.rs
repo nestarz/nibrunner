@@ -1,6 +1,6 @@
 //! The ids the proxy gives every request it routes, and the book of which ones it gave.
 //!
-//! A trace id is `hex(t_us >> 4)` in twelve digits followed by eighty random bits: a W3C trace id
+//! A trace id is the Unix millisecond in twelve hex digits followed by eighty random bits: a W3C trace id
 //! that also says the hour it began in, which is how a control plane finds a trace's chunks
 //! without an index (its wire contract with this host).
 use std::collections::{HashMap, VecDeque};
@@ -36,14 +36,14 @@ fn random_bits() -> u128 {
 
 impl TraceId {
     pub(crate) fn minted_at(t_us: i64) -> Self {
-        let time = (u128::try_from(t_us).unwrap_or(0) >> 4) & ((1 << 48) - 1);
+        let time = (u128::try_from(t_us.div_euclid(1000)).unwrap_or(0)) & ((1 << 48) - 1);
         let random = random_bits() & ((1 << 80) - 1);
         Self((time << 80) | random | u128::from(time == 0 && random == 0))
     }
 
-    /// When a minted id says its trace began, to the 16 µs.
+    /// When a minted id says its trace began, to the millisecond.
     pub(crate) fn started_us(self) -> i64 {
-        i64::try_from((self.0 >> 80) << 4).unwrap_or(i64::MAX)
+        i64::try_from((self.0 >> 80) * 1000).unwrap_or(i64::MAX)
     }
 
     pub(crate) fn parse(hex: &str) -> Option<Self> {
@@ -95,7 +95,8 @@ pub(crate) struct RequestTrace {
 
 impl RequestTrace {
     /// A new trace for the request whose headers these are: the caller's `traceparent` and
-    /// `tracestate` taken off, ours put on for the guest.
+    /// `tracestate` taken off, ours put on for the guest. It starts at the millisecond its id
+    /// says, so a reader of the id and of the root span's `t` reads one instant.
     pub(crate) fn begin(headers: &mut HeaderMap, book: &TraceBook, started_us: i64) -> Self {
         let parent_trace = headers
             .get_all(TRACEPARENT)
@@ -103,11 +104,12 @@ impl RequestTrace {
             .find_map(|value| traceparent_trace(value.to_str().ok()?));
         headers.remove(TRACEPARENT);
         headers.remove(TRACESTATE);
+        let trace = book.mint(started_us);
         let trace = Self {
-            trace: book.mint(started_us),
+            trace,
             span: SpanId::random(),
             parent_trace,
-            started_us,
+            started_us: trace.started_us(),
         };
         trace.answer(headers);
         trace
@@ -233,19 +235,19 @@ mod tests {
     const NOW_US: i64 = 1_792_152_300_123_456; // 2026-10-16T12:05:00.123456Z
 
     #[test]
-    fn a_minted_id_is_32_hex_whose_first_twelve_say_when_it_began_to_sixteen_microseconds() {
+    fn a_minted_id_is_32_hex_whose_first_twelve_are_the_unix_millisecond_it_began() {
         let id = TraceId::minted_at(NOW_US);
         let hex = id.to_string();
         assert_eq!(hex.len(), 32);
         assert!(hex
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-        assert_eq!(&hex[..12], &format!("{:012x}", NOW_US >> 4));
-        let recovered = i64::from_str_radix(&hex[..12], 16).unwrap() << 4;
-        assert_eq!(recovered, id.started_us());
-        assert!(NOW_US - recovered < 16);
+        assert_eq!(&hex[..12], &format!("{:012x}", NOW_US / 1000));
+        let recovered_ms = i64::from_str_radix(&hex[..12], 16).unwrap();
+        assert_eq!(recovered_ms, 1_792_152_300_123);
+        assert_eq!(recovered_ms * 1000, id.started_us());
         assert_eq!(
-            crate::domain::metrics::rollup::hour_key(recovered / 1_000_000),
+            crate::domain::metrics::rollup::hour_key(recovered_ms / 1000),
             "2026101612"
         );
         assert_eq!(TraceId::parse(&hex), Some(id));
@@ -282,6 +284,12 @@ mod tests {
             HeaderValue::from_static("vendor=secret"),
         );
         let trace = RequestTrace::begin(&mut headers, &book, NOW_US);
+        assert_eq!(
+            trace.started_us,
+            i64::from_str_radix(&trace.trace.to_string()[..12], 16).unwrap() * 1000,
+            "the trace starts at the millisecond its id names"
+        );
+        assert_eq!(trace.started_us, 1_792_152_300_123_000);
         assert_eq!(
             trace.parent_trace.map(|t| t.to_string()).as_deref(),
             Some("4bf92f3577b34da6a3ce929d0e0e4736")
@@ -340,7 +348,7 @@ mod tests {
         );
         let stranger = TraceId::parse("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
         assert!(book.admit(stranger, NOW_US).foreign);
-        assert!(book.admit(minted, NOW_US + MINTED_FOR_US + 16).foreign);
+        assert!(book.admit(minted, NOW_US + MINTED_FOR_US + 1000).foreign);
     }
 
     #[test]
