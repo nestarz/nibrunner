@@ -160,6 +160,7 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
     for action in &plan.instances {
         match action {
             InstancePlan::Stop { app_id, reason } => {
+                let _transition = host.state.transition(app_id).await;
                 instances::stop_instance(host, app_id, reason.as_str()).await;
             }
             InstancePlan::Replace { desired } | InstancePlan::FallBack { desired, .. } => {
