@@ -84,9 +84,14 @@ deployment first:
 The instance's `cutover` says the same as a value: `{ "kind": "fallback", "reason": "volume" }`
 (or `no-room`, `no-staging-name`), or `{ "kind": "abandoned", "deploymentId": "..." }`.
 
+The same holds for an `on-request` instance that is asleep: the new deployment boots beside its
+snapshot, a request meanwhile wakes the old deployment, and at the cut-over the old snapshot is
+deleted. If the new one is abandoned, the old one stays asleep and is woken on request as before.
+A deployment with `firstBoot: "lazy"` is not booted ahead: its first request boots it.
+
 An abandoned deployment is not tried again until the document names another `deploymentId`. While
-both run, the host needs the memory of both. The app's `hostPort` changes at the cut-over, since
-the new deployment runs on a slot of its own.
+both run, the host needs the memory of both; one asleep holds none. The app's `hostPort` changes
+at the cut-over, since the new deployment runs on a slot of its own.
 
 <Callout title="Why not with a volume">
   Two guests cannot mount one disk, so an instance with a volume is always stopped before its new

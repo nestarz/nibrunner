@@ -318,6 +318,34 @@ mod tests {
             .await;
     }
 
+    /// The app scaled to zero: its record kept, asleep, with no microVM running behind it.
+    async fn asleep(host: &TestHost) {
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.volume_id = None;
+                record.state = InstanceState::Idle;
+                record.on_request = true;
+            }))
+            .await;
+    }
+
+    fn on_request(deployment: DeploymentId) -> DesiredInstance {
+        desired_instance(|instance| {
+            *instance = wanted();
+            instance.deployment_id = deployment;
+            instance.desired_state = DesiredInstanceState::OnRequest;
+            instance.activation = Some(protocol::ActivationPolicy {
+                snapshot_ttl_ms: None,
+                first_boot: protocol::FirstBoot::Eager,
+                sleep_when: protocol::SleepPolicy::TrafficIdle {
+                    timeout_ms: protocol::IdleTimeoutMs::try_from(300_000).unwrap(),
+                },
+                cutover_timeout_ms: Some(protocol::CutoverTimeoutMs::try_from(600_000).unwrap()),
+            });
+        })
+    }
+
     async fn booted_beside(host: &TestHost, state: InstanceState) -> u16 {
         let slot = host.slot_for(&staging()).await.unwrap();
         host.state
@@ -480,6 +508,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_promote_over_a_snapshotted_owner_drops_its_snapshot() {
+        let host = test_host().await;
+        asleep(&host).await;
+        let staged_port = booted_beside(&host, InstanceState::Running).await;
+
+        apply_cutovers(
+            host.arc(),
+            &plan_of(InstancePlan::Promote {
+                desired: on_request(new_deployment()),
+            }),
+        )
+        .await;
+
+        // The exchange hands the staging id the old deployment's snapshot, which the stop and the
+        // discard of that id then delete; the app keeps the microVM booted beside it.
+        assert_eq!(
+            host.vms.calls(),
+            vec![VmCall::Exchange, VmCall::Stop, VmCall::Discard, VmCall::DeleteTap]
+        );
+        let owner = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(
+            (owner.deployment_id.clone(), owner.state),
+            (new_deployment(), InstanceState::Running)
+        );
+        assert_eq!(owner.host_port.unwrap().get(), staged_port);
+        assert!(owner.on_request);
+        assert!(host.state.record(&staging()).await.is_none());
+        assert!(host.slot_of(&staging()).await.is_none());
+        let routes = renderable_routes(&host.state.records().await);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].host_port.get(), staged_port);
+    }
+
+    #[tokio::test]
+    async fn a_request_while_an_idle_owner_is_cut_over_wakes_the_old_deployment() {
+        let host = test_host().await;
+        host.state.modify(|snapshot| snapshot.isolated = true).await;
+        asleep(&host).await;
+        let next = on_request(new_deployment());
+        apply_cutovers(
+            host.arc(),
+            &plan_of(InstancePlan::Stage {
+                desired: next.clone(),
+                timeout_ms: 600_000,
+            }),
+        )
+        .await;
+
+        let woken = super::super::instances::resume_instance(&host, &next).await;
+
+        assert_eq!(woken, Ok(crate::ports::WakeOutcome::Restored));
+        assert_eq!(host.vms.woken(), vec![deployment_id()]);
+        assert_eq!(host.vms.calls(), vec![VmCall::Boot, VmCall::Wake]);
+        let owner = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(
+            (owner.deployment_id, owner.state),
+            (deployment_id(), InstanceState::Starting)
+        );
+        assert_eq!(
+            host.state.record(&staging()).await.unwrap().deployment_id,
+            new_deployment()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_owner_with_nothing_to_wake_from_is_not_booted_as_the_new_deployment_mid_cutover() {
+        let host = test_host().await;
+        host.state.modify(|snapshot| snapshot.isolated = true).await;
+        asleep(&host).await;
+        let next = on_request(new_deployment());
+        apply_cutovers(
+            host.arc(),
+            &plan_of(InstancePlan::Stage {
+                desired: next.clone(),
+                timeout_ms: 600_000,
+            }),
+        )
+        .await;
+        host.vms.refuse_wake(crate::ports::VmError::SnapshotUnusable {
+            reason: "no snapshot".into(),
+        });
+
+        let refused = super::super::instances::resume_instance(&host, &next).await;
+
+        assert!(
+            matches!(&refused, Err(crate::ports::WakeRefusal::Failed { reason, .. })
+                if reason.contains("has not taken the app over")),
+            "{refused:?}"
+        );
+        assert_eq!(host.vms.calls(), vec![VmCall::Boot, VmCall::Wake]);
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().deployment_id,
+            deployment_id()
+        );
+    }
+
+    #[tokio::test]
     async fn a_replacement_that_could_not_be_a_cut_over_says_why() {
         let host = test_host().await;
         serving(&host).await;
@@ -572,5 +697,80 @@ mod tests {
             VmCall::Discard,
             VmCall::DeleteTap
         ]));
+    }
+
+    fn on_request_document(deployment: DeploymentId) -> protocol::HostDesiredState {
+        desired_state(|state| state.instances = vec![on_request(deployment)])
+    }
+
+    #[tokio::test]
+    async fn an_idle_owner_is_cut_over_to_and_kept_on_abandon() {
+        use crate::domain::metrics::passes::Trigger;
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let hostname = app_hostname().hostname;
+        super::super::reconcile(host.arc(), &on_request_document(deployment_id()), Trigger::Change).await;
+        host.state
+            .update_record(&app_id(), |record| record.state = InstanceState::Idle)
+            .await;
+        let old_port = host.router.routes().await.port_for(hostname.as_str()).unwrap();
+
+        super::super::reconcile(
+            host.arc(),
+            &on_request_document(new_deployment()),
+            Trigger::Change,
+        )
+        .await;
+
+        assert!(host.vms.calls().ends_with(&[VmCall::Boot, VmCall::Boot]));
+        let owner = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(
+            (owner.deployment_id, owner.state),
+            (deployment_id(), InstanceState::Idle)
+        );
+        assert_eq!(
+            host.state.record(&staging()).await.unwrap().staging_for,
+            Some(app_id())
+        );
+        assert_eq!(
+            host.router.routes().await.port_for(hostname.as_str()),
+            Some(old_port)
+        );
+
+        host.state
+            .update_record(&staging(), |record| record.state = InstanceState::Failed)
+            .await;
+        super::super::reconcile(host.arc(), &on_request_document(new_deployment()), Trigger::Tick).await;
+
+        assert!(host.state.record(&staging()).await.is_none());
+        let owner = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(
+            (owner.deployment_id.clone(), owner.state),
+            (deployment_id(), InstanceState::Idle)
+        );
+        assert_eq!(
+            to_reported_instance(&owner, None).cutover,
+            Some(protocol::CutoverOutcome::Abandoned {
+                deployment_id: new_deployment()
+            })
+        );
+        assert_eq!(
+            host.router.routes().await.port_for(hostname.as_str()),
+            Some(old_port)
+        );
+        assert!(!host.vms.calls().contains(&VmCall::Exchange));
+
+        let boots = |calls: Vec<VmCall>| calls.iter().filter(|call| **call == VmCall::Boot).count();
+        let booted = boots(host.vms.calls());
+        super::super::reconcile(host.arc(), &on_request_document(new_deployment()), Trigger::Tick).await;
+        assert_eq!(
+            boots(host.vms.calls()),
+            booted,
+            "an abandoned deployment is not tried again"
+        );
+        assert_eq!(
+            host.state.record(&app_id()).await.unwrap().deployment_id,
+            deployment_id()
+        );
     }
 }

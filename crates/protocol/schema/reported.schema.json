@@ -173,7 +173,7 @@
           ]
         },
         {
-          "description": "`deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the\ndeployment reported keeps serving, and the named one is not tried again.",
+          "description": "`deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the\ndeployment reported keeps serving, or stays asleep to be woken on request, and the named\none is not tried again.",
           "type": "object",
           "properties": {
             "deploymentId": {

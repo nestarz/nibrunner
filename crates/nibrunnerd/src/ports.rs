@@ -246,8 +246,9 @@ pub trait Vmm: Send + Sync {
     async fn expire_snapshot(&self, _app_id: &AppId, _kept_for: std::time::Duration) -> bool {
         false
     }
-    /// Hands each of two running microVMs the other's app id, so that the app one answered to
-    /// is answered by the other from now on.
+    /// Hands each of two apps the other's microVM, so that the app one answered to is answered
+    /// by the other from now on. Either may have none running: an app asleep hands over its
+    /// snapshot, and one never booted nothing at all.
     async fn exchange(&self, first: &AppId, second: &AppId) -> Result<(), VmError>;
 }
 

@@ -24,6 +24,7 @@ use crate::domain::metrics::converge;
 use crate::domain::metrics::passes::Trigger;
 use crate::domain::metrics::resources::StartRefusal;
 
+use crate::domain::report::InstanceRecord;
 use crate::host::Host;
 
 pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
@@ -46,6 +47,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                     present: status.loaded || record.is_some(),
                     expired: record.is_some_and(|record| record.expired_at_ms.is_some()),
                     running: status.active,
+                    asleep: !status.active && record.is_some_and(InstanceRecord::is_idle),
                     exited: !status.active
                         && status.started_this_boot
                         && record.is_some_and(|record| record.started_at.is_some() && !record.stop_requested),

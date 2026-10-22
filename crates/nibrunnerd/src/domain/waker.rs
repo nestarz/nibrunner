@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 
 use crate::domain::health::is_within_grace_period;
 use crate::domain::health::probe::probe_instance;
+use crate::domain::reconcile::instances::kept_through_cutover;
 use crate::host::Host;
 use crate::ports::{WakeFailure, WakeOutcome, WakeRefusal, Waker};
 
@@ -105,7 +106,11 @@ impl AppWaker {
                 reason: "the isolation ruleset is not applied".into(),
             });
         }
-        if wanted.desired_state == DesiredInstanceState::Running {
+        // A deployment asleep that a cut-over is replacing is woken whatever the document now says
+        // of the app: the pass boots the document's beside it, never in its place.
+        if wanted.desired_state == DesiredInstanceState::Running
+            && kept_through_cutover(&self.host, &wanted).await.is_none()
+        {
             return self.hold(app_id, &wanted).await;
         }
         // The lock a sleep of this app holds while it is writing the guest out. A request that
@@ -133,8 +138,10 @@ impl AppWaker {
         let frozen_on_its_way_out = self.host.state.record(app_id).await.is_some_and(|record| {
             record.state == InstanceState::Frozen && record.deployment_id != wanted.deployment_id
         });
+        let on_its_way_out =
+            frozen_on_its_way_out || kept_through_cutover(&self.host, &wanted).await.is_some();
         let outcome = match crate::domain::reconcile::instances::resume_instance(&self.host, &wanted).await {
-            Err(_) if frozen_on_its_way_out => {
+            Err(_) if on_its_way_out => {
                 drop(reservation);
                 drop(transition);
                 return self.await_replacement(app_id, &wanted).await;
@@ -278,10 +285,10 @@ impl AppWaker {
         }
     }
 
-    /// A frozen guest of the deployment being replaced that would not resume is the pass's to take
-    /// down: it is bringing the deployment the document names up in its place, beside it or after
-    /// it. The request waits for that one, the transition let go so the pass can take it over, as
-    /// long as a boot of it is given to answer.
+    /// A guest of the deployment being replaced that would not resume, frozen or asleep, is the
+    /// pass's to take down: it is bringing the deployment the document names up in its place,
+    /// beside it or after it. The request waits for that one, the transition let go so the pass
+    /// can take it over, as long as a boot of it is given to answer.
     async fn await_replacement(&self, app_id: &AppId, wanted: &DesiredInstance) -> Outcome {
         let arrived = Instant::now();
         let grace = Duration::from_millis(wanted.config.health_check.probe().grace_period_ms);
@@ -300,8 +307,9 @@ impl AppWaker {
             if arrived.elapsed() >= grace {
                 return Err(WakeRefusal::Failed {
                     kind: WakeFailure::WouldNotStart,
-                    reason: "its frozen guest would not thaw, and the deployment replacing it did not come up in time"
-                        .into(),
+                    reason:
+                        "its guest would not resume, and the deployment replacing it did not come up in time"
+                            .into(),
                 });
             }
             tokio::time::sleep(PROBE_INTERVAL).await;

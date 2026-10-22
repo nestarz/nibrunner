@@ -1997,6 +1997,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_app_asleep_trades_its_snapshot_for_the_microvm_booted_beside_it_and_its_retirement_deletes_it(
+    ) {
+        let fixture = fixture();
+        let staging = AppId::parse("app-1--next").unwrap();
+        let asleep = snapshot_paths(&fixture.manager.snapshot_dir, &app_id());
+        std::fs::create_dir_all(&asleep.directory).unwrap();
+        std::fs::write(&asleep.memory_path, b"memory").unwrap();
+        std::fs::write(&asleep.stamp_path, b"{}").unwrap();
+        running_under(&fixture, &staging);
+
+        fixture.manager.exchange(&app_id(), &staging).await.unwrap();
+        assert!(fixture.manager.holds_snapshot(&staging));
+        assert!(!fixture.manager.holds_snapshot(&app_id()));
+
+        fixture.manager.stop(&staging).await.unwrap();
+        fixture.manager.discard(&staging).await.unwrap();
+        assert!(!asleep.directory.exists());
+        assert!(!asleep.stamp_path.exists());
+        assert_eq!(fixture.manager.key(&app_id()), staging);
+    }
+
+    #[tokio::test]
     async fn a_deployment_booted_beside_the_serving_one_is_listened_for_under_its_own_id() {
         let fixture = fixture();
         let staging = AppId::parse("app-1--next").unwrap();

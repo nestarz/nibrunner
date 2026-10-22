@@ -635,11 +635,12 @@ pub struct ActivationPolicy {
     /// Whether the host boots the instance once it is declared, or leaves it to its first request.
     #[serde(default, skip_serializing_if = "FirstBoot::is_eager")]
     pub first_boot: FirstBoot,
-    /// How long a new `deploymentId` is given to become healthy beside the deployment still
-    /// serving, before its hostnames are moved over to it and the old one is stopped. A new
-    /// deployment that is not healthy by then is stopped and the old one keeps serving. Absent,
-    /// the old deployment is stopped before the new one starts. An instance with a volume is
-    /// always replaced that way, since two guests cannot write one disk.
+    /// How long a new `deploymentId` is given to become healthy beside the deployment it
+    /// replaces, running or asleep, before its hostnames are moved over to it and the old one is
+    /// stopped (and its snapshot deleted). A new deployment that is not healthy by then is stopped
+    /// and the old one keeps its hostnames, serving or woken on request. Absent, the old
+    /// deployment is stopped before the new one starts. An instance with a volume is always
+    /// replaced that way, since two guests cannot write one disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cutover_timeout_ms: Option<CutoverTimeoutMs>,
 }

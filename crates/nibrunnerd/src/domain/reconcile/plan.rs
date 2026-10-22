@@ -12,6 +12,9 @@ pub struct ObservedInstance {
     pub deployment_id: Option<DeploymentId>,
     pub present: bool,
     pub running: bool,
+    /// Whether the record is asleep with no microVM behind it: scaled to zero, or declared and
+    /// never booted. A request wakes it, so it is as much the app as one running.
+    pub asleep: bool,
     pub exited: bool,
     /// Whether the record is down from a start this host refused before spending an attempt on
     /// it: its volume could not be made ready, its document asked for what this host cannot
@@ -243,16 +246,19 @@ pub fn plan_reconcile(desired: &HostDesiredState, observed: &ObservedState) -> R
     }
 }
 
-/// What a new deployment of an app that is up comes to: a plain replacement unless the document
-/// asked for it to be booted beside the old one first, and then wherever that cut-over has got.
+/// What a new deployment of an app that is up or asleep comes to: a plain replacement unless the
+/// document asked for it to be booted beside the old one first, and then wherever that cut-over
+/// has got.
 fn replacement(wanted: &DesiredInstance, current: &ObservedInstance, room: CutoverRoom) -> InstancePlan {
     let Some(timeout) = wanted.activation().cutover_timeout_ms else {
         return InstancePlan::Replace {
             desired: wanted.clone(),
         };
     };
-    // Nothing is being served to keep up while the new one comes up.
-    if !current.running {
+    // Nothing is being served, nor would be woken by a request, to keep while the new one comes
+    // up. One asleep keeps its hostnames: stopping it first would leave nothing to answer them
+    // should the new one not come up.
+    if !current.running && !current.asleep {
         return InstancePlan::Replace {
             desired: wanted.clone(),
         };
@@ -1474,6 +1480,92 @@ mod tests {
                 InstancePlan::FallBack {
                     desired: wanted(),
                     reason: CutoverFallback::NoStagingName
+                }
+            );
+        }
+
+        fn asleep(cutover: Option<ObservedCutover>) -> ObservedInstance {
+            observed_instance(|instance| {
+                instance.volume_id = None;
+                instance.running = false;
+                instance.asleep = true;
+                instance.cutover = cutover;
+            })
+        }
+
+        fn on_request(first_boot: protocol::FirstBoot) -> DesiredInstance {
+            desired_instance(|instance| {
+                *instance = wanted();
+                instance.desired_state = DesiredInstanceState::OnRequest;
+                instance.activation = Some(protocol::ActivationPolicy {
+                    first_boot,
+                    ..wanted().activation.unwrap()
+                });
+            })
+        }
+
+        #[test]
+        fn boots_the_new_deployment_beside_one_asleep_and_goes_on_as_beside_one_serving() {
+            for wanted in [wanted(), on_request(protocol::FirstBoot::Eager)] {
+                assert_eq!(
+                    planned(wanted.clone(), asleep(None), 0),
+                    InstancePlan::Stage {
+                        desired: wanted.clone(),
+                        timeout_ms: 600_000
+                    }
+                );
+                assert_eq!(
+                    planned(
+                        wanted.clone(),
+                        asleep(under_way(Some(StagingProgress::Healthy))),
+                        0
+                    ),
+                    InstancePlan::Promote {
+                        desired: wanted.clone()
+                    }
+                );
+                assert_eq!(
+                    planned(
+                        wanted.clone(),
+                        asleep(under_way(Some(StagingProgress::Failed))),
+                        0
+                    ),
+                    InstancePlan::Abandon {
+                        desired: wanted.clone()
+                    }
+                );
+                let given_up = Some(ObservedCutover {
+                    abandoned: true,
+                    ..under_way(Some(StagingProgress::Failed)).unwrap()
+                });
+                assert_eq!(
+                    planned(wanted, asleep(given_up), DEADLINE_MS * 2),
+                    InstancePlan::None { app_id: app_id() }
+                );
+            }
+        }
+
+        #[test]
+        fn leaves_a_deployment_that_boots_on_its_first_request_to_that_request() {
+            let lazy = on_request(protocol::FirstBoot::Lazy);
+            assert_eq!(
+                planned(lazy.clone(), asleep(None), 0),
+                InstancePlan::Declare { desired: lazy }
+            );
+        }
+
+        #[test]
+        fn stops_first_beside_one_asleep_when_the_instance_writes_to_a_volume() {
+            let with_volume = desired_instance(|instance| {
+                *instance = on_request(protocol::FirstBoot::Eager);
+                instance.scratch = None;
+                instance.volume_id = Some(volume_id());
+            });
+            assert_eq!(
+                planned(with_volume.clone(), asleep(None), 0),
+                InstancePlan::FallBack {
+                    desired: with_volume,
+                    reason: CutoverFallback::Volume
                 }
             );
         }

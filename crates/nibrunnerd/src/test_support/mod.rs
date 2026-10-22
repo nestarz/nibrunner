@@ -312,6 +312,7 @@ pub fn observed_instance(edit: impl FnOnce(&mut ObservedInstance)) -> ObservedIn
         deployment_id: Some(deployment_id()),
         present: true,
         running: true,
+        asleep: false,
         exited: false,
         refused: false,
         ran_once: false,

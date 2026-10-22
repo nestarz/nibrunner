@@ -879,7 +879,8 @@ pub enum CutoverOutcome {
     /// The old deployment was stopped before the one reported started.
     Fallback { reason: CutoverFallback },
     /// `deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the
-    /// deployment reported keeps serving, and the named one is not tried again.
+    /// deployment reported keeps serving, or stays asleep to be woken on request, and the named
+    /// one is not tried again.
     Abandoned { deployment_id: DeploymentId },
 }
 

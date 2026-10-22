@@ -102,6 +102,7 @@ pub struct VmmSpy {
     on_boot: Arc<Mutex<Option<VmError>>>,
     on_sleep: Arc<Mutex<Option<VmError>>>,
     on_wake: Arc<Mutex<Option<VmError>>>,
+    woken: Arc<Mutex<Vec<protocol::DeploymentId>>>,
     on_thaw: Arc<Mutex<Option<VmError>>>,
     verdict: Arc<Mutex<Option<String>>>,
     adopted: Arc<Mutex<Vec<AppId>>>,
@@ -117,6 +118,7 @@ impl Default for VmmSpy {
             on_boot: shared(None),
             on_sleep: shared(None),
             on_wake: shared(None),
+            woken: shared(Vec::new()),
             on_thaw: shared(None),
             verdict: shared(None),
             adopted: shared(Vec::new()),
@@ -147,6 +149,11 @@ impl VmmSpy {
 
     pub fn refuse_wake(&self, error: VmError) {
         *self.on_wake.lock().expect("no panic holds this lock") = Some(error);
+    }
+
+    /// The deployment each wake was asked to restore, in order.
+    pub fn woken(&self) -> Vec<protocol::DeploymentId> {
+        held(&self.woken)
     }
 
     pub fn set_verdict(&self, verdict: impl Into<String>) {
@@ -186,11 +193,13 @@ pub(crate) fn vmm_under(directory: PathBuf) -> (Arc<MockVmm>, VmmSpy) {
         push(&calls, VmCall::Sleep);
         held(&on_sleep).map_or(Ok(()), Err)
     });
-    let (calls, on_wake) = (spy.calls.clone(), spy.on_wake.clone());
-    vms.expect_wake().returning(move |_| {
-        push(&calls, VmCall::Wake);
-        held(&on_wake).map_or(Ok(()), Err)
-    });
+    let (calls, on_wake, woken) = (spy.calls.clone(), spy.on_wake.clone(), spy.woken.clone());
+    vms.expect_wake()
+        .returning(move |request: crate::ports::SuspendRequest| {
+            push(&calls, VmCall::Wake);
+            push(&woken, request.deployment_id);
+            held(&on_wake).map_or(Ok(()), Err)
+        });
     let calls = spy.calls.clone();
     vms.expect_stop().returning(move |_| {
         push(&calls, VmCall::Stop);

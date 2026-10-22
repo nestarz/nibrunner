@@ -59,7 +59,7 @@
       "type": "object",
       "properties": {
         "cutoverTimeoutMs": {
-          "description": "How long a new `deploymentId` is given to become healthy beside the deployment still\nserving, before its hostnames are moved over to it and the old one is stopped. A new\ndeployment that is not healthy by then is stopped and the old one keeps serving. Absent,\nthe old deployment is stopped before the new one starts. An instance with a volume is\nalways replaced that way, since two guests cannot write one disk.",
+          "description": "How long a new `deploymentId` is given to become healthy beside the deployment it\nreplaces, running or asleep, before its hostnames are moved over to it and the old one is\nstopped (and its snapshot deleted). A new deployment that is not healthy by then is stopped\nand the old one keeps its hostnames, serving or woken on request. Absent, the old\ndeployment is stopped before the new one starts. An instance with a volume is always\nreplaced that way, since two guests cannot write one disk.",
           "anyOf": [
             {
               "$ref": "#/$defs/CutoverTimeoutMs"

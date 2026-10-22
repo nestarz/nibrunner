@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use protocol::{
-    AppId, DesiredInstance, DesiredInstanceState, InstanceState, StateMessage, TenantExit, VolumeId,
-    VolumeState,
+    AppId, DeploymentId, DesiredInstance, DesiredInstanceState, InstanceState, StateMessage, TenantExit,
+    VolumeId, VolumeState,
 };
 
 use crate::adapters::vm::{VmExit, VmStatus, UNKNOWN_VM};
@@ -730,6 +730,23 @@ async fn cold_boot(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome
     })
 }
 
+/// The deployment the app's record holds when it is not the document's and a cut-over to the
+/// document's is under way or was given up on: until that cut-over hands the app over, the one
+/// the record holds keeps its hostnames, asleep or not, and it is the one a request wakes.
+pub(crate) async fn kept_through_cutover(host: &Host, desired: &DesiredInstance) -> Option<DeploymentId> {
+    host.state
+        .record(&desired.app_id)
+        .await
+        .filter(|record| {
+            record.deployment_id != desired.deployment_id
+                && record
+                    .cutover
+                    .as_ref()
+                    .is_some_and(|cutover| cutover.deployment_id == desired.deployment_id)
+        })
+        .map(|record| record.deployment_id)
+}
+
 pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<WakeOutcome, WakeRefusal> {
     let would_not_start = |reason: String| WakeRefusal::Failed {
         kind: WakeFailure::WouldNotStart,
@@ -801,9 +818,10 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
 
     host.state.mark_active(&desired.app_id, now_ms()).await;
 
+    let kept = kept_through_cutover(host, desired).await;
     let request = SuspendRequest {
         app_id: desired.app_id.clone(),
-        deployment_id: desired.deployment_id.clone(),
+        deployment_id: kept.clone().unwrap_or_else(|| desired.deployment_id.clone()),
         slot,
     };
     match host.vms.wake(request).await {
@@ -819,6 +837,23 @@ pub async fn resume_instance(host: &Host, desired: &DesiredInstance) -> Result<W
                 .await;
             host.state.probe_at_once(&desired.app_id).await;
             Ok(WakeOutcome::Restored)
+        }
+        // Only the snapshot of the deployment kept is held, not what it was booted from, and
+        // booting the document's under the app would hand it the hostnames before the cut-over
+        // has seen it healthy.
+        Err(error @ (VmError::SnapshotUnusable { .. } | VmError::WakeStalled { .. })) if kept.is_some() => {
+            let reason = format!(
+                "deployment {} could not be woken ({}), and deployment {} has not taken the app over",
+                kept.map_or_else(String::new, |id| id.to_string()),
+                error.message(),
+                desired.deployment_id,
+            );
+            host.state
+                .update_record(&desired.app_id, |record| {
+                    record.message = Some(StateMessage::new(reason.clone()));
+                })
+                .await;
+            Err(would_not_start(reason))
         }
         Err(error @ (VmError::SnapshotUnusable { .. } | VmError::WakeStalled { .. })) => {
             let stalled = match error {
