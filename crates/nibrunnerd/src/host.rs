@@ -354,6 +354,12 @@ impl Host {
         if let Some(document) = &accepted {
             self.widen_slots(&document.desired).await;
         }
+        // A slot is held for an app this host keeps a record of. One without was left behind by an
+        // app that was forgotten without giving it back, as daemons before this one did.
+        let assignments = assignments
+            .into_iter()
+            .filter(|(app_id, _)| records.iter().any(|record| &record.app_id == app_id))
+            .collect();
         self.allocator.lock().await.restore(assignments, cursor);
         self.state
             .modify(|snapshot| {
@@ -697,6 +703,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slot_left_behind_by_an_app_this_host_no_longer_holds_is_free_after_a_restart() {
+        let host = test_host().await;
+        let left_behind = protocol::AppId::parse("left-behind").unwrap();
+        host.slot_for(&left_behind).await.unwrap();
+        host.slot_for(&app_id()).await.unwrap();
+        host.state.put_record(instance_record(|_| {})).await;
+        host.persist().await;
+
+        *host.allocator.lock().await =
+            crate::adapters::net::allocator::SlotAllocator::addressing(host.config.max_apps);
+        host.load().await;
+
+        assert!(host.slot_of(&left_behind).await.is_none());
+        assert!(host.slot_of(&app_id()).await.is_some());
+    }
+
+    #[tokio::test]
     async fn a_slot_past_max_apps_that_a_document_widened_the_ring_to_is_kept_across_a_restart() {
         let host = test_host().await;
         let past = host.config.max_apps;
@@ -708,6 +731,9 @@ mod tests {
             .lock()
             .await
             .restore(BTreeMap::from([(app.clone(), past)]), 0);
+        host.state
+            .put_record(instance_record(|record| record.app_id = app.clone()))
+            .await;
         host.persist().await;
 
         *host.allocator.lock().await =
