@@ -372,6 +372,12 @@ async fn writable_for(host: &Host, desired: &DesiredInstance) -> Result<Writable
 }
 
 pub async fn sleep_instance(host: &Host, desired: &DesiredInstance) {
+    // The plan was made from a look at the app taken before this, and a request may have woken it
+    // since. The record read here is put back whole, so it is read under the transition a wake
+    // holds: read outside it, the copy of the app asleep, down on purpose with `stop_requested`
+    // set, could land over the record the wake had just written, and the guest running under it
+    // read as stopping from then on.
+    let _transition = host.state.transition(&desired.app_id).await;
     let Ok(slot) = host.slot_for(&desired.app_id).await else {
         report_no_slot(host, desired, StateMessage::new("this host has no slot left")).await;
         return;
@@ -1551,6 +1557,70 @@ mod tests {
         assert_eq!(record.deployment_id.as_str(), "dep-2");
         assert_eq!(record.restart_count, 3);
         assert!(record.on_request);
+    }
+
+    #[tokio::test]
+    async fn a_sleep_planned_before_a_wake_does_not_put_the_woken_app_back_to_sleep() {
+        let host = test_host().await;
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| {
+                record.state = InstanceState::Idle;
+                record.stop_requested = true;
+                record.on_request = true;
+            }))
+            .await;
+        let waking = host.state.transition(&app_id()).await;
+
+        let planned = tokio::spawn({
+            let host = host.arc().clone();
+            async move { sleep_instance(&host, &on_request()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!planned.is_finished(), "the sleep waits for the wake under way");
+        host.state
+            .update_record(&app_id(), |record| {
+                record.state = InstanceState::Starting;
+                record.stop_requested = false;
+            })
+            .await;
+        drop(waking);
+        planned.await.unwrap();
+
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(
+            (record.state, record.stop_requested),
+            (InstanceState::Starting, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_app_woken_on_request_reads_as_coming_up_and_not_as_stopping() {
+        let host = test_host().await;
+        host.volumes.provision(&desired_volume(|_| {})).await.unwrap();
+        host.slot_for(&app_id()).await.unwrap();
+        host.state
+            .put_record(instance_record(|record| record.on_request = true))
+            .await;
+        stop_instance(&host, &app_id(), "idle").await;
+        assert!(host.state.record(&app_id()).await.unwrap().stop_requested);
+
+        resume_instance(&host, &on_request()).await.unwrap();
+        host.vms.set_status(VmStatus {
+            loaded: true,
+            active: true,
+            started_this_boot: true,
+            ..VmStatus::default()
+        });
+        refresh_states(host.arc()).await;
+
+        let record = host.state.record(&app_id()).await.unwrap();
+        assert!(!record.stop_requested);
+        assert_eq!(record.state, InstanceState::Starting);
+        assert_eq!(
+            crate::domain::report::build_report::to_reported_instance(&record, None).state,
+            InstanceState::Starting
+        );
     }
 
     #[tokio::test]

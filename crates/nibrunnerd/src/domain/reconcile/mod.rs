@@ -162,6 +162,7 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
     for action in &plan.instances {
         match action {
             InstancePlan::Stop { app_id, reason } => {
+                let _transition = host.state.transition(app_id).await;
                 instances::stop_instance(host, app_id, reason.as_str()).await;
             }
             InstancePlan::Replace { desired } | InstancePlan::FallBack { desired, .. } => {
@@ -188,12 +189,14 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             InstancePlan::Forget { app_id } => {
                 let _transition = host.state.transition(app_id).await;
                 let _ = host.vms.discard(app_id).await;
-                // Nothing else will ever ask for the slot of what was booted for a cut-over.
+                // An app that is leaving gives its slot and tap back, or every app id a host ever
+                // held keeps one and the ring runs out. One with a volume keeps it until the volume
+                // is detached or torn down, which give it back themselves.
                 if host
                     .state
                     .record(app_id)
                     .await
-                    .is_some_and(|record| record.staging_for.is_some())
+                    .is_none_or(|record| record.volume_id.is_none())
                 {
                     volumes::give_back_slot(host, app_id).await;
                 }
@@ -1951,6 +1954,59 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn apps_forgotten_one_after_another_never_run_the_slots_out() {
+        let host = test_host().await;
+        for n in 0..=host.config.max_apps {
+            let leaving = protocol::AppId::parse(format!("leaving-{n}")).unwrap();
+            let slot = host.slot_for(&leaving).await.unwrap();
+            host.state
+                .put_record(instance_record(|record| {
+                    record.app_id = leaving.clone();
+                    record.volume_id = None;
+                    record.host_port = Some(slot.host_port);
+                }))
+                .await;
+
+            stops_applied(
+                &host,
+                InstancePlan::Forget {
+                    app_id: leaving.clone(),
+                },
+            )
+            .await;
+
+            assert!(host.slot_of(&leaving).await.is_none(), "{leaving}");
+        }
+        assert!(host.allocator.lock().await.assignments().is_empty());
+        assert_eq!(
+            host.vms.removed_taps().len(),
+            usize::try_from(host.config.max_apps).unwrap() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_that_is_stopped_or_leaves_a_volume_behind_keeps_its_slot() {
+        let host = test_host().await;
+        host.slot_for(&app_id()).await.unwrap();
+        host.state.put_record(instance_record(|_| {})).await;
+        stops_applied(
+            &host,
+            InstancePlan::Stop {
+                app_id: app_id(),
+                reason: InstanceStopReason::DesiredStopped,
+            },
+        )
+        .await;
+        assert!(host.slot_of(&app_id()).await.is_some(), "stopped");
+
+        stops_applied(&host, InstancePlan::Forget { app_id: app_id() }).await;
+        assert!(
+            host.slot_of(&app_id()).await.is_some(),
+            "its volume's detach or teardown gives the slot back"
+        );
     }
 
     #[tokio::test]
