@@ -19,13 +19,14 @@ use crate::domain::metrics::{CacheOutcome, HostMetrics, Outcome};
 use tokio::sync::RwLock;
 
 use crate::adapters::otlp::trace::{RequestTrace, TraceBook};
-use crate::adapters::proxy::cache::{self, Asked, Origin, ResponseCache};
+use crate::adapters::proxy::cache::{self, Asked, Origin, ResponseCache, Tenant};
 use crate::adapters::proxy::encode::{self, Encoding, Metered};
 use crate::adapters::proxy::forward::{
     forward, hostname_of, note_the_hop, say, ProxyBody, Unreachable, Upstreams,
 };
 use crate::adapters::proxy::http_log::{HttpRequestLog, HttpRequestRecord, HttpRequestScope, Wake};
 use crate::adapters::proxy::pem;
+use crate::adapters::proxy::purge::{Purge, SharedCache};
 use crate::domain::metrics::proxy::Handshake;
 use crate::domain::report::routes::RouteTarget;
 
@@ -117,6 +118,7 @@ pub struct Router {
     concurrency: Option<super::concurrency::ConcurrencyLimiter>,
     state: crate::state::SharedState,
     cache: Option<Arc<ResponseCache>>,
+    shared: std::sync::RwLock<Arc<SharedCache>>,
     encode: Option<HttpEncode>,
 }
 
@@ -210,8 +212,65 @@ impl Router {
             metrics,
             http_log,
             cache,
+            shared: std::sync::RwLock::default(),
             encode,
         })
+    }
+
+    fn shared(&self) -> Arc<SharedCache> {
+        self.shared
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Takes up the document's `httpCache`: the name the cache reports itself by, and the purge.
+    /// One that cannot be set up leaves the one before it serving.
+    pub fn share_cache(&self, desired: Option<&protocol::DesiredHttpCache>) {
+        self.share_cache_trusting(desired, &[]);
+    }
+
+    pub(crate) fn share_cache_trusting(
+        &self,
+        desired: Option<&protocol::DesiredHttpCache>,
+        roots: &[reqwest::Certificate],
+    ) {
+        if self.shared().describes(desired) {
+            return;
+        }
+        match SharedCache::of(desired, roots) {
+            Ok(shared) => {
+                *self
+                    .shared
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(shared);
+            }
+            Err(error) => tracing::warn!(%error, "the desired state's httpCache is not taken up"),
+        }
+    }
+
+    /// A purge an app asked of this host is counted for every app on it the purge covers.
+    async fn purged<B>(&self, purge: &Purge, request: Request<B>) -> Response<ProxyBody>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes, Error = hyper::Error>,
+    {
+        let (response, asked) = purge.answer(request, self.cache.as_deref()).await;
+        if let Some(asked) = asked {
+            let covered: BTreeSet<AppId> = self
+                .routes()
+                .await
+                .by_hostname
+                .values()
+                .filter(|route| {
+                    Tenant::of(&route.app_id, &route.deployment_id, &route.labels).owner() == asked.owner
+                })
+                .map(|route| route.app_id.clone())
+                .collect();
+            for app_id in &covered {
+                self.metrics.proxy.purge_asked(app_id);
+            }
+        }
+        response
     }
 
     pub async fn discard_http_log(&self, app_id: &AppId) {
@@ -299,6 +358,10 @@ impl Router {
                 Outcome::WrongHost,
                 None,
             );
+        }
+        let shared = self.shared();
+        if let Some(purge) = shared.purge_at(&hostname, request.uri().path()) {
+            return (self.purged(purge, request).await, Outcome::Served, None);
         }
         let (route, logging) = {
             let routes = self.routes.read().await;
@@ -432,7 +495,8 @@ impl Router {
         let (response, outcome) = match &self.cache {
             Some(cache) if cache::answerable(&request) => {
                 let (visitor, _) = request.into_parts();
-                let asked = Asked::new(visitor, route.deployment_id.clone(), hostname, encoding);
+                let tenant = Tenant::of(&route.app_id, &route.deployment_id, &route.labels);
+                let asked = Asked::new(visitor, tenant, hostname, encoding);
                 let answered = cache.answer(asked, origin).await;
                 (answered.response, Some(answered.outcome))
             }
@@ -452,6 +516,10 @@ impl Router {
                 (response, cached.as_ref().map(|_| CacheOutcome::Bypass))
             }
         };
+        let mut response = response;
+        if let Some(outcome) = outcome {
+            cache::report(&mut response, self.shared().name(), outcome);
+        }
         let sent = Encoding::of(response.headers());
         (response, outcome, sent)
     }
@@ -2008,7 +2076,7 @@ mod tests {
             "the POST, then the GET it made stale"
         );
         assert_eq!(
-            metrics.proxy.of(&crate::test_support::app_id()).cache[3],
+            metrics.proxy.of(&crate::test_support::app_id()).cache[4],
             1,
             "a POST bypasses"
         );
@@ -2322,6 +2390,275 @@ mod tests {
                 "{} holds 2 certificate(s) that could not be parsed as X.509",
                 pool.display()
             )
+        );
+    }
+
+    const PURGE_HOSTNAME: &str = "cache.example.com";
+    const PURGE_KEY: [u8; 32] = [7; 32];
+
+    /// A tenant whose every answer may be shared for a minute under the tag `t:page`, counting the
+    /// requests it is asked.
+    async fn tagging_and_counting() -> (HostPort, Arc<std::sync::atomic::AtomicUsize>) {
+        let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let host_port = HostPort::new(upstream.local_addr().unwrap().port()).unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream.accept().await else {
+                    return;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_request: Request<Incoming>| {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async move {
+                            let mut shared = say(StatusCode::OK, "tagged\n");
+                            for (name, value) in [
+                                ("cache-control", "public, max-age=0, must-revalidate"),
+                                ("cdn-cache-control", "public, s-maxage=60"),
+                                ("cache-tag", "t:page"),
+                            ] {
+                                shared
+                                    .headers_mut()
+                                    .insert(name, hyper::header::HeaderValue::from_static(value));
+                            }
+                            Ok::<_, std::convert::Infallible>(shared)
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (host_port, asked)
+    }
+
+    fn shared_cache(peers: &[String]) -> protocol::DesiredHttpCache {
+        use base64::Engine;
+        serde_json::from_value(serde_json::json!({
+            "name": "mf",
+            "purge": {
+                "hostname": PURGE_HOSTNAME,
+                "path": "/_purge",
+                "keys": [base64::engine::general_purpose::STANDARD.encode(PURGE_KEY)],
+                "peers": peers,
+            },
+        }))
+        .unwrap()
+    }
+
+    fn caching(metrics: Arc<HostMetrics>) -> Arc<Router> {
+        Router::with_http(
+            metrics,
+            None,
+            None,
+            Some(&HttpCache {
+                memory_mib: 8.try_into().unwrap(),
+                max_entry_kib: 1024.try_into().unwrap(),
+            }),
+            None,
+            crate::state::HostState::shared(),
+        )
+    }
+
+    /// The page asked for until the cache answers it, and the `Cache-Status` of every answer.
+    async fn until_held(proxy: u16) -> Vec<String> {
+        let mut statuses = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while statuses.last().is_none_or(|status| status != "mf; hit") {
+            assert!(std::time::Instant::now() < deadline, "never held: {statuses:?}");
+            let answered = reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{proxy}/"))
+                .header("host", "app-1.apps.example.com")
+                .send()
+                .await
+                .unwrap();
+            statuses.push(answered.headers()["cache-status"].to_str().unwrap().to_string());
+            assert_eq!(answered.text().await.unwrap(), "tagged\n");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        statuses
+    }
+
+    async fn purged_at(proxy: u16, authorization: &str, body: &str) -> (u16, serde_json::Value) {
+        let answered = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy}/_purge"))
+            .header("host", PURGE_HOSTNAME)
+            .header("authorization", authorization)
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = answered.status().as_u16();
+        (status, answered.json().await.unwrap())
+    }
+
+    fn bearer(key: &[u8], owner: &str) -> String {
+        format!("Bearer {}", crate::adapters::proxy::purge::token(key, owner))
+    }
+
+    #[tokio::test]
+    async fn a_purge_takes_only_a_valid_token_of_the_owner_and_removes_exactly_its_tags() {
+        crate::install_crypto_provider();
+        let (host_port, asked_of_the_app) = tagging_and_counting().await;
+        let metrics = Arc::new(HostMetrics::new());
+        let router = caching(metrics.clone());
+        router.share_cache(Some(&shared_cache(&[])));
+        routed_at(&router, host_port).await;
+        let proxy = serving(router).await;
+        let statuses = until_held(proxy).await;
+        assert_eq!(statuses[0], "mf; fwd=miss; stored", "{statuses:?}");
+        let app_was_asked = || asked_of_the_app.load(std::sync::atomic::Ordering::SeqCst);
+        let held = app_was_asked();
+
+        let tags = r#"{"tags": ["t:page"]}"#;
+        let forged = {
+            let theirs = crate::adapters::proxy::purge::token(&PURGE_KEY, "app-2");
+            format!("Bearer {}", theirs.replace("v1.app-2.", "v1.app-1."))
+        };
+        let unsigned = "Bearer v1.app-1".to_string();
+        let basic = bearer(&PURGE_KEY, "app-1").replace("Bearer", "Basic");
+        for refused in [bearer(&[8; 32], "app-1"), forged, unsigned, basic] {
+            assert_eq!(purged_at(proxy, &refused, tags).await.0, 401, "{refused}");
+        }
+        let token = bearer(&PURGE_KEY, "app-1");
+        for (body, status) in [
+            ("tags", 400),
+            (r#"{"tags": [""]}"#, 400),
+            (r#"{"tags": "t:page"}"#, 400),
+        ] {
+            assert_eq!(purged_at(proxy, &token, body).await.0, status, "{body}");
+        }
+        let too_many = serde_json::json!({ "tags": vec!["t"; 501] }).to_string();
+        assert_eq!(purged_at(proxy, &token, &too_many).await.0, 413);
+        assert_eq!(
+            purged_at(proxy, &bearer(&PURGE_KEY, "app-2"), tags).await,
+            (200, serde_json::json!({ "purged": 0, "hosts": 1 })),
+            "another app's own token purges only what it owns"
+        );
+        let get = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{proxy}/_purge"))
+            .header("host", PURGE_HOSTNAME)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), 405);
+        assert_eq!(get.headers()["allow"], "POST");
+        let elsewhere = asked(
+            proxy,
+            &format!("POST /other HTTP/1.0\r\nHost: {PURGE_HOSTNAME}\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert!(elsewhere.starts_with("HTTP/1.0 404 "), "{elsewhere}");
+        assert_eq!(until_held(proxy).await, ["mf; hit"]);
+        assert_eq!(app_was_asked(), held, "nothing refused removed anything");
+
+        assert_eq!(
+            purged_at(proxy, &token, tags).await,
+            (200, serde_json::json!({ "purged": 1, "hosts": 1 }))
+        );
+        assert_eq!(until_held(proxy).await[0], "mf; fwd=miss; stored");
+        assert_eq!(app_was_asked(), held + 1);
+        let counted = metrics.proxy.of(&crate::test_support::app_id());
+        assert_eq!((counted.cache_purges, counted.cache_purged), (1, 1));
+    }
+
+    struct Peer {
+        listed: String,
+        plain: u16,
+        metrics: Arc<HostMetrics>,
+    }
+
+    fn unused_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A host caching the app behind `host_port`, which serves the purge over TLS under a
+    /// certificate for its hostname and relays to `peers`.
+    async fn peer(
+        host_port: HostPort,
+        acceptor: &tokio_rustls::TlsAcceptor,
+        roots: &[reqwest::Certificate],
+        peers: &[String],
+    ) -> Peer {
+        let metrics = Arc::new(HostMetrics::new());
+        let router = caching(metrics.clone());
+        router.share_cache_trusting(Some(&shared_cache(peers)), roots);
+        routed_at(&router, host_port).await;
+        let secure = SocketAddr::from(([127, 0, 0, 1], unused_port()));
+        tokio::spawn(serve_https(router.clone(), secure, acceptor.clone(), None));
+        while tokio::net::TcpStream::connect(secure).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Peer {
+            listed: format!("https://{secure}"),
+            plain: serving(router).await,
+            metrics,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_reaches_every_peer_once_and_names_the_peers_it_could_not() {
+        crate::install_crypto_provider();
+        let (host_port, _) = tagging_and_counting().await;
+        let made = rcgen::generate_simple_self_signed(vec![PURGE_HOSTNAME.into()]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (certificate, key) = (
+            directory.path().join("cert.pem"),
+            directory.path().join("key.pem"),
+        );
+        std::fs::write(&certificate, made.cert.pem()).unwrap();
+        std::fs::write(&key, made.key_pair.serialize_pem()).unwrap();
+        let acceptor = tls_acceptor(&certificate, &key, None).unwrap();
+        let roots = [reqwest::Certificate::from_pem(made.cert.pem().as_bytes()).unwrap()];
+        let dead = format!("https://127.0.0.1:{}", unused_port());
+
+        // A peer that relayed again would fail on the dead peer and be named itself.
+        let relaying_again_would_fail = peer(host_port, &acceptor, &roots, std::slice::from_ref(&dead)).await;
+        let quiet = peer(host_port, &acceptor, &roots, &[]).await;
+        let peers = [
+            relaying_again_would_fail.listed.clone(),
+            quiet.listed.clone(),
+            dead.clone(),
+        ];
+        let asked = peer(host_port, &acceptor, &roots, &peers).await;
+        let everyone = [&asked, &relaying_again_would_fail, &quiet];
+        for host in everyone {
+            until_held(host.plain).await;
+        }
+        let token = bearer(&PURGE_KEY, "app-1");
+        let tags = r#"{"tags": ["t:page"]}"#;
+        assert_eq!(
+            purged_at(asked.plain, &token, tags).await,
+            (502, serde_json::json!({ "failed": [dead] }))
+        );
+        let app = crate::test_support::app_id();
+        for host in everyone {
+            assert_eq!(host.metrics.proxy.of(&app).cache_purged, 1, "{}", host.listed);
+            assert_eq!(until_held(host.plain).await[0], "mf; fwd=miss; stored");
+        }
+        assert_eq!(
+            everyone.map(|host| host.metrics.proxy.of(&app).cache_purges),
+            [1, 0, 0],
+            "counted where it was asked"
+        );
+
+        let router_without_the_dead = caching(Arc::new(HostMetrics::new()));
+        router_without_the_dead.share_cache_trusting(Some(&shared_cache(&peers[..2])), &roots);
+        routed_at(&router_without_the_dead, host_port).await;
+        let proxy = serving(router_without_the_dead).await;
+        until_held(proxy).await;
+        assert_eq!(
+            purged_at(proxy, &token, tags).await,
+            (200, serde_json::json!({ "purged": 3, "hosts": 3 }))
         );
     }
 }

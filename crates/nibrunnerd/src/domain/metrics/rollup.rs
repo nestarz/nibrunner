@@ -36,8 +36,11 @@ pub struct UnitMetrics {
     pub sleeps: u64,
     pub cache_hit: u64,
     pub cache_stale: u64,
+    pub cache_revalidated: u64,
     pub cache_miss: u64,
     pub cache_bypass: u64,
+    pub cache_purges: u64,
+    pub cache_purged: u64,
     /// What the proxy's compression took from the app and gave out, every coding together.
     pub encoded_bytes_in: u64,
     pub encoded_bytes_out: u64,
@@ -64,8 +67,11 @@ impl UnitMetrics {
         self.sleeps += other.sleeps;
         self.cache_hit += other.cache_hit;
         self.cache_stale += other.cache_stale;
+        self.cache_revalidated += other.cache_revalidated;
         self.cache_miss += other.cache_miss;
         self.cache_bypass += other.cache_bypass;
+        self.cache_purges += other.cache_purges;
+        self.cache_purged += other.cache_purged;
         self.encoded_bytes_in += other.encoded_bytes_in;
         self.encoded_bytes_out += other.encoded_bytes_out;
     }
@@ -289,10 +295,13 @@ impl Counting {
                     "proxy_cache_requests_total" => match label(s, "outcome") {
                         Some("hit") => m.cache_hit += n,
                         Some("stale") => m.cache_stale += n,
+                        Some("revalidated") => m.cache_revalidated += n,
                         Some("miss") => m.cache_miss += n,
                         Some("bypass") => m.cache_bypass += n,
                         _ => {}
                     },
+                    "proxy_cache_purges_total" => m.cache_purges += n,
+                    "proxy_cache_purged_total" => m.cache_purged += n,
                     "proxy_encode_bytes_total" => match label(s, "direction") {
                         Some("in") => m.encoded_bytes_in += n,
                         Some("out") => m.encoded_bytes_out += n,
@@ -375,6 +384,9 @@ mod tests {
              nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"stale\"}} 1\n\
              nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"miss\"}} {}\n\
              nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"bypass\"}} 0\n\
+             nibrunner_proxy_cache_requests_total{{app=\"site\",outcome=\"revalidated\"}} {requests}\n\
+             nibrunner_proxy_cache_purges_total{{app=\"site\"}} {requests}\n\
+             nibrunner_proxy_cache_purged_total{{app=\"site\"}} {}\n\
              nibrunner_proxy_cache_bytes 4096\n\
              nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"br\",direction=\"in\"}} {}\n\
              nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"br\",direction=\"out\"}} {requests}\n\
@@ -382,6 +394,7 @@ mod tests {
              nibrunner_proxy_encode_bytes_total{{app=\"site\",encoding=\"gzip\",direction=\"out\"}} {requests}\n\
              nibrunner_app_requests_total{{app=\"build-x\",class=\"2xx\"}} 9\n",
             requests * 2,
+            requests * 3,
             requests * 10,
             requests * 10,
         )
@@ -421,6 +434,10 @@ mod tests {
                 site.cache_bypass
             ),
             (2, 0, 4, 0)
+        );
+        assert_eq!(
+            (site.cache_revalidated, site.cache_purges, site.cache_purged),
+            (2, 2, 6)
         );
         assert_eq!((site.encoded_bytes_in, site.encoded_bytes_out), (40, 4));
         assert_eq!(
@@ -508,8 +525,11 @@ mod tests {
             sleeps: 0,
             cache_hit: 2,
             cache_stale: 0,
+            cache_revalidated: 1,
             cache_miss: 1,
             cache_bypass: 0,
+            cache_purges: 1,
+            cache_purged: 3,
             encoded_bytes_in: 30_000,
             encoded_bytes_out: 2_000,
         };

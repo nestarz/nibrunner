@@ -125,6 +125,7 @@ impl ConvergeController {
         desired: &HostDesiredState,
     ) -> Result<Option<Changes>, crate::domain::cron::registry::CronRegistryError> {
         self.host.widen_slots(desired).await;
+        self.host.router.share_cache(desired.http_cache.as_ref());
         let changes = {
             let mut cache = self.host.cache.lock().await;
             let deployments = desired

@@ -180,13 +180,29 @@
     "name": "nibrunner_raw_port_bytes_total"
   },
   {
-    "help": "Requests for an app by what the response cache did: hit is answered from a fresh entry without the app, stale from an entry past its lifetime while it revalidates or because the app failed, miss asked the app, bypass is a request the cache does not hold answers to. Zero everywhere on a host with no [proxy.http.cache].",
+    "help": "Requests for an app by what the response cache did: hit is answered from a fresh entry without the app, stale from an entry past its lifetime while it revalidates or because the app failed, revalidated from an entry past its lifetime the app answered 304 for, miss asked the app, bypass is a request the cache does not hold answers to. Zero everywhere on a host with no [proxy.http.cache].",
     "kind": "counter",
     "labels": [
       "app",
       "outcome"
     ],
     "name": "nibrunner_proxy_cache_requests_total"
+  },
+  {
+    "help": "Purges by tag the app asked of this host, counted for every app on it the purge's owner covers. The host relays each to every other, which does not count it again.",
+    "kind": "counter",
+    "labels": [
+      "app"
+    ],
+    "name": "nibrunner_proxy_cache_purges_total"
+  },
+  {
+    "help": "Entries of the app's that purges removed from this host's response cache, whichever host the purge was asked of.",
+    "kind": "counter",
+    "labels": [
+      "app"
+    ],
+    "name": "nibrunner_proxy_cache_purged_total"
   },
   {
     "help": "What the stored responses weigh together, headers and bodies as stored, against [proxy.http.cache] memory_mib.",

@@ -49,12 +49,14 @@ pub const OUTCOMES: [Outcome; 5] = [
 ];
 
 /// What the response cache did with a request: answered it from a fresh entry, from a stale one
-/// while it revalidates or because the app failed, asked the app, or was not the place for it.
+/// while it revalidates or because the app failed, from a stale one the app said was still
+/// current, asked the app, or was not the place for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheOutcome {
     Hit,
     Stale,
+    Revalidated,
     Miss,
     Bypass,
 }
@@ -64,15 +66,17 @@ impl CacheOutcome {
         match self {
             CacheOutcome::Hit => "hit",
             CacheOutcome::Stale => "stale",
+            CacheOutcome::Revalidated => "revalidated",
             CacheOutcome::Miss => "miss",
             CacheOutcome::Bypass => "bypass",
         }
     }
 }
 
-const CACHE_OUTCOMES: [CacheOutcome; 4] = [
+const CACHE_OUTCOMES: [CacheOutcome; 5] = [
     CacheOutcome::Hit,
     CacheOutcome::Stale,
+    CacheOutcome::Revalidated,
     CacheOutcome::Miss,
     CacheOutcome::Bypass,
 ];
@@ -194,6 +198,8 @@ pub struct AppProxy {
     pub raw_bytes_in: [u64; PROTOCOLS.len()],
     pub raw_bytes_out: [u64; PROTOCOLS.len()],
     pub cache: [u64; CACHE_OUTCOMES.len()],
+    pub cache_purges: u64,
+    pub cache_purged: u64,
     pub encoded_in: [u64; COMPRESSIONS.len()],
     pub encoded_out: [u64; COMPRESSIONS.len()],
 }
@@ -345,6 +351,16 @@ impl ProxyMetrics {
         self.app(app_id, |app| app.cache[position(&CACHE_OUTCOMES, &outcome)] += 1);
     }
 
+    /// A purge an app asked of this host, which it relays to every other.
+    pub fn purge_asked(&self, app_id: &AppId) {
+        self.app(app_id, |app| app.cache_purges += 1);
+    }
+
+    /// One entry of the app's a purge removed from this host's cache.
+    pub fn purged(&self, app_id: &AppId) {
+        self.app(app_id, |app| app.cache_purged += 1);
+    }
+
     pub fn cache_weighs(&self, bytes: u64) {
         self.cache_bytes.store(bytes, Ordering::Relaxed);
     }
@@ -461,9 +477,23 @@ static RAW_PORT_BYTES_TOTAL: Metric = Metric {
 
 static PROXY_CACHE_REQUESTS_TOTAL: Metric = Metric {
     name: "nibrunner_proxy_cache_requests_total",
-    help: "Requests for an app by what the response cache did: hit is answered from a fresh entry without the app, stale from an entry past its lifetime while it revalidates or because the app failed, miss asked the app, bypass is a request the cache does not hold answers to. Zero everywhere on a host with no [proxy.http.cache].",
+    help: "Requests for an app by what the response cache did: hit is answered from a fresh entry without the app, stale from an entry past its lifetime while it revalidates or because the app failed, revalidated from an entry past its lifetime the app answered 304 for, miss asked the app, bypass is a request the cache does not hold answers to. Zero everywhere on a host with no [proxy.http.cache].",
     kind: Kind::Counter,
     labels: &["app", "outcome"],
+};
+
+static PROXY_CACHE_PURGES_TOTAL: Metric = Metric {
+    name: "nibrunner_proxy_cache_purges_total",
+    help: "Purges by tag the app asked of this host, counted for every app on it the purge's owner covers. The host relays each to every other, which does not count it again.",
+    kind: Kind::Counter,
+    labels: &["app"],
+};
+
+static PROXY_CACHE_PURGED_TOTAL: Metric = Metric {
+    name: "nibrunner_proxy_cache_purged_total",
+    help: "Entries of the app's that purges removed from this host's response cache, whichever host the purge was asked of.",
+    kind: Kind::Counter,
+    labels: &["app"],
 };
 
 static PROXY_CACHE_BYTES: Metric = Metric {
@@ -493,6 +523,8 @@ pub(super) static DECLARED: &[&Metric] = &[
     &RAW_PORT_SESSIONS_TOTAL,
     &RAW_PORT_BYTES_TOTAL,
     &PROXY_CACHE_REQUESTS_TOTAL,
+    &PROXY_CACHE_PURGES_TOTAL,
+    &PROXY_CACHE_PURGED_TOTAL,
     &PROXY_CACHE_BYTES,
     &PROXY_ENCODE_BYTES_TOTAL,
 ];
@@ -599,6 +631,24 @@ pub(super) fn render(page: &mut Page, metrics: &ProxyMetrics, snapshot: &HostSna
                 app.cache[index],
             );
         }
+    }
+
+    page.declare(&PROXY_CACHE_PURGES_TOTAL);
+    for app_id in &apps {
+        page.value(
+            &PROXY_CACHE_PURGES_TOTAL,
+            &[("app", app_id.as_str())],
+            metrics.of(app_id).cache_purges,
+        );
+    }
+
+    page.declare(&PROXY_CACHE_PURGED_TOTAL);
+    for app_id in &apps {
+        page.value(
+            &PROXY_CACHE_PURGED_TOTAL,
+            &[("app", app_id.as_str())],
+            metrics.of(app_id).cache_purged,
+        );
     }
 
     page.declare(&PROXY_CACHE_BYTES);

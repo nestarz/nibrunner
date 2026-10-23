@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,14 +11,15 @@ use http_body_util::{BodyExt, Empty, Full};
 use http_cache_semantics::{AfterResponse, BeforeRequest, CacheOptions, CachePolicy};
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH,
-    CONTENT_LOCATION, CONTENT_RANGE, DATE, ETAG, EXPIRES, HOST, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-    IF_RANGE, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, PRAGMA, RANGE, SET_COOKIE, TRANSFER_ENCODING,
-    UPGRADE, VARY,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_LOCATION, CONTENT_RANGE, DATE, ETAG, EXPIRES, HOST, IF_MATCH, IF_MODIFIED_SINCE,
+    IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, PRAGMA, RANGE, SET_COOKIE,
+    TRANSFER_ENCODING, UPGRADE, VARY,
 };
 use hyper::http::{request, response};
 use hyper::{Method, Request, Response, StatusCode};
-use protocol::DeploymentId;
+use moka::ops::compute::{CompResult, Op};
+use protocol::{AppId, DeploymentId, InstanceLabels};
 
 use crate::adapters::proxy::encode::{self, Encoding};
 use crate::adapters::proxy::forward::{ProxyBody, Unreachable};
@@ -65,9 +67,49 @@ struct Windows {
     if_error: Duration,
 }
 
-fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
+// RFC 9213's field for every CDN, which Deno Deploy's cache reads too: Autokit sends its pages
+// `cache-control: public, max-age=0, must-revalidate` for the browser beside
+// `cdn-cache-control: public, s-maxage=86400, stale-while-revalidate=60, stale-if-error=86400`.
+const CDN_CACHE_CONTROL: HeaderName = HeaderName::from_static("cdn-cache-control");
+
+fn targeted(headers: &HeaderMap) -> bool {
     headers
-        .get_all(CACHE_CONTROL)
+        .get_all(CDN_CACHE_CONTROL)
+        .iter()
+        .any(|value| !value.as_bytes().trim_ascii().is_empty())
+}
+
+/// The fields a shared cache reads its policy from. A response with `CDN-Cache-Control` is read by
+/// it alone, `Cache-Control` and `Expires` left to the browser (RFC 9213 §2.1); one without is
+/// read as it came.
+fn governing(headers: &HeaderMap) -> HeaderMap {
+    let mut governing = headers.clone();
+    if targeted(headers) {
+        governing.remove(CACHE_CONTROL);
+        governing.remove(EXPIRES);
+        for value in headers.get_all(CDN_CACHE_CONTROL) {
+            governing.append(CACHE_CONTROL, value.clone());
+        }
+    }
+    governing
+}
+
+/// A response with `headers` as the policy reads it.
+fn governed(status: StatusCode, headers: &HeaderMap) -> Response<()> {
+    let mut governed = Response::new(());
+    *governed.status_mut() = status;
+    *governed.headers_mut() = governing(headers);
+    governed
+}
+
+fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
+    let field = if targeted(headers) {
+        CDN_CACHE_CONTROL
+    } else {
+        CACHE_CONTROL
+    };
+    headers
+        .get_all(field)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
@@ -93,13 +135,16 @@ fn seconds(directives: &[(String, Option<String>)], name: &str) -> Duration {
 }
 
 impl Windows {
-    // RFC 9111 §4.2.4: these four forbid a shared cache from ever giving a stale answer.
+    // RFC 9111 §4.2.4: these four forbid a shared cache from ever giving a stale answer. The
+    // `s-maxage` among them is `Cache-Control`'s: in `CDN-Cache-Control` it is only the lifetime.
     fn of(headers: &HeaderMap) -> Self {
         let directives = directives(headers);
-        if ["no-cache", "must-revalidate", "proxy-revalidate", "s-maxage"]
-            .iter()
-            .any(|forbidding| says(&directives, forbidding))
-        {
+        let forbidding: &[&str] = if targeted(headers) {
+            &["no-cache", "must-revalidate", "proxy-revalidate"]
+        } else {
+            &["no-cache", "must-revalidate", "proxy-revalidate", "s-maxage"]
+        };
+        if forbidding.iter().any(|forbidding| says(&directives, forbidding)) {
             return Self::default();
         }
         Self {
@@ -201,9 +246,38 @@ impl Held {
     }
 }
 
+/// Whose answers an entry holds: the app a request was routed to, whose counters it moves, and
+/// the owner a purge names. Every timeline of an app shares its tags, so the owner is the `app`
+/// label a control plane gives each of them, and the app's own id when it gives none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Tenant {
+    app_id: AppId,
+    deployment_id: DeploymentId,
+    owner: Arc<str>,
+}
+
+impl Tenant {
+    pub(crate) fn of(app_id: &AppId, deployment_id: &DeploymentId, labels: &InstanceLabels) -> Self {
+        let owner = labels
+            .iter()
+            .find(|(key, _)| key.as_str() == "app")
+            .map_or(app_id.as_str(), |(_, app)| app.as_str());
+        Self {
+            app_id: app_id.clone(),
+            deployment_id: deployment_id.clone(),
+            owner: Arc::from(owner),
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+}
+
 /// A request the cache may answer, read the way it keys and matches.
 pub(crate) struct Asked {
     key: Key,
+    tenant: Tenant,
     head: bool,
     visitor: request::Parts,
     canonical: request::Parts,
@@ -212,12 +286,7 @@ pub(crate) struct Asked {
 
 impl Asked {
     /// `visitor`'s `Accept-Encoding` already says the one coding it was given.
-    pub(crate) fn new(
-        visitor: request::Parts,
-        deployment_id: DeploymentId,
-        authority: &str,
-        encoding: Encoding,
-    ) -> Self {
+    pub(crate) fn new(visitor: request::Parts, tenant: Tenant, authority: &str, encoding: Encoding) -> Self {
         let target = visitor
             .uri
             .path_and_query()
@@ -244,11 +313,12 @@ impl Asked {
         encode::as_negotiated(&mut canonical.headers, encoding);
         Self {
             key: Key {
-                deployment_id,
+                deployment_id: tenant.deployment_id.clone(),
                 authority: authority.to_string(),
                 target,
                 encoding,
             },
+            tenant,
             head: visitor.method == Method::HEAD,
             held: Held::of(&visitor.headers),
             visitor,
@@ -314,6 +384,7 @@ pub(crate) struct Stored {
     windows: Windows,
     fresh_until: SystemTime,
     revalidating: AtomicBool,
+    tags: Vec<Box<str>>,
     weight: u32,
 }
 
@@ -387,9 +458,103 @@ impl Stored {
     }
 }
 
-/// Every answer stored under one key, one per `Vary` variant, newest first.
+const CACHE_TAG: HeaderName = HeaderName::from_static("cache-tag");
+const SURROGATE_KEY: HeaderName = HeaderName::from_static("surrogate-key");
+const MOST_TAGS: usize = 128;
+const LONGEST_TAG: usize = 1024;
+// What one tag of one key costs in the index beside the tag and the key themselves.
+const INDEX_ENTRY_OVERHEAD: usize = 64;
+
+/// What a purge may name a stored answer by: `Cache-Tag`, comma separated as Deno Deploy and
+/// Cloudflare read it, and `Surrogate-Key`, space separated as Fastly does. None for an answer
+/// with more tags, or longer ones, than the index holds, or one it cannot read: no purge could be
+/// trusted to reach it.
+fn tags_of(headers: &HeaderMap) -> Option<Vec<Box<str>>> {
+    let mut tags: Vec<Box<str>> = Vec::new();
+    for (name, separator) in [(CACHE_TAG, ','), (SURROGATE_KEY, ' ')] {
+        for value in headers.get_all(name) {
+            let listed = value.to_str().ok()?.split(separator).map(str::trim);
+            tags.extend(listed.filter(|tag| !tag.is_empty()).map(Box::from));
+        }
+    }
+    tags.sort_unstable();
+    tags.dedup();
+    (tags.len() <= MOST_TAGS && tags.iter().all(|tag| tag.len() <= LONGEST_TAG)).then_some(tags)
+}
+
+type Generation = u64;
+
+/// The keys each tag of each owner is stored under, so a purge finds them without a scan. A key is
+/// held with the generation of the variants that put it there: the eviction of those variants, or
+/// their replacement by newer ones, then takes away only what they put.
+#[derive(Default)]
+struct TagIndex(HashMap<Arc<str>, HashMap<Box<str>, HashMap<Key, Generation>>>);
+
+impl TagIndex {
+    fn add(&mut self, key: &Key, variants: &Variants) {
+        if variants.tags.is_empty() {
+            return;
+        }
+        let owned = self.0.entry(variants.tenant.owner.clone()).or_default();
+        for tag in &variants.tags {
+            owned
+                .entry(tag.clone())
+                .or_default()
+                .insert(key.clone(), variants.generation);
+        }
+    }
+
+    fn forget(&mut self, key: &Key, variants: &Variants) {
+        let Some(owned) = self.0.get_mut(&variants.tenant.owner) else {
+            return;
+        };
+        for tag in &variants.tags {
+            if let Some(keys) = owned.get_mut(tag) {
+                if keys.get(key) == Some(&variants.generation) {
+                    keys.remove(key);
+                }
+                if keys.is_empty() {
+                    owned.remove(tag);
+                }
+            }
+        }
+        if owned.is_empty() {
+            self.0.remove(&variants.tenant.owner);
+        }
+    }
+
+    /// Every key `owner` stored under any of `tags`, each with the newest generation that put it
+    /// there, taken out of the index.
+    fn take(&mut self, owner: &str, tags: &[String]) -> HashMap<Key, Generation> {
+        let Some(owned) = self.0.get_mut(owner) else {
+            return HashMap::new();
+        };
+        let mut taken: HashMap<Key, Generation> = HashMap::new();
+        for (key, generation) in tags.iter().filter_map(|tag| owned.remove(tag.as_str())).flatten() {
+            let newest = taken.entry(key).or_insert(generation);
+            *newest = (*newest).max(generation);
+        }
+        if owned.is_empty() {
+            self.0.remove(owner);
+        }
+        taken
+    }
+}
+
+fn index_weight(key: &Key, tags: &[Box<str>]) -> usize {
+    let key_weight = key.deployment_id.as_str().len() + key.authority.len() + key.target.len();
+    tags.iter()
+        .map(|tag| tag.len() + key_weight + INDEX_ENTRY_OVERHEAD)
+        .sum()
+}
+
+/// Every answer stored under one key, one per `Vary` variant, newest first, and the tags any of
+/// them carries.
 pub(crate) struct Variants {
     stored: Vec<Arc<Stored>>,
+    tenant: Tenant,
+    tags: Vec<Box<str>>,
+    generation: Generation,
     lifetime: Duration,
     weight: u32,
 }
@@ -425,6 +590,39 @@ enum Revalidated {
     Unmatched,
 }
 
+/// On an answer the cache is keeping as it passes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Kept;
+
+const CACHE_STATUS: HeaderName = HeaderName::from_static("cache-status");
+
+/// RFC 9211's account of what the cache called `name` did, added after any an app behind it gave.
+/// Spelled as Deno Deploy's cache spells the same outcomes for the same Autokit pages:
+/// `deno; hit`, `deno; fwd=miss; stored`, `deno; fwd=bypass; detail=not-cacheable`.
+pub(crate) fn report(response: &mut Response<ProxyBody>, name: &str, outcome: CacheOutcome) {
+    let status = match outcome {
+        CacheOutcome::Hit => format!("{name}; hit"),
+        CacheOutcome::Stale => format!("{name}; hit; detail=stale"),
+        CacheOutcome::Revalidated => format!("{name}; fwd=stale; fwd-status=304"),
+        CacheOutcome::Miss if response.extensions().get::<Kept>().is_some() => {
+            format!("{name}; fwd=miss; stored")
+        }
+        CacheOutcome::Miss => format!("{name}; fwd=miss"),
+        CacheOutcome::Bypass => format!("{name}; fwd=bypass"),
+    };
+    let status = match response
+        .headers()
+        .get(CACHE_STATUS)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(behind) => format!("{behind}, {status}"),
+        None => status,
+    };
+    if let Ok(status) = HeaderValue::from_str(&status) {
+        response.headers_mut().insert(CACHE_STATUS, status);
+    }
+}
+
 /// What the cache answered, and how.
 pub(crate) struct Answered {
     pub(crate) response: Response<ProxyBody>,
@@ -433,9 +631,15 @@ pub(crate) struct Answered {
 
 pub(crate) struct ResponseCache {
     entries: moka::future::Cache<Key, Arc<Variants>>,
+    tags: Arc<Mutex<TagIndex>>,
+    generations: AtomicU64,
     max_entry_bytes: usize,
     clock: Clock,
     metrics: Arc<HostMetrics>,
+}
+
+fn locked(tags: &Mutex<TagIndex>) -> std::sync::MutexGuard<'_, TagIndex> {
+    tags.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn failed(response: &Response<ProxyBody>) -> bool {
@@ -444,17 +648,26 @@ fn failed(response: &Response<ProxyBody>) -> bool {
 
 fn explicit_lifetime(headers: &HeaderMap) -> bool {
     let directives = directives(headers);
-    says(&directives, "s-maxage") || says(&directives, "max-age") || headers.contains_key(EXPIRES)
+    says(&directives, "s-maxage")
+        || says(&directives, "max-age")
+        || (!targeted(headers) && headers.contains_key(EXPIRES))
 }
 
 impl ResponseCache {
     pub(crate) fn new(settings: &HttpCache, clock: Clock, metrics: Arc<HostMetrics>) -> Arc<Self> {
+        let tags = Arc::new(Mutex::new(TagIndex::default()));
+        let forgetting = tags.clone();
         Arc::new(Self {
             entries: moka::future::Cache::builder()
                 .max_capacity(u64::from(settings.memory_mib.get()) * BYTES_PER_MIB)
                 .weigher(|_, variants: &Arc<Variants>| variants.weight)
                 .expire_after(UntilTheLastVariantExpires)
+                .eviction_listener(move |key, variants: Arc<Variants>, _| {
+                    locked(&forgetting).forget(&key, &variants);
+                })
                 .build(),
+            tags,
+            generations: AtomicU64::new(0),
             max_entry_bytes: usize::try_from(settings.max_entry_kib.get())
                 .unwrap_or(usize::MAX)
                 .saturating_mul(BYTES_PER_KIB),
@@ -597,7 +810,10 @@ impl ResponseCache {
         };
         let origin_again = origin.clone();
         match self.revalidated(&asked, &stored, revalidation, origin).await {
-            Revalidated::Refreshed(refreshed) => miss(refreshed.serve(&asked, (self.clock)(), false)),
+            Revalidated::Refreshed(refreshed) => Answered {
+                response: refreshed.serve(&asked, (self.clock)(), false),
+                outcome: CacheOutcome::Revalidated,
+            },
             Revalidated::Replaced(response) => miss(response),
             Revalidated::Unmatched => self.miss(asked, origin_again).await,
             Revalidated::Failed(response) => {
@@ -637,6 +853,9 @@ impl ResponseCache {
                     .policy
                     .after_response(&revalidation, &response, requested_at)
             {
+                // The policy's own refresh is of the fields it reads, which for a response with
+                // `CDN-Cache-Control` are not the ones the browser is given.
+                refreshed.headers = refreshed_as_served(&stored.headers, response.headers());
                 if stored.provenance.recoded {
                     encode::as_encoded(&mut refreshed.headers, stored.encoding);
                 }
@@ -654,8 +873,14 @@ impl ResponseCache {
                     now,
                 ) {
                     let refreshed = Arc::new(refreshed);
-                    self.keep(asked.key.clone(), &asked.canonical, refreshed.clone(), now)
-                        .await;
+                    self.keep(
+                        asked.key.clone(),
+                        &asked.tenant,
+                        &asked.canonical,
+                        refreshed.clone(),
+                        now,
+                    )
+                    .await;
                     return Revalidated::Refreshed(refreshed);
                 }
             }
@@ -707,17 +932,21 @@ impl ResponseCache {
         now: SystemTime,
     ) -> Option<Stored> {
         let encoding = Encoding::of(&response.headers)?;
+        let tags = tags_of(&response.headers)?;
         // Given the time the request left rather than the time the answer came, the crate's
         // `age_value + resident_time` is RFC 9111 §4.2.3's `age_value + response_delay +
         // resident_time`, without the apparent age a skewed `Date` would add.
-        let policy = CachePolicy::new_options(canonical, &response, requested_at, options());
-        let shared_with_cookies =
-            response.headers.contains_key(SET_COOKIE) && !says(&directives(&response.headers), "public");
+        let policy = CachePolicy::new_options(
+            canonical,
+            &governed(response.status, &response.headers),
+            requested_at,
+            options(),
+        );
         let windows = Windows::of(&response.headers);
         let fresh_until = now + policy.time_to_live(now);
         let storable = policy.is_storable()
             && explicit_lifetime(&response.headers)
-            && !shared_with_cookies
+            && !response.headers.contains_key(SET_COOKIE)
             && !response.headers.contains_key(CONTENT_RANGE)
             && response.status != StatusCode::PARTIAL_CONTENT
             && body.len() <= self.max_entry_bytes
@@ -727,8 +956,16 @@ impl ResponseCache {
         }
         response.headers.remove(hyper::header::CONNECTION);
         let kept = matched_by(canonical, &response.headers);
-        let policy = CachePolicy::new_options(&kept, &response, requested_at, options());
-        let weight = weight_of(&response.headers) * 2 + weight_of(&kept.headers) + body.len();
+        let policy = CachePolicy::new_options(
+            &kept,
+            &governed(response.status, &response.headers),
+            requested_at,
+            options(),
+        );
+        let weight = weight_of(&response.headers) * 2
+            + weight_of(&kept.headers)
+            + body.len()
+            + tags.iter().map(|tag| tag.len()).sum::<usize>();
         Some(Stored {
             policy,
             status: response.status,
@@ -739,11 +976,19 @@ impl ResponseCache {
             windows,
             fresh_until,
             revalidating: AtomicBool::new(false),
+            tags,
             weight: u32::try_from(weight).unwrap_or(u32::MAX),
         })
     }
 
-    async fn keep(&self, key: Key, canonical: &request::Parts, stored: Arc<Stored>, now: SystemTime) {
+    async fn keep(
+        &self,
+        key: Key,
+        tenant: &Tenant,
+        canonical: &request::Parts,
+        stored: Arc<Stored>,
+        now: SystemTime,
+    ) {
         let others = self
             .entries
             .get(&key)
@@ -761,7 +1006,11 @@ impl ResponseCache {
             .chain(others)
             .take(MOST_VARIANTS)
             .collect();
-        let variants = Variants {
+        let mut tags: Vec<Box<str>> = stored.iter().flat_map(|stored| stored.tags.clone()).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        let indexed = u32::try_from(index_weight(&key, &tags)).unwrap_or(u32::MAX);
+        let variants = Arc::new(Variants {
             lifetime: stored
                 .iter()
                 .map(|stored| stored.lifetime(now))
@@ -769,11 +1018,47 @@ impl ResponseCache {
                 .unwrap_or_default(),
             weight: stored
                 .iter()
-                .fold(0u32, |weight, stored| weight.saturating_add(stored.weight)),
+                .fold(indexed, |weight, stored| weight.saturating_add(stored.weight)),
             stored,
-        };
-        self.entries.insert(key, Arc::new(variants)).await;
+            tenant: tenant.clone(),
+            tags,
+            generation: self.generations.fetch_add(1, Ordering::Relaxed),
+        });
+        // Indexed under the key's own lock, so a purge that finds it in the index waits for it to
+        // be there to remove.
+        let index = self.tags.clone();
+        self.entries
+            .entry(key.clone())
+            .and_compute_with(|_| {
+                locked(&index).add(&key, &variants);
+                std::future::ready(Op::Put(variants))
+            })
+            .await;
         self.weighed().await;
+    }
+
+    /// A purge: every entry `owner` stored under one of `tags` removed, and how many there were.
+    pub(crate) async fn purge(&self, owner: &str, tags: &[String]) -> usize {
+        let taken = locked(&self.tags).take(owner, tags);
+        let mut purged = 0;
+        for (key, generation) in taken {
+            let removed = self
+                .entries
+                .entry(key)
+                .and_compute_with(|held| {
+                    std::future::ready(match held {
+                        Some(held) if held.value().generation == generation => Op::Remove,
+                        _ => Op::Nop,
+                    })
+                })
+                .await;
+            if let CompResult::Removed(entry) = removed {
+                self.metrics.proxy.purged(&entry.value().tenant.app_id);
+                purged += 1;
+            }
+        }
+        self.weighed().await;
+        purged
     }
 
     /// `response` on its way to the visitor, its body copied aside as it passes and stored once it
@@ -790,16 +1075,27 @@ impl ResponseCache {
         {
             return response;
         }
-        let probe = CachePolicy::new_options(&asked.canonical, &response, requested_at, options());
-        if !probe.is_storable() || !explicit_lifetime(response.headers()) {
+        let probe = CachePolicy::new_options(
+            &asked.canonical,
+            &governed(response.status(), response.headers()),
+            requested_at,
+            options(),
+        );
+        if !probe.is_storable()
+            || !explicit_lifetime(response.headers())
+            || response.headers().contains_key(SET_COOKIE)
+            || tags_of(response.headers()).is_none()
+        {
             return response;
         }
-        let (parts, body) = response.into_parts();
+        let (mut parts, body) = response.into_parts();
+        parts.extensions.insert(Kept);
         let headers = parts.headers.clone();
         let status = parts.status;
         let provenance = Provenance::of(&parts);
         let cache = self.clone();
         let key = asked.key.clone();
+        let tenant = asked.tenant.clone();
         let canonical = asked.canonical.clone();
         let kept = Tee::new(body, self.max_entry_bytes, move |body: Bytes| {
             tokio::spawn(async move {
@@ -813,12 +1109,28 @@ impl ResponseCache {
                 let (response, ()) = response.into_parts();
                 if let Some(stored) = cache.stored(&canonical, response, body, provenance, requested_at, now)
                 {
-                    cache.keep(key, &canonical, Arc::new(stored), now).await;
+                    cache.keep(key, &tenant, &canonical, Arc::new(stored), now).await;
                 }
             });
         });
         Response::from_parts(parts, kept.boxed())
     }
+}
+
+/// What a 304 makes of the headers a stored answer is served with: each field it carries replaces
+/// the stored one, but for those that describe a body it did not send (RFC 9111 §3.2).
+fn refreshed_as_served(served: &HeaderMap, not_modified: &HeaderMap) -> HeaderMap {
+    let mut refreshed = served.clone();
+    for name in not_modified.keys() {
+        if [CONTENT_LENGTH, CONTENT_ENCODING, TRANSFER_ENCODING, CONTENT_RANGE].contains(name) {
+            continue;
+        }
+        refreshed.remove(name);
+        for value in not_modified.get_all(name) {
+            refreshed.append(name.clone(), value.clone());
+        }
+    }
+    refreshed
 }
 
 /// The request a stored answer is matched by: the host, the coding, and what its `Vary` names,
@@ -1054,6 +1366,14 @@ mod tests {
         )
     }
 
+    fn tenant(deployment: &str) -> Tenant {
+        Tenant::of(
+            &AppId::parse("app-1").unwrap(),
+            &DeploymentId::parse(deployment).unwrap(),
+            &InstanceLabels::default(),
+        )
+    }
+
     fn asked_with(method: Method, path: &str, deployment: &str, headers: &[(&str, &str)]) -> Asked {
         let mut builder = Request::builder().method(method).uri(path);
         for (name, value) in headers {
@@ -1062,12 +1382,7 @@ mod tests {
         let (mut parts, ()) = builder.body(()).unwrap().into_parts();
         let encoding = encode::negotiate(&parts.headers, &both().encodings);
         encode::as_negotiated(&mut parts.headers, encoding);
-        Asked::new(
-            parts,
-            DeploymentId::parse(deployment).unwrap(),
-            "app-1.apps.example.com",
-            encoding,
-        )
+        Asked::new(parts, tenant(deployment), "app-1.apps.example.com", encoding)
     }
 
     fn asked(accept_encoding: &str) -> Asked {
@@ -1154,7 +1469,7 @@ mod tests {
                     ("cache-control", "public, max-age=60"),
                     ("set-cookie", "theme=dark"),
                 ],
-                true,
+                false,
             ),
             (&[("cache-control", "max-age=0")], false),
         ];
@@ -1432,7 +1747,7 @@ mod tests {
         sent(&cache, asked("br"), &app).await;
         hands.forward(Duration::from_secs(61));
         let (revalidated, outcome, body) = sent(&cache, asked("br"), &app).await;
-        assert_eq!((outcome, app.woken()), (CacheOutcome::Miss, 2));
+        assert_eq!((outcome, app.woken()), (CacheOutcome::Revalidated, 2));
         assert_eq!(revalidated.status(), StatusCode::OK);
         assert_eq!(inflated(body, Encoding::Br).await, page());
         assert_eq!(sent(&cache, asked("br"), &app).await.1, CacheOutcome::Hit);
@@ -1667,7 +1982,7 @@ mod tests {
             encode::as_negotiated(&mut parts.headers, Encoding::Identity);
             Asked::new(
                 parts,
-                DeploymentId::parse("dep-1").unwrap(),
+                tenant("dep-1"),
                 "app-1.apps.example.com",
                 Encoding::Identity,
             )
@@ -1721,5 +2036,376 @@ mod tests {
         let into = kept.clone();
         let _tee = Tee::new(empty(), 16, move |body| *into.lock().unwrap() = Some(body));
         assert_eq!(*kept.lock().unwrap(), Some(Bytes::new()));
+    }
+
+    // Autokit's pages as Deno Deploy served them on 2026-10-23.
+    const FOR_THE_BROWSER: &str = "public, max-age=0, must-revalidate";
+    const FOR_THE_CDN: &str = "public, s-maxage=86400, stale-while-revalidate=60, stale-if-error=86400";
+
+    fn autokit(tags: &'static str) -> impl Fn(&request::Parts) -> Response<ProxyBody> + Send + Sync {
+        move |_| {
+            answer(
+                &[
+                    ("content-type", "text/html"),
+                    ("cache-control", FOR_THE_BROWSER),
+                    ("cdn-cache-control", FOR_THE_CDN),
+                    ("cache-tag", tags),
+                    ("etag", "\"v1\""),
+                ],
+                page(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn cdn_cache_control_decides_what_is_stored_and_for_how_long_and_the_browser_keeps_its_own() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(autokit("t:page"));
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(3_600));
+        let (hit, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!((outcome, app.woken()), (CacheOutcome::Hit, 1));
+        assert_eq!(hit.headers()[AGE], "3600");
+        assert_eq!(hit.headers()[CACHE_CONTROL], FOR_THE_BROWSER);
+        assert_eq!(hit.headers()[CDN_CACHE_CONTROL], FOR_THE_CDN);
+        assert_eq!(hit.headers()[CACHE_TAG], "t:page");
+
+        hands.forward(Duration::from_secs(86_400 - 3_600 + 30));
+        let (_, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(
+            outcome,
+            CacheOutcome::Stale,
+            "the browser's must-revalidate is not the cache's"
+        );
+
+        let canonical = asked("identity").canonical;
+        let storable = |headers: &[(&str, &str)]| {
+            let (parts, _) = answer(headers, Bytes::from_static(b"x")).into_parts();
+            cache
+                .stored(
+                    &canonical,
+                    parts,
+                    Bytes::from_static(b"x"),
+                    Provenance::default(),
+                    hands.now(),
+                    hands.now(),
+                )
+                .is_some()
+        };
+        let table: [(&[(&str, &str)], bool); 5] = [
+            (
+                &[
+                    ("cache-control", FOR_THE_BROWSER),
+                    ("cdn-cache-control", FOR_THE_CDN),
+                ],
+                true,
+            ),
+            (
+                &[
+                    ("cache-control", "no-store"),
+                    ("cdn-cache-control", "s-maxage=60"),
+                ],
+                true,
+            ),
+            (
+                &[
+                    ("cache-control", "public, max-age=60"),
+                    ("cdn-cache-control", "no-store"),
+                ],
+                false,
+            ),
+            (
+                &[
+                    ("cache-control", "public, max-age=60"),
+                    ("cdn-cache-control", "private"),
+                ],
+                false,
+            ),
+            (
+                &[
+                    ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+                    ("cdn-cache-control", "public"),
+                ],
+                false,
+            ),
+        ];
+        for (headers, expected) in table {
+            assert_eq!(storable(headers), expected, "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn s_maxage_forbids_stale_answers_only_in_cache_control() {
+        let windows = |headers: &[(&str, &str)]| {
+            let (parts, _) = answer(headers, Bytes::new()).into_parts();
+            Windows::of(&parts.headers)
+        };
+        assert_eq!(
+            windows(&[("cache-control", "s-maxage=60, stale-while-revalidate=30")]),
+            Windows::default()
+        );
+        assert_eq!(
+            windows(&[(
+                "cache-control",
+                "max-age=60, stale-while-revalidate=30, stale-if-error=90"
+            )]),
+            Windows {
+                while_revalidating: Duration::from_secs(30),
+                if_error: Duration::from_secs(90),
+            }
+        );
+        assert_eq!(
+            windows(&[
+                ("cache-control", "max-age=60, stale-while-revalidate=5"),
+                ("cdn-cache-control", "s-maxage=60, stale-while-revalidate=30"),
+            ]),
+            Windows {
+                while_revalidating: Duration::from_secs(30),
+                if_error: Duration::ZERO,
+            }
+        );
+        assert_eq!(
+            windows(&[
+                ("cache-control", "max-age=60, stale-while-revalidate=30"),
+                ("cdn-cache-control", "max-age=60, must-revalidate"),
+            ]),
+            Windows::default()
+        );
+    }
+
+    #[test]
+    fn tags_are_read_from_cache_tag_and_surrogate_key_and_an_answer_with_too_many_has_none() {
+        let tags = |headers: &[(&str, &str)]| {
+            let (parts, _) = answer(headers, Bytes::new()).into_parts();
+            tags_of(&parts.headers).map(|tags| tags.iter().map(|tag| tag.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            tags(&[
+                ("cache-tag", "t:page, t:price list,t:page"),
+                ("surrogate-key", "s:a  s:b"),
+                ("cache-tag", "t:other"),
+            ]),
+            Some(vec![
+                "s:a".to_string(),
+                "s:b".to_string(),
+                "t:other".to_string(),
+                "t:page".to_string(),
+                "t:price list".to_string(),
+            ])
+        );
+        assert_eq!(tags(&[]), Some(vec![]));
+        let most = (0..MOST_TAGS)
+            .map(|n| format!("t:{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            tags(&[("cache-tag", &most)]).map(|tags| tags.len()),
+            Some(MOST_TAGS)
+        );
+        let one_more = format!("{most},t:one-more");
+        assert_eq!(tags(&[("cache-tag", &one_more)]), None);
+        let longest = "t".repeat(LONGEST_TAG);
+        assert!(tags(&[("cache-tag", &longest)]).is_some());
+        assert_eq!(tags(&[("cache-tag", &format!("{longest}t"))]), None);
+
+        let mut unreadable = HeaderMap::new();
+        unreadable.insert(CACHE_TAG, HeaderValue::from_bytes(b"t:\xff").unwrap());
+        assert_eq!(tags_of(&unreadable), None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_whose_tags_no_purge_could_be_trusted_to_reach_is_not_stored() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|_| {
+            let tags = (0..=MOST_TAGS)
+                .map(|n| format!("t:{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            answer(
+                &[("cache-control", "public, max-age=60"), ("cache-tag", &tags)],
+                page(),
+            )
+        });
+        sent(&cache, asked("br"), &app).await;
+        assert_eq!(sent(&cache, asked("br"), &app).await.1, CacheOutcome::Miss);
+    }
+
+    fn tenant_labelled(app_id: &str, deployment: &str, app_label: Option<&str>) -> Tenant {
+        let labels = app_label.map_or_else(|| serde_json::json!({}), |app| serde_json::json!({ "app": app }));
+        Tenant::of(
+            &AppId::parse(app_id).unwrap(),
+            &DeploymentId::parse(deployment).unwrap(),
+            &serde_json::from_value(labels).unwrap(),
+        )
+    }
+
+    fn asked_by(tenant: Tenant, path: &str) -> Asked {
+        let (mut parts, ()) = Request::builder()
+            .uri(path)
+            .header(ACCEPT_ENCODING, "br")
+            .body(())
+            .unwrap()
+            .into_parts();
+        encode::as_negotiated(&mut parts.headers, Encoding::Br);
+        Asked::new(parts, tenant, "app-1.apps.example.com", Encoding::Br)
+    }
+
+    fn tagged_by_path() -> Arc<App> {
+        App::answering(|parts| {
+            let tags = match parts.uri.path() {
+                "/a" => "t:a, t:all",
+                "/b" => "t:b, t:all",
+                _ => "t:c",
+            };
+            answer(
+                &[("cache-control", "public, max-age=600"), ("cache-tag", tags)],
+                page(),
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_purge_removes_every_answer_its_owner_tagged_and_nothing_of_anyone_else() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = tagged_by_path();
+        let production = || tenant_labelled("shop-prod", "dep-1", Some("shop"));
+        let preview = || tenant_labelled("shop-preview", "dep-2", Some("shop"));
+        let other = || tenant_labelled("other", "dep-3", None);
+        let all = [
+            (production(), "/a"),
+            (production(), "/b"),
+            (production(), "/c"),
+            (preview(), "/a"),
+            (other(), "/a"),
+        ];
+        for (tenant, path) in all.clone() {
+            sent(&cache, asked_by(tenant, path), &app).await;
+        }
+        assert_eq!(cache.purge("shop", &["t:a".to_string()]).await, 2);
+        assert_eq!(cache.purge("shop", &["t:a".to_string()]).await, 0, "already gone");
+        assert_eq!(
+            cache.purge("shop-prod", &["t:b".to_string()]).await,
+            0,
+            "the owner is the label"
+        );
+        assert_eq!(cache.purge("nobody", &["t:all".to_string()]).await, 0);
+        let mut outcomes = Vec::new();
+        for (tenant, path) in all {
+            outcomes.push(sent(&cache, asked_by(tenant, path), &app).await.1);
+        }
+        use CacheOutcome::{Hit, Miss};
+        assert_eq!(outcomes, [Miss, Hit, Hit, Miss, Hit]);
+        assert_eq!(
+            cache
+                .purge(
+                    "shop",
+                    &["t:all".to_string(), "t:c".to_string(), "t:b".to_string()]
+                )
+                .await,
+            4,
+            "each entry once, however many of its tags are named"
+        );
+        assert_eq!(cache.purge("other", &["t:a".to_string()]).await, 1);
+        assert_eq!(cache.entries.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tag_leaves_the_index_with_the_answer_that_carried_it() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let answers = Arc::new(AtomicUsize::new(0));
+        let counted = answers.clone();
+        let app = App::answering(move |_| {
+            let tag = match counted.fetch_add(1, Ordering::SeqCst) {
+                0 => "t:first",
+                _ => "t:second",
+            };
+            answer(
+                &[("cache-control", "public, max-age=60"), ("cache-tag", tag)],
+                page(),
+            )
+        });
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(61));
+        assert_eq!(sent(&cache, asked("br"), &app).await.1, CacheOutcome::Miss);
+        settled(&cache).await;
+        assert_eq!(
+            cache.purge("app-1", &["t:first".to_string()]).await,
+            0,
+            "the answer that carried it was replaced"
+        );
+        assert_eq!(sent(&cache, asked("br"), &app).await.1, CacheOutcome::Hit);
+
+        cache.entries.invalidate_all();
+        settled(&cache).await;
+        assert!(locked(&cache.tags).0.is_empty(), "evicted with its entry");
+        assert_eq!(cache.purge("app-1", &["t:second".to_string()]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_set_cookie_is_never_stored_whatever_the_app_says() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|_| {
+            answer(
+                &[
+                    ("cache-control", "public, max-age=60"),
+                    ("cdn-cache-control", "public, s-maxage=60"),
+                    ("set-cookie", "theme=dark"),
+                ],
+                page(),
+            )
+        });
+        let (first, _, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(
+            first.headers()[SET_COOKIE],
+            "theme=dark",
+            "the visitor still gets it"
+        );
+        let (_, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!((outcome, app.woken()), (CacheOutcome::Miss, 2));
+    }
+
+    fn reported(response: &mut Response<ProxyBody>, outcome: CacheOutcome) -> String {
+        report(response, "mf", outcome);
+        response.headers()[CACHE_STATUS].to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn cache_status_says_what_the_cache_did_as_deno_deploy_spells_it() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(autokit("t:page"));
+        let (mut stored, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(reported(&mut stored, outcome), "mf; fwd=miss; stored");
+        assert!(!stored.headers().contains_key(AGE));
+        hands.forward(Duration::from_secs(13));
+        let (mut hit, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(reported(&mut hit, outcome), "mf; hit");
+        assert_eq!(hit.headers()[AGE], "13");
+
+        let unstored = App::answering(html("no-store"));
+        let (mut passed, outcome, _) = sent(
+            &cache,
+            asked_with(Method::GET, "/private", "dep-1", &[("accept-encoding", "br")]),
+            &unstored,
+        )
+        .await;
+        assert_eq!(reported(&mut passed, outcome), "mf; fwd=miss");
+
+        let mut answered = answer(&[("cache-status", "deno; hit")], Bytes::new());
+        assert_eq!(
+            reported(&mut answered, CacheOutcome::Bypass),
+            "deno; hit, mf; fwd=bypass"
+        );
+        for (outcome, status) in [
+            (CacheOutcome::Stale, "mf; hit; detail=stale"),
+            (CacheOutcome::Revalidated, "mf; fwd=stale; fwd-status=304"),
+        ] {
+            assert_eq!(reported(&mut answer(&[], Bytes::new()), outcome), status);
+        }
     }
 }
