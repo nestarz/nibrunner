@@ -104,6 +104,13 @@ pub async fn apply_network(host: &Host) {
                 guest_ipv4: sender.guest_ipv4.into(),
             })
             .collect(),
+        proxy_tls_listener: host
+            .config
+            .proxy
+            .http
+            .as_ref()
+            .filter(|http| http.tls.is_some())
+            .map(|http| std::net::SocketAddr::new(http.listen_address, http.port)),
         allowed_host_tcp_endpoints: host.config.allowed_host_tcp_endpoints.clone(),
         allowed_egress_endpoints: host.config.allowed_egress_endpoints.clone(),
         denied_egress_addresses_v4: host.config.denied_egress_addresses_v4.clone(),

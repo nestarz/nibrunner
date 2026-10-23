@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use protocol::{AppId, GuestPort, HostPort, Ipv4Address};
 
@@ -96,6 +96,9 @@ pub struct FirewallState {
     pub instances: Vec<ForwardedInstance>,
     /// Every slot's guest, booting ones included: a runtime exports what it printed while starting.
     pub otlp_senders: Vec<OtlpSender>,
+    /// The host's own TLS proxy, which a guest reaches at one of the host's addresses, as any
+    /// visitor does: an app that calls its own or a neighbour's hostname, or purges the cache.
+    pub proxy_tls_listener: Option<SocketAddr>,
     pub denied_egress_addresses_v4: Vec<String>,
     pub denied_egress_addresses_v6: Vec<String>,
 }
@@ -333,8 +336,27 @@ fn input_chain(state: &FirewallState, ipv4: bool) -> Vec<String> {
             )
         }));
     }
+    rules.extend(own_proxy_rule(&tap, state.proxy_tls_listener, ipv4));
     rules.push(format!("iifname {tap} {DENY} comment \"guest to host\""));
     chain("input {", &rules)
+}
+
+// A packet a guest sends to any of this host's addresses arrives here rather than in forward,
+// public ones included. A proxy listening on every address is reached on all of them but the tap
+// addresses, which are the guest network's and stay closed to it.
+fn own_proxy_rule(tap: &str, listener: Option<SocketAddr>, ipv4: bool) -> Option<String> {
+    let listener = listener?;
+    let port = listener.port();
+    let addresses = match listener.ip() {
+        ip if ip.is_unspecified() && ipv4 => format!("fib daddr type local ip daddr != {GUEST_NETWORK_CIDR}"),
+        ip if ip.is_unspecified() => "fib daddr type local".to_string(),
+        IpAddr::V4(ip) if ipv4 => format!("ip daddr {ip}"),
+        IpAddr::V6(ip) if !ipv4 => format!("ip6 daddr {ip}"),
+        _ => return None,
+    };
+    Some(format!(
+        "iifname {tap} {addresses} tcp dport {port} accept comment \"this host's proxy\""
+    ))
 }
 
 fn forward_chain_v6(state: &FirewallState) -> Vec<String> {
@@ -450,6 +472,7 @@ mod tests {
         FirewallState {
             instances,
             otlp_senders: vec![],
+            proxy_tls_listener: None,
             allowed_host_tcp_endpoints: vec![],
             allowed_egress_endpoints: vec![],
             denied_egress_addresses_v4: v4.iter().map(|s| s.to_string()).collect(),
@@ -543,6 +566,59 @@ mod tests {
         assert!(!input_chain(&FirewallState::default(), true)
             .join("\n")
             .contains("otlp receiver"));
+    }
+
+    #[test]
+    fn a_guest_reaches_the_hosts_own_tls_proxy_at_its_addresses_but_not_at_its_tap_address() {
+        let mut configured = state(vec![], &["203.0.113.0/24"], &["2001:db8::/32"]);
+        configured.proxy_tls_listener = Some("0.0.0.0:443".parse().unwrap());
+        let expected = [
+            (true, "iifname \"nbr*\" fib daddr type local ip daddr != 10.201.0.0/16 tcp dport 443 accept comment \"this host's proxy\""),
+            (false, "iifname \"nbr*\" fib daddr type local tcp dport 443 accept comment \"this host's proxy\""),
+        ];
+        for (ipv4, allowed) in expected {
+            let rules = input_chain(&configured, ipv4);
+            let allow_at = rules.iter().position(|rule| rule.trim() == allowed).unwrap();
+            let position = |comment: &str| rules.iter().position(|rule| rule.contains(comment)).unwrap();
+            assert!(
+                position("denied egress") < allow_at,
+                "a denied address stays denied"
+            );
+            assert!(allow_at < position("guest to host"));
+            assert_eq!(
+                rules
+                    .iter()
+                    .filter(|rule| rule.contains("this host's proxy"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn a_proxy_on_one_address_is_reached_there_alone_and_only_in_its_family() {
+        let mut configured = state(vec![], &[], &[]);
+        let proxy_rules = |configured: &FirewallState, ipv4: bool| -> Vec<String> {
+            input_chain(configured, ipv4)
+                .into_iter()
+                .filter(|rule| rule.contains("this host's proxy"))
+                .map(|rule| rule.trim().to_string())
+                .collect()
+        };
+        configured.proxy_tls_listener = Some("203.0.113.10:8443".parse().unwrap());
+        assert_eq!(
+            proxy_rules(&configured, true),
+            ["iifname \"nbr*\" ip daddr 203.0.113.10 tcp dport 8443 accept comment \"this host's proxy\""]
+        );
+        assert!(proxy_rules(&configured, false).is_empty());
+        configured.proxy_tls_listener = Some("[2001:db8::10]:443".parse().unwrap());
+        assert!(proxy_rules(&configured, true).is_empty());
+        assert_eq!(
+            proxy_rules(&configured, false),
+            ["iifname \"nbr*\" ip6 daddr 2001:db8::10 tcp dport 443 accept comment \"this host's proxy\""]
+        );
+        configured.proxy_tls_listener = None;
+        assert!(!render_ruleset(&configured).contains("this host's proxy"));
     }
 
     #[test]

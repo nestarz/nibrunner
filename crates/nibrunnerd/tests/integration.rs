@@ -312,6 +312,7 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
             host_ipv4: protocol::Ipv4Address::parse("10.201.0.1").unwrap(),
             guest_ipv4: protocol::Ipv4Address::parse("10.201.0.2").unwrap(),
         }],
+        proxy_tls_listener: Some("0.0.0.0:443".parse().unwrap()),
         allowed_host_tcp_endpoints: vec![
             "203.0.113.10:443".parse().unwrap(),
             "[2001:db8::10]:443".parse().unwrap(),
@@ -338,6 +339,9 @@ async fn the_isolation_ruleset_loads_into_the_kernel() {
     assert!(held.contains("reject comment \"guest to guest\""));
     assert!(held.contains("reject comment \"guest to host\""));
     assert!(held.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
+    assert!(held
+        .lines()
+        .any(|line| line.contains("fib daddr type local") && line.contains("comment \"this host's proxy\"")));
     assert!(held
         .contains("ip saddr 10.201.0.2 ip daddr 10.201.0.1 tcp dport 4318 accept comment \"otlp receiver\""));
     assert!(held.contains("ip daddr 10.0.0.5 tcp dport 9000 accept comment \"allowed egress endpoint\""));

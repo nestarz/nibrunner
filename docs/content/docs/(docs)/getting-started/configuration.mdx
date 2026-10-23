@@ -72,8 +72,13 @@ must be outside the range `21000` to `21000 + 8 × max_apps − 1`. Port `0` is 
 
 ## Calling a public endpoint on this host
 
-Guests cannot initiate connections to their host by default. To let an app call an HTTPS
-edge on the same host, name only its public address and port:
+Guests cannot initiate connections to their host by default, with one exception. When
+`[proxy.http.tls]` is set, a guest can reach this host's own proxy on `proxy.http.port` at
+`proxy.http.listen_address`. With an unspecified listen address, that means any of the host's
+addresses outside the guest network `10.201.0.0/16`. An app can then call its own hostname, or
+another app's, when public DNS resolves it to this host.
+
+To let an app call another HTTPS edge on the same host, name only its public address and port:
 
 ```toml
 [network.host_tcp]
