@@ -20,6 +20,17 @@
     "hostId": {
       "$ref": "#/$defs/HostId"
     },
+    "httpCache": {
+      "description": "Absent, the response cache names itself `nibrunner` and no purge is served.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DesiredHttpCache"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "instances": {
       "type": "array",
       "items": {
@@ -154,6 +165,52 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$"
     },
+    "CacheName": {
+      "description": "a lowercase letter, then at most 31 lowercase letters, digits or `-`",
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "CachePeer": {
+      "description": "an https URL naming an IP address and optionally a port, without a path",
+      "type": "string",
+      "pattern": "^https://(\\[[0-9A-Fa-f:.]+\\]|[0-9.]+)(:[0-9]{1,5})?$"
+    },
+    "CachePurge": {
+      "description": "Where an app purges what the response cache holds of it, and the hosts a purge reaches.\n\n`POST https://<hostname><path>` with `authorization: Bearer v1.<owner>.<signature>`, the\nsignature `HMAC-SHA256(key, \"mf-cache-purge\\0\" || owner)` in unpadded base64url under any of\n`keys`, and `{\"tags\": [...]}`, removes every stored answer of `owner` carrying one of the tags:\nhere, then on every peer. `owner` is the `app` label of the instances it covers, or the app id\nof one without that label.",
+      "type": "object",
+      "properties": {
+        "hostname": {
+          "$ref": "#/$defs/Hostname"
+        },
+        "keys": {
+          "description": "Two while the key is being rotated, so a token signed under either is taken.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PurgeKey"
+          },
+          "maxItems": 4,
+          "minItems": 1
+        },
+        "path": {
+          "$ref": "#/$defs/PurgePath"
+        },
+        "peers": {
+          "description": "Every other host, each asked to purge too before the purge is answered.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CachePeer"
+          },
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "hostname",
+        "path",
+        "keys",
+        "peers"
+      ]
+    },
     "CheckpointId": {
       "description": "an identifier",
       "type": "string",
@@ -247,6 +304,22 @@
         "volumeId",
         "objectKey",
         "desiredState"
+      ]
+    },
+    "DesiredHttpCache": {
+      "description": "How the response cache of `[proxy.http.cache]` is shared: what it calls itself to visitors, and\nhow an app purges it across every host.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CacheName"
+        },
+        "purge": {
+          "$ref": "#/$defs/CachePurge"
+        }
+      },
+      "required": [
+        "name",
+        "purge"
       ]
     },
     "DesiredInstance": {
@@ -1024,6 +1097,17 @@
       "description": "lowercase letters, digits and dashes, starting with a letter",
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]{0,15}$"
+    },
+    "PurgeKey": {
+      "description": "32 bytes in padded standard base64",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
+    },
+    "PurgePath": {
+      "description": "an absolute path of at most 256 printable characters, without a query or fragment",
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^/[\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*$"
     },
     "RestartPolicy": {
       "type": "object",

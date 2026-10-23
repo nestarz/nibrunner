@@ -232,6 +232,49 @@ fn a_desired_state_round_trips_with_its_wire_names() {
     assert_eq!(written["volumes"][0]["initialContents"]["digest"], "c".repeat(64));
 }
 
+const PURGE_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+fn http_cache_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "mf",
+        "purge": {
+            "hostname": "apps.example.com",
+            "path": "/_mf/cache/purge",
+            "keys": [PURGE_KEY],
+            "peers": ["https://203.0.113.7", "https://[2001:db8::1]"]
+        }
+    })
+}
+
+#[test]
+fn a_shared_cache_names_its_purge_and_its_peers_by_address() {
+    let parsed: HostDesiredState = serde_json::from_value(desired_json()).expect("parses");
+    assert_eq!(parsed.http_cache, None);
+    assert!(serde_json::to_value(&parsed).unwrap().get("httpCache").is_none());
+
+    let mut document = desired_json();
+    document["httpCache"] = http_cache_json();
+    let parsed: HostDesiredState = serde_json::from_value(document.clone()).expect("parses");
+    let cache = parsed.http_cache.as_ref().expect("named");
+    assert_eq!(cache.name.as_str(), "mf");
+    assert_eq!(
+        cache
+            .purge
+            .peers
+            .iter()
+            .map(CachePeer::address)
+            .collect::<Vec<_>>(),
+        [
+            "203.0.113.7:443".parse::<std::net::SocketAddr>().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap()
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&parsed).unwrap()["httpCache"],
+        http_cache_json()
+    );
+}
+
 #[test]
 fn a_document_that_names_no_max_apps_leaves_the_host_to_its_configuration_and_writes_none_back() {
     let parsed: HostDesiredState = serde_json::from_value(desired_json()).expect("parses");
@@ -1483,6 +1526,51 @@ mod schema {
             ),
         ];
         for document in broken {
+            assert!(
+                serde_json::from_value::<HostDesiredState>(document.clone()).is_err(),
+                "the parser took {document}"
+            );
+            assert!(!validator.is_valid(&document), "the schema took {document}");
+        }
+    }
+
+    #[test]
+    fn the_http_cache_schema_and_parser_agree_on_what_a_purge_may_name() {
+        let validator = validator(crate::schema::desired_state());
+        let cached = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut document = desired_json();
+            document["httpCache"] = http_cache_json();
+            edit(&mut document["httpCache"]);
+            document
+        };
+        let accepted = [
+            cached(&|_| {}),
+            cached(&|cache| cache["purge"]["peers"] = serde_json::json!([])),
+            cached(&|cache| cache["purge"]["peers"] = serde_json::json!(["https://198.51.100.4:8443"])),
+            cached(&|cache| cache["purge"]["path"] = serde_json::json!("/")),
+        ];
+        for document in accepted {
+            serde_json::from_value::<HostDesiredState>(document.clone()).unwrap();
+            assert!(validator.is_valid(&document), "the schema refused {document}");
+        }
+        let key = || serde_json::json!(PURGE_KEY);
+        let refused = [
+            cached(&|cache| cache["purge"]["keys"] = serde_json::json!([])),
+            cached(&|cache| cache["purge"]["keys"] = serde_json::json!(vec![key(); MAX_PURGE_KEYS + 1])),
+            cached(&|cache| cache["purge"]["keys"] = serde_json::json!(["c2hvcnQ="])),
+            cached(&|cache| cache["purge"]["keys"] = serde_json::json!([format!("{}B=", &PURGE_KEY[..42])])),
+            cached(&|cache| cache["purge"]["peers"] = serde_json::json!(["https://apps.example.com"])),
+            cached(&|cache| cache["purge"]["peers"] = serde_json::json!(["http://203.0.113.7"])),
+            cached(&|cache| cache["purge"]["peers"] = serde_json::json!(["https://203.0.113.7/purge"])),
+            cached(&|cache| cache["purge"]["path"] = serde_json::json!("/_mf/cache/purge?now")),
+            cached(&|cache| cache["purge"]["path"] = serde_json::json!("_mf/cache/purge")),
+            cached(&|cache| cache["purge"]["hostname"] = serde_json::json!("localhost")),
+            cached(&|cache| cache["name"] = serde_json::json!("Not A Token")),
+            cached(&|cache| {
+                cache.as_object_mut().unwrap().remove("purge");
+            }),
+        ];
+        for document in refused {
             assert!(
                 serde_json::from_value::<HostDesiredState>(document.clone()).is_err(),
                 "the parser took {document}"

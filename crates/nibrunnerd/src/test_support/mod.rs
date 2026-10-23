@@ -286,6 +286,7 @@ pub fn desired_state(edit: impl FnOnce(&mut HostDesiredState)) -> HostDesiredSta
         instances: vec![],
         checkpoints: vec![],
         exports: vec![],
+        http_cache: None,
     };
     edit(&mut value);
     value

@@ -7,6 +7,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::*;
+use crate::http_cache::DesiredHttpCache;
 use crate::wire::*;
 
 /// The whole of an instance's activation policy.
@@ -761,6 +762,9 @@ pub struct HostDesiredState {
     pub instances: Vec<DesiredInstance>,
     pub checkpoints: Vec<DesiredCheckpoint>,
     pub exports: Vec<DesiredExport>,
+    /// Absent, the response cache names itself `nibrunner` and no purge is served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_cache: Option<DesiredHttpCache>,
 }
 
 // A hostname routes to one app, so a document that gives one to two would have the host pick
@@ -776,6 +780,8 @@ struct HostDesiredStateFields {
     instances: Vec<DesiredInstance>,
     checkpoints: Vec<DesiredCheckpoint>,
     exports: Vec<DesiredExport>,
+    #[serde(default)]
+    http_cache: Option<DesiredHttpCache>,
 }
 
 impl TryFrom<HostDesiredStateFields> for HostDesiredState {
@@ -796,6 +802,9 @@ impl TryFrom<HostDesiredStateFields> for HostDesiredState {
                 }
             }
         }
+        if let Some(http_cache) = &fields.http_cache {
+            http_cache.check()?;
+        }
         Ok(Self {
             host_id: fields.host_id,
             revision: fields.revision,
@@ -804,6 +813,7 @@ impl TryFrom<HostDesiredStateFields> for HostDesiredState {
             instances: fields.instances,
             checkpoints: fields.checkpoints,
             exports: fields.exports,
+            http_cache: fields.http_cache,
         })
     }
 }
