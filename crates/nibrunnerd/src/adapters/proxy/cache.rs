@@ -487,8 +487,10 @@ type Generation = u64;
 /// The keys each tag of each owner is stored under, so a purge finds them without a scan. A key is
 /// held with the generation of the variants that put it there: the eviction of those variants, or
 /// their replacement by newer ones, then takes away only what they put.
+type KeysOfTag = HashMap<Key, Generation>;
+
 #[derive(Default)]
-struct TagIndex(HashMap<Arc<str>, HashMap<Box<str>, HashMap<Key, Generation>>>);
+struct TagIndex(HashMap<Arc<str>, HashMap<Box<str>, KeysOfTag>>);
 
 impl TagIndex {
     fn add(&mut self, key: &Key, variants: &Variants) {
