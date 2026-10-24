@@ -1,6 +1,9 @@
+//! The cron vocabulary of both documents, and the schedule parser the host runs, so that a control
+//! plane refuses what the host would and computes the same next occurrence.
 #[cfg(feature = "schema")]
 use std::borrow::Cow;
 
+use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 #[cfg(feature = "schema")]
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
@@ -33,9 +36,12 @@ pub struct CronSchedule(String);
 impl CronSchedule {
     pub fn parse(value: impl Into<String>) -> Result<Self, InvalidValue> {
         let value = value.into();
-        if value.chars().count() > MAX_CRON_SCHEDULE_LENGTH || !is_nonempty_line(&value) {
+        if value.chars().count() > MAX_CRON_SCHEDULE_LENGTH
+            || !is_nonempty_line(&value)
+            || ParsedSchedule::parse(&value).is_err()
+        {
             return Err(InvalidValue::new_public(
-                "a cron schedule must be a nonempty line within the length limit",
+                "a cron schedule must be a five-field expression or a supported alias within the length limit",
             ));
         }
         Ok(Self(value))
@@ -43,6 +49,16 @@ impl CronSchedule {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Its first occurrence strictly after `after`; [`InvalidCronSchedule::NoOccurrence`] when it
+    /// has none within the parser's search.
+    pub fn next_after<Z: TimeZone + Copy>(
+        &self,
+        after: DateTime<Utc>,
+        time_zone: Z,
+    ) -> Result<DateTime<Utc>, InvalidCronSchedule> {
+        ParsedSchedule::parse(&self.0)?.next_after(after, time_zone)
     }
 }
 
@@ -69,7 +85,7 @@ impl JsonSchema for CronSchedule {
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "a five-field cron expression or an alias such as @daily, as the crontab line gave it",
+            "description": "a five-field cron expression or an alias such as @daily, as the crontab line or the document gave it",
             "pattern": CRON_LINE_PATTERN,
             "maxLength": MAX_CRON_SCHEDULE_LENGTH,
         })
@@ -380,4 +396,228 @@ pub struct CronTable {
     pub jobs: CronJobDefinitions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crontab: Option<Crontab>,
+}
+
+const SEARCH_DAYS: usize = 366 * 8;
+const MAX_OFFSET_GAP_MINUTES: i64 = 24 * 60;
+const MONTH_NAMES: [&str; 12] = [
+    "JANUARY",
+    "FEBRUARY",
+    "MARCH",
+    "APRIL",
+    "MAY",
+    "JUNE",
+    "JULY",
+    "AUGUST",
+    "SEPTEMBER",
+    "OCTOBER",
+    "NOVEMBER",
+    "DECEMBER",
+];
+const WEEKDAY_NAMES: [&str; 7] = [
+    "SUNDAY",
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidCronSchedule {
+    #[error("the cron schedule must be a valid five-field expression or supported alias")]
+    Expression,
+    #[error("the cron schedule has no occurrence within the next eight years")]
+    NoOccurrence,
+}
+
+#[derive(Debug, Clone)]
+struct Field {
+    values: Vec<u32>,
+    wildcard: bool,
+}
+
+impl Field {
+    fn parse(text: &str, minimum: u32, maximum: u32, names: &[&str]) -> Result<Self, InvalidCronSchedule> {
+        let mut values = Vec::new();
+        for part in text.split(',') {
+            let (range, step) = match part.split_once('/') {
+                Some((range, step)) => (
+                    range,
+                    step.parse::<i8>().map_err(|_| InvalidCronSchedule::Expression)?,
+                ),
+                None => (part, 1),
+            };
+            if step <= 0 {
+                return Err(InvalidCronSchedule::Expression);
+            }
+            let number = |value: &str| -> Result<u32, InvalidCronSchedule> {
+                let value = names
+                    .iter()
+                    .position(|name| {
+                        value.eq_ignore_ascii_case(name) || value.eq_ignore_ascii_case(&name[..3])
+                    })
+                    .map_or_else(
+                        || {
+                            value
+                                .parse::<i8>()
+                                .map(|number| number as u32)
+                                .map_err(|_| InvalidCronSchedule::Expression)
+                        },
+                        |index| Ok(index as u32 + minimum),
+                    )?;
+                if !(minimum..=maximum).contains(&value) {
+                    return Err(InvalidCronSchedule::Expression);
+                }
+                Ok(value)
+            };
+            let (start, end) = if range == "*" {
+                (minimum, maximum)
+            } else if range.starts_with('-') && !range[1..].contains('-') {
+                let start = number(range)?;
+                (start, if part.contains('/') { maximum } else { start })
+            } else if let Some((start, end)) = range.split_once('-') {
+                (number(start)?, number(end)?)
+            } else {
+                let start = number(range)?;
+                (start, if part.contains('/') { maximum } else { start })
+            };
+            if start > end {
+                return Err(InvalidCronSchedule::Expression);
+            }
+            values.extend((start..=end).step_by(step as usize));
+        }
+        values.sort_unstable();
+        values.dedup();
+        Ok(Self {
+            values,
+            wildcard: text == "*",
+        })
+    }
+
+    fn contains(&self, value: u32) -> bool {
+        self.values.binary_search(&value).is_ok()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedSchedule {
+    minute: Field,
+    hour: Field,
+    day: Field,
+    month: Field,
+    weekday: Field,
+}
+
+impl ParsedSchedule {
+    pub fn parse(expression: &str) -> Result<Self, InvalidCronSchedule> {
+        if expression
+            .chars()
+            .any(|character| character.is_whitespace() && !matches!(character, ' ' | '\t'))
+        {
+            return Err(InvalidCronSchedule::Expression);
+        }
+        let normalized = expression.trim_matches([' ', '\t']).to_ascii_lowercase();
+        let expression = match normalized.as_str() {
+            "@yearly" | "@annually" => "0 0 1 1 *",
+            "@monthly" => "0 0 1 * *",
+            "@weekly" => "0 0 * * 0",
+            "@daily" | "@midnight" => "0 0 * * *",
+            "@hourly" => "0 * * * *",
+            expression => expression,
+        };
+        let fields: Vec<_> = expression.split_whitespace().collect();
+        let [minute, hour, day, month, weekday] = fields.as_slice() else {
+            return Err(InvalidCronSchedule::Expression);
+        };
+        let mut weekday = Field::parse(weekday, 0, 7, &WEEKDAY_NAMES)?;
+        for value in &mut weekday.values {
+            if *value == 7 {
+                *value = 0;
+            }
+        }
+        weekday.values.sort_unstable();
+        weekday.values.dedup();
+        Ok(Self {
+            minute: Field::parse(minute, 0, 59, &[])?,
+            hour: Field::parse(hour, 0, 23, &[])?,
+            day: Field::parse(day, 1, 31, &[])?,
+            month: Field::parse(month, 1, 12, &MONTH_NAMES)?,
+            weekday,
+        })
+    }
+
+    /// The first occurrence strictly after `after`, in `time_zone`. A local time a clock change
+    /// skips runs that much later; one it repeats runs at its first occurrence.
+    pub fn next_after<Z: TimeZone + Copy>(
+        &self,
+        after: DateTime<Utc>,
+        time_zone: Z,
+    ) -> Result<DateTime<Utc>, InvalidCronSchedule> {
+        let mut date = after.with_timezone(&time_zone).date_naive();
+        for _ in 0..SEARCH_DAYS {
+            let day_matches = self.day.contains(date.day());
+            let weekday_matches = self.weekday.contains(date.weekday().num_days_from_sunday());
+            let matches = if self.day.wildcard || self.weekday.wildcard {
+                day_matches && weekday_matches
+            } else {
+                day_matches || weekday_matches
+            };
+            if self.month.contains(date.month()) && matches {
+                let mut next = None;
+                for hour in &self.hour.values {
+                    for minute in &self.minute.values {
+                        let local = date
+                            .and_hms_opt(*hour, *minute, 0)
+                            .ok_or(InvalidCronSchedule::Expression)?;
+                        if let Some(candidate) = local_occurrence(local, time_zone) {
+                            if candidate > after && next.is_none_or(|held| candidate < held) {
+                                next = Some(candidate);
+                            }
+                        }
+                    }
+                }
+                if let Some(next) = next {
+                    return Ok(next);
+                }
+            }
+            date = date.succ_opt().ok_or(InvalidCronSchedule::NoOccurrence)?;
+        }
+        Err(InvalidCronSchedule::NoOccurrence)
+    }
+}
+
+fn local_occurrence<Z: TimeZone + Copy>(local: NaiveDateTime, time_zone: Z) -> Option<DateTime<Utc>> {
+    match time_zone.from_local_datetime(&local) {
+        LocalResult::Single(value) => Some(value.with_timezone(&Utc)),
+        LocalResult::Ambiguous(first, second) => Some(first.min(second).with_timezone(&Utc)),
+        LocalResult::None => {
+            let mut before = None;
+            let mut after = None;
+            for minutes in 1..=MAX_OFFSET_GAP_MINUTES {
+                let distance = Duration::minutes(minutes);
+                if before.is_none() {
+                    before = time_zone
+                        .from_local_datetime(&local.checked_sub_signed(distance)?)
+                        .earliest();
+                }
+                if after.is_none() {
+                    after = time_zone
+                        .from_local_datetime(&local.checked_add_signed(distance)?)
+                        .earliest();
+                }
+                if let (Some(before), Some(after)) = (&before, &after) {
+                    let gap =
+                        after.offset().fix().local_minus_utc() - before.offset().fix().local_minus_utc();
+                    let shifted = local.checked_add_signed(Duration::seconds(i64::from(gap)))?;
+                    return time_zone
+                        .from_local_datetime(&shifted)
+                        .earliest()
+                        .map(|value| value.with_timezone(&Utc));
+                }
+            }
+            None
+        }
+    }
 }

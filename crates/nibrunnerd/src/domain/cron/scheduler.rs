@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+use protocol::cron::ParsedSchedule;
 use protocol::{AppId, DeploymentId};
 
 use super::jobs::{CronJob, CronJobs, CronOrigin, CronWhen};
-use super::schedule::ParsedSchedule;
 
 /// A job is its deployment, its id and when it is due: a new schedule is a new job.
 type JobKey = (AppId, DeploymentId, String, CronWhen);

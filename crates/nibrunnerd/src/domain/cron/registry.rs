@@ -14,7 +14,6 @@ use crate::repositories::cron_repository::CronRepository;
 
 use super::crontab::{parse_crontab, InvalidCrontab};
 use super::jobs::CronJobs;
-use super::schedule::ParsedSchedule;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CronRegistryError {
@@ -146,8 +145,8 @@ impl CronRegistry {
     pub async fn validate_restored(&self, after: DateTime<Utc>) -> Result<(), CronRegistryError> {
         for table in self.tables().await? {
             for job in table.jobs.iter() {
-                ParsedSchedule::parse(job.schedule.as_str())
-                    .and_then(|schedule| schedule.next_after(after, self.time_zone))
+                job.schedule
+                    .next_after(after, self.time_zone)
                     .map_err(|_| CronRegistryError::Restore)?;
             }
         }

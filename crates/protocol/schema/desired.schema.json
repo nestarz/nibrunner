@@ -253,7 +253,7 @@
       "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
     },
     "CronSchedule": {
-      "description": "a five-field cron expression or an alias such as @daily, as the crontab line gave it",
+      "description": "a five-field cron expression or an alias such as @daily, as the crontab line or the document gave it",
       "type": "string",
       "maxLength": 256,
       "pattern": "^[^\\r\\n\\u0000]*[^\\r\\n\\u0000 \\t][^\\r\\n\\u0000]*$"

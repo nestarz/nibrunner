@@ -7,8 +7,6 @@ use protocol::{
     TenantValue, MAX_CRON_ENVIRONMENT_VARIABLES,
 };
 
-use super::schedule::ParsedSchedule;
-
 fn crontab_whitespace(character: char) -> bool {
     matches!(
         character,
@@ -134,11 +132,13 @@ pub fn parse_crontab(
             return Err(InvalidCrontab::JobLimit);
         }
         let (schedule, command) = job_line(line, number)?;
-        ParsedSchedule::parse(schedule)
-            .and_then(|parsed| parsed.next_after(after, time_zone))
+        let schedule =
+            CronSchedule::parse(schedule).map_err(|_| InvalidCrontab::Schedule { line: number })?;
+        schedule
+            .next_after(after, time_zone)
             .map_err(|_| InvalidCrontab::Schedule { line: number })?;
         jobs.push(CronJobDefinition {
-            schedule: CronSchedule::parse(schedule).map_err(|_| InvalidCrontab::Schedule { line: number })?,
+            schedule,
             command: CronCommand::parse(command).map_err(|_| InvalidCrontab::Command { line: number })?,
             environment: Some(
                 TenantEnvironment::try_from(environment.clone())

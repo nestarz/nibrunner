@@ -26,6 +26,7 @@ chrono.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+chrono-tz.workspace = true
 jsonschema.workspace = true
 # Turns the feature on for this crate's own tests, which is what a dev-dependency on oneself is for.
 nibrunner-protocol = { path = ".", features = ["schema"] }

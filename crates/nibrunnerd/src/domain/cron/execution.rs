@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::ports::{TenantLogBody, TenantLogEvent};
 
 use super::jobs::CronWhen;
-use super::schedule::ParsedSchedule;
 use super::scheduler::ScheduledRun;
 
 const MAX_LINE_BYTES: usize = 16_384;
@@ -79,8 +78,8 @@ pub fn retry_delay(
     let delay = *run.job.declared.as_ref()?.backoff.get(attempt - 1)?;
     let retried_at = now + chrono::Duration::from_std(delay).ok()?;
     let due_first = match &run.job.when {
-        CronWhen::Schedule(schedule) => ParsedSchedule::parse(schedule.as_str())
-            .and_then(|schedule| schedule.next_after(now, time_zone))
+        CronWhen::Schedule(schedule) => schedule
+            .next_after(now, time_zone)
             .is_ok_and(|next| next <= retried_at),
         CronWhen::At(_) => false,
     };

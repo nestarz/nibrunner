@@ -70,9 +70,21 @@ fn a_declared_cron_job_round_trips_and_an_instance_without_one_names_none() {
 }
 
 #[test]
-fn cron_wire_validation_leaves_expression_syntax_to_the_scheduler() {
-    assert!(CronSchedule::parse("@reboot").is_ok());
-    assert!(CronSchedule::parse("60 * * * *").is_ok());
+fn a_cron_schedule_is_refused_on_the_wire_as_the_scheduler_would_refuse_it() {
+    for refused in ["@reboot", "60 * * * *", "* * * * * *", "CRON_TZ=UTC * * * * *"] {
+        assert!(CronSchedule::parse(refused).is_err(), "{refused}");
+    }
+    let never = CronSchedule::parse("0 0 31 2 *").unwrap();
+    assert_eq!(
+        never.next_after("2026-01-01T00:00:00Z".parse().unwrap(), chrono::Utc),
+        Err(cron::InvalidCronSchedule::NoOccurrence)
+    );
+    assert_eq!(
+        CronSchedule::parse("*/5 * * * *")
+            .unwrap()
+            .next_after("2026-10-24T16:13:00Z".parse().unwrap(), chrono::Utc),
+        Ok("2026-10-24T16:15:00Z".parse().unwrap())
+    );
 }
 
 #[test]
@@ -99,9 +111,9 @@ fn cron_input_and_errors_do_not_expose_commands_or_crontabs() {
 
 #[test]
 fn cron_jobs_refuse_empty_multiline_and_oversized_fields() {
-    for (field, limit) in [
-        ("schedule", MAX_CRON_SCHEDULE_LENGTH),
-        ("command", MAX_CRON_COMMAND_LENGTH),
+    for (field, limit, line) in [
+        ("schedule", MAX_CRON_SCHEDULE_LENGTH, "@daily"),
+        ("command", MAX_CRON_COMMAND_LENGTH, "x"),
     ] {
         for value in ["", " \t", "x\0", "x\r", "x\n", "x\nhello"] {
             let mut table = cron_table_json();
@@ -110,7 +122,7 @@ fn cron_jobs_refuse_empty_multiline_and_oversized_fields() {
         }
         for (length, accepted) in [(limit, true), (limit + 1, false)] {
             let mut table = cron_table_json();
-            table["jobs"][0][field] = serde_json::json!("x".repeat(length));
+            table["jobs"][0][field] = serde_json::json!(format!("{line:<length$}"));
             assert_eq!(
                 serde_json::from_value::<CronTable>(table).is_ok(),
                 accepted,
@@ -134,9 +146,10 @@ fn a_cron_command_fits_the_guests_byte_limit_even_with_unicode() {
 }
 
 #[test]
-fn cron_schedule_text_has_a_character_bound_before_syntax_validation() {
-    assert!(CronSchedule::parse("é".repeat(MAX_CRON_SCHEDULE_LENGTH)).is_ok());
-    assert!(CronSchedule::parse("é".repeat(MAX_CRON_SCHEDULE_LENGTH + 1)).is_err());
+fn cron_schedule_text_has_a_character_bound() {
+    let padded = |length: usize| format!("{:<length$}", "@daily");
+    assert!(CronSchedule::parse(padded(MAX_CRON_SCHEDULE_LENGTH)).is_ok());
+    assert!(CronSchedule::parse(padded(MAX_CRON_SCHEDULE_LENGTH + 1)).is_err());
 }
 
 #[test]
@@ -2094,4 +2107,142 @@ fn guest_memory_is_a_whole_number_of_2_mib_huge_pages() {
     let odd = serde_json::json!({"vcpuCount": 1, "memoryMib": 257});
     let error = serde_json::from_value::<InstanceResources>(odd).unwrap_err();
     assert!(error.to_string().contains("multiple of 2"), "{error}");
+}
+
+mod cron_schedule {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use chrono_tz::Tz;
+
+    fn at(value: &str) -> DateTime<Utc> {
+        value.parse().unwrap()
+    }
+    fn next(expression: &str, after: &str, zone: Tz) -> DateTime<Utc> {
+        ParsedSchedule::parse(expression)
+            .unwrap()
+            .next_after(at(after), zone)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_next_run_is_strictly_after_the_given_instant() {
+        assert_eq!(
+            next("* * * * *", "2026-01-01T00:00:00Z", chrono_tz::UTC),
+            at("2026-01-01T00:01:00Z")
+        );
+        assert_eq!(
+            next("@hourly", "2026-01-01T00:00:30Z", chrono_tz::UTC),
+            at("2026-01-01T01:00:00Z")
+        );
+    }
+
+    #[test]
+    fn names_lists_ranges_steps_and_sunday_seven_are_understood() {
+        assert_eq!(
+            next(
+                "5,20-40/10 2 * JAN-MAR/2 7",
+                "2026-01-01T00:00:00Z",
+                chrono_tz::UTC
+            ),
+            at("2026-01-04T02:05:00Z")
+        );
+    }
+
+    #[test]
+    fn full_month_and_weekday_names_match_the_nibrun_schedule_contract() {
+        for (expression, expected) in [
+            ("0 9 * * Monday-Friday", "2026-10-01T09:00:00Z"),
+            ("0 0 1 january *", "2027-01-01T00:00:00Z"),
+            ("0 0 29 2 *", "2028-02-29T00:00:00Z"),
+            ("*/15 * * * *", "2026-09-30T09:45:00Z"),
+        ] {
+            assert_eq!(
+                next(expression, "2026-09-30T09:41:56Z", chrono_tz::UTC),
+                at(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn day_and_weekday_restrictions_match_either_day() {
+        assert_eq!(
+            next("0 0 15 * MON", "2026-01-01T00:00:00Z", chrono_tz::UTC),
+            at("2026-01-05T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn a_nonexistent_spring_hour_moves_forward_by_the_offset_gap() {
+        assert_eq!(
+            next("30 2 * * *", "2026-03-28T02:00:00Z", chrono_tz::Europe::Zurich),
+            at("2026-03-29T01:30:00Z")
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_autumn_hour_runs_only_at_its_first_occurrence() {
+        let first = next("30 2 * * *", "2026-10-24T23:00:00Z", chrono_tz::Europe::Zurich);
+        assert_eq!(first, at("2026-10-25T00:30:00Z"));
+        assert_eq!(
+            next("30 2 * * *", "2026-10-25T00:30:00Z", chrono_tz::Europe::Zurich),
+            at("2026-10-26T01:30:00Z")
+        );
+    }
+
+    #[test]
+    fn malformed_and_reboot_schedules_are_rejected() {
+        for expression in [
+            "@reboot",
+            "* * * *",
+            "60 * * * *",
+            "*/0 * * * *",
+            "* * 0 * *",
+            "* * * 13 *",
+            "* * * * 8",
+            "9-3 * * * *",
+        ] {
+            assert!(ParsedSchedule::parse(expression).is_err(), "{expression}");
+        }
+        assert_eq!(
+            ParsedSchedule::parse("0 0 31 FEB *")
+                .unwrap()
+                .next_after(at("2026-01-01T00:00:00Z"), chrono_tz::UTC),
+            Err(InvalidCronSchedule::NoOccurrence)
+        );
+    }
+
+    #[test]
+    fn schedule_grammar_and_day_matching_follow_bun_1_4_2_fixtures() {
+        for (expression, expected) in [
+            ("@DAILY", "2026-01-02T00:00:00Z"),
+            (" @Daily ", "2026-01-02T00:00:00Z"),
+            ("*/100 * * * *", "2026-01-01T01:00:00Z"),
+            ("*/127 * * * *", "2026-01-01T01:00:00Z"),
+            ("0 0 */2 * MON", "2026-01-03T00:00:00Z"),
+            ("0 0 *,1 * MON", "2026-01-02T00:00:00Z"),
+            ("0 0 15 * */1", "2026-01-02T00:00:00Z"),
+            ("0 0 15 * *", "2026-01-15T00:00:00Z"),
+            ("0 0 * * MON/2", "2026-01-02T00:00:00Z"),
+            ("0 0 * * -0", "2026-01-04T00:00:00Z"),
+            ("+1-+3 * * * *", "2026-01-01T00:01:00Z"),
+        ] {
+            assert_eq!(
+                next(expression, "2026-01-01T00:00:00Z", chrono_tz::UTC),
+                at(expected),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "*/128 * * * *",
+            "*/-0 * * * *",
+            "0 0 * * FRI-MON",
+            "0 0 * DEC-FEB *",
+            "-0-2 * * * *",
+            "0 0 * * ?",
+            "0 0 * * *\r",
+            "0 0 * * *\n",
+        ] {
+            assert!(ParsedSchedule::parse(expression).is_err(), "{expression}");
+        }
+    }
 }

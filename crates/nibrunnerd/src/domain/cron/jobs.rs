@@ -10,8 +10,6 @@ use protocol::{
 };
 use sha2::{Digest, Sha256};
 
-use super::schedule::ParsedSchedule;
-
 /// When a job is due: on its schedule, or once at an instant.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CronWhen {
@@ -129,8 +127,8 @@ pub fn reported_jobs(jobs: &CronJobs, now: DateTime<Utc>, time_zone: Tz) -> Vec<
                 schedule: schedule.clone(),
                 command_digest: Sha256Digest::parse(hex::encode(Sha256::digest(job.command.expose())))
                     .expect("a SHA-256 in lowercase hex is a digest"),
-                next_run: ParsedSchedule::parse(schedule.as_str())
-                    .and_then(|schedule| schedule.next_after(now, time_zone))
+                next_run: schedule
+                    .next_after(now, time_zone)
                     .ok()
                     .map(|next| Timestamp::from_epoch_ms(next.timestamp_millis())),
             })

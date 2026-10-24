@@ -2018,6 +2018,7 @@ name = "nibrunner-protocol"
 version = "2026.10.4-14"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "jsonschema",
  "nibrunner-protocol",
  "schemars",

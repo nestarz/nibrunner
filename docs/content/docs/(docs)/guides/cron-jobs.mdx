@@ -46,6 +46,8 @@ Give the instance a [`cron`](/docs/reference/desired) list:
 | `timeoutS` | Seconds an attempt may last. |
 | `backoffMs` | Delays before each [retry](#runs) of a failed attempt: at most 5, each at most an hour. |
 
+- A `schedule` outside the [schedule syntax](#schedule-syntax) refuses the whole document. One
+  that never occurs, such as `0 0 31 2 *`, is accepted and never runs.
 - The list is the deployment's whole table. Changing it under the same `deploymentId` restarts
   nothing.
 - A job is its name and its schedule. A job that keeps both keeps its next run when the rest of

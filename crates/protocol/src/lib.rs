@@ -3,7 +3,7 @@
 #[macro_use]
 mod wire;
 mod control;
-mod cron;
+pub mod cron;
 mod domain;
 mod http_cache;
 #[cfg(feature = "schema")]
