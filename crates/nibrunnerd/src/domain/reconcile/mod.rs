@@ -189,17 +189,6 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
             InstancePlan::Forget { app_id } => {
                 let _transition = host.state.transition(app_id).await;
                 let _ = host.vms.discard(app_id).await;
-                // An app that is leaving gives its slot and tap back, or every app id a host ever
-                // held keeps one and the ring runs out. One with a volume keeps it until the volume
-                // is detached or torn down, which give it back themselves.
-                if host
-                    .state
-                    .record(app_id)
-                    .await
-                    .is_none_or(|record| record.volume_id.is_none())
-                {
-                    volumes::give_back_slot(host, app_id).await;
-                }
                 let deleting_expired_disk = plan.volumes.iter().any(|v| {
                     matches!(v,
                     VolumePlan::Teardown { desired } if desired.app_id == *app_id)
@@ -215,6 +204,9 @@ async fn apply_stops(host: &Host, plan: &ReconcilePlan) {
                 } else {
                     host.state.drop_record(app_id).await;
                 }
+                // An app that is leaving gives its slot and tap back, or every app id a host ever
+                // held keeps one and the ring runs out.
+                volumes::release_unheld_slot(host, app_id).await;
                 if let Some(telemetry) = &host.telemetry {
                     if let Err(error) = telemetry.forget(app_id).await {
                         tracing::warn!(%app_id, %error, "the last of an app's output did not reach its sink");
@@ -377,6 +369,7 @@ pub async fn reconcile(host: &Arc<Host>, desired: &HostDesiredState, trigger: Tr
     volumes::apply_teardowns(host, &plan).await;
     checkpoints::apply_checkpoints(host, &plan).await;
     exports::apply_exports(host, &plan, trigger).await;
+    volumes::release_unheld_slots(host, desired).await;
     network::apply_activators(host).await;
     network::apply_network(host).await;
     network::apply_routes(host).await;
@@ -1987,11 +1980,27 @@ mod tests {
         );
     }
 
+    async fn volume_attached_for(host: &TestHost, owner: &protocol::AppId) {
+        let report = protocol::ReportedVolume {
+            volume_id: volume_id(),
+            app_id: owner.clone(),
+            state: protocol::VolumeState::Ready,
+            size_bytes: VOLUME_SIZE_BYTES,
+            storage_prefix: None,
+            device_path: None,
+            message: None,
+        };
+        host.state
+            .modify(|snapshot| snapshot.volume_reports = vec![report])
+            .await;
+    }
+
     #[tokio::test]
     async fn an_app_that_is_stopped_or_leaves_a_volume_behind_keeps_its_slot() {
         let host = test_host().await;
         host.slot_for(&app_id()).await.unwrap();
         host.state.put_record(instance_record(|_| {})).await;
+        volume_attached_for(&host, &app_id()).await;
         stops_applied(
             &host,
             InstancePlan::Stop {
@@ -2006,6 +2015,56 @@ mod tests {
         assert!(
             host.slot_of(&app_id()).await.is_some(),
             "its volume's detach or teardown gives the slot back"
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_on_a_shared_cache_volume_give_their_slots_back_however_many_run() {
+        let host = test_host().await;
+        let cache = protocol::AppId::parse("build-site").unwrap();
+        host.slot_for(&cache).await.unwrap();
+        volume_attached_for(&host, &cache).await;
+        for n in 0..=host.config.max_apps {
+            let build = protocol::AppId::parse(format!("build-site-{n}")).unwrap();
+            host.slot_for(&build).await.unwrap();
+            host.state
+                .put_record(instance_record(|record| record.app_id = build.clone()))
+                .await;
+            stops_applied(
+                &host,
+                InstancePlan::Forget {
+                    app_id: build.clone(),
+                },
+            )
+            .await;
+            assert!(host.slot_of(&build).await.is_none(), "{build}");
+        }
+        assert_eq!(
+            host.allocator
+                .lock()
+                .await
+                .assignments()
+                .keys()
+                .collect::<Vec<_>>(),
+            [&cache],
+            "the volume keeps the slot it is attached through"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_gives_back_the_slot_of_an_app_nothing_holds_and_keeps_the_rest() {
+        let host = test_host().await;
+        let orphan = protocol::AppId::parse("left-behind").unwrap();
+        let named = desired_instance(|_| {});
+        for app in [&orphan, &named.app_id] {
+            host.slot_for(app).await.unwrap();
+        }
+        let desired = desired_state(|state| state.instances = vec![named.clone()]);
+        volumes::release_unheld_slots(&host, &desired).await;
+        assert!(host.slot_of(&orphan).await.is_none());
+        assert!(
+            host.slot_of(&named.app_id).await.is_some(),
+            "named by the document"
         );
     }
 

@@ -178,6 +178,38 @@ pub(super) async fn give_back_slot(host: &Host, app_id: &AppId) {
     }
 }
 
+/// Gives `app_id`'s slot back unless something still holds it: its record, or a volume attached
+/// through it, whose own detach or teardown gives it back. A slot is held for as long as one of
+/// the two is, so no app id outlives both with a slot.
+pub(super) async fn release_unheld_slot(host: &Host, app_id: &AppId) {
+    let snapshot = host.state.snapshot().await;
+    let held = snapshot.records.contains_key(app_id)
+        || snapshot.volume_reports.iter().any(|volume| {
+            volume.app_id == *app_id && !matches!(volume.state, VolumeState::Detached | VolumeState::Deleted)
+        });
+    if !held {
+        give_back_slot(host, app_id).await;
+    }
+}
+
+/// What a pass leaves held is what it found a use for: the slot of an app the document does not
+/// name and nothing holds goes back, the rule a restart applies too.
+pub(super) async fn release_unheld_slots(host: &Host, desired: &HostDesiredState) {
+    let held: Vec<AppId> = host
+        .allocator
+        .lock()
+        .await
+        .assignments()
+        .keys()
+        .cloned()
+        .collect();
+    for app_id in held {
+        if !desired.instances.iter().any(|instance| instance.app_id == app_id) {
+            release_unheld_slot(host, &app_id).await;
+        }
+    }
+}
+
 async fn provision_volume(
     host: &Host,
     desired: &DesiredVolume,

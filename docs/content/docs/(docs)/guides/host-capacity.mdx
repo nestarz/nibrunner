@@ -179,6 +179,18 @@ the new count.
     is refused at boot instead of borrowing someone else's identity.
 </Callout>
 
+### As apps arrive
+
+On a `local-file` host, `max_apps` and `maxApps` are where the slot ring starts, not where it
+stops. When every slot is held, the next app widens the ring, doubling it, up to the most the host
+can address: 5567, or fewer when a listener of yours sits in the loopback ports past the ring. A
+`zerofs` host stops at `max_apps`.
+
+A slot is held while its app has a record or a volume attached through it. A pass gives back any
+other slot of an app the document does not name, so a slot left behind lasts one pass.
+
+`reported.json` says where the host stands as `slots`: `used`, the ring's `total`, and `most`.
+
 ## HTTP concurrency
 
 By default the HTTP router imposes no concurrency limit. To bound requests across

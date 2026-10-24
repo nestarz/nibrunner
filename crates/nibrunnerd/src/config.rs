@@ -862,6 +862,22 @@ impl HostConfig {
         Self::from_document(&wider.to_document()).map(|wider| wider.max_apps)
     }
 
+    /// The most slots this host can address without a restart, which its ring widens itself to
+    /// as apps arrive: as many as the ports above 21000 fit below the first listener in their way,
+    /// and `max_apps` alone on a ZeroFS host.
+    pub fn widest_ring(&self) -> u32 {
+        let (mut fits, mut refused) = (self.max_apps, nft_render::most_apps_the_ports_fit() + 1);
+        while refused - fits > 1 {
+            let tried = fits + (refused - fits) / 2;
+            if self.widened_to(tried).is_ok_and(|widened| widened == tried) {
+                fits = tried;
+            } else {
+                refused = tried;
+            }
+        }
+        fits
+    }
+
     fn from_document(document: &file::ConfigFile) -> Result<Self, ConfigError> {
         let max_apps = apps("max_apps", required("max_apps", document.max_apps)?)?;
         let cron = required("cron", document.cron.as_ref())?;

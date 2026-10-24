@@ -56,6 +56,7 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
         accepted_revision: snapshot.accepted_revision.clone(),
         message: snapshot.desired_refusal.clone(),
         proxy: proxy_of(&host.config.proxy, host.metrics.proxy.cache_bytes()),
+        slots: slots_of(&*host.allocator.lock().await),
     });
     let ids = records
         .iter()
@@ -69,6 +70,14 @@ pub async fn build(host: &Host, versions: HostVersions) -> HostReportedState {
 }
 
 /// The response cache's weight, copied from the gauge the cache keeps, when there is a cache.
+fn slots_of(allocator: &crate::adapters::net::allocator::SlotAllocator) -> protocol::ReportedSlots {
+    protocol::ReportedSlots {
+        used: u32::try_from(allocator.assignments().len()).unwrap_or(u32::MAX),
+        total: allocator.limit(),
+        most: allocator.ceiling(),
+    }
+}
+
 fn proxy_of(proxy: &ProxyConfig, cache_bytes: u64) -> Option<ReportedProxy> {
     proxy
         .http

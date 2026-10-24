@@ -75,7 +75,9 @@ pub async fn build_host(config: HostConfig) -> Result<Arc<Host>, StartupError> {
     if let Err(error) = crate::domain::store::import::import_documents(&repositories, &config).await {
         tracing::warn!(error = %error.message(), "what an earlier daemon wrote could not be carried over");
     }
-    let allocator = Arc::new(Mutex::new(SlotAllocator::addressing(config.max_apps)));
+    let allocator = Arc::new(Mutex::new(
+        SlotAllocator::addressing(config.max_apps).reaching(config.widest_ring()),
+    ));
 
     let artifacts = Arc::new(
         ObjectArtifactStore::open(&config.artifact_store_url)

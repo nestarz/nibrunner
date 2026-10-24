@@ -4,7 +4,7 @@ use nft_render::{describe_slot, AppSlot, FIRST_SLOT};
 use protocol::AppId;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("all {limit} apps this host is laid out for hold a slot; raise max_apps in config.toml, or maxApps in the desired state")]
+#[error("all {limit} apps this host can address hold a slot; on a ZeroFS host raise max_apps in config.toml, or maxApps in the desired state, and elsewhere move a listener out of the ports from 21000, which fit at most 5567 apps")]
 pub struct SlotExhausted {
     pub limit: u32,
 }
@@ -40,10 +40,13 @@ pub fn assignments_from(records: BTreeMap<String, serde_json::Value>, max_apps: 
     assignments
 }
 
+/// The slots handed out, on a ring that widens itself as apps arrive, up to the most this host
+/// can address. It never narrows: a slot handed out keeps its ports for as long as its app does.
 pub struct SlotAllocator {
     assignments: BTreeMap<AppId, u32>,
     cursor: i64,
     limit: u32,
+    ceiling: u32,
 }
 
 impl SlotAllocator {
@@ -53,7 +56,14 @@ impl SlotAllocator {
             assignments: BTreeMap::new(),
             cursor: i64::from(FIRST_SLOT),
             limit: max_apps,
+            ceiling: max_apps,
         }
+    }
+
+    /// The same ring, free to widen itself up to `ceiling` slots when every slot is held.
+    pub fn reaching(mut self, ceiling: u32) -> Self {
+        self.ceiling = ceiling.max(self.limit);
+        self
     }
 
     /// What an earlier daemon wrote down may have been measured against a wider ring than this
@@ -62,8 +72,11 @@ impl SlotAllocator {
     pub fn restore(&mut self, assignments: BTreeMap<AppId, u32>, cursor: i64) {
         self.assignments = assignments
             .into_iter()
-            .filter(|(_, slot)| (FIRST_SLOT..self.limit).contains(slot))
+            .filter(|(_, slot)| (FIRST_SLOT..self.ceiling).contains(slot))
             .collect();
+        if let Some(widest) = self.assignments.values().max() {
+            self.grow(widest + 1);
+        }
         self.cursor = i64::from(self.wrapped(cursor - i64::from(FIRST_SLOT)));
     }
 
@@ -79,8 +92,13 @@ impl SlotAllocator {
         self.limit
     }
 
+    pub fn ceiling(&self) -> u32 {
+        self.ceiling
+    }
+
     pub(crate) fn grow(&mut self, limit: u32) {
         self.limit = self.limit.max(limit);
+        self.ceiling = self.ceiling.max(self.limit);
     }
 
     fn span(&self) -> u32 {
@@ -104,7 +122,15 @@ impl SlotAllocator {
         if let Some(slot) = self.assignments.get(app_id) {
             return Ok(describe_slot(*slot, app_id.clone()));
         }
-        let free = self.next_free().ok_or(SlotExhausted { limit: self.limit })?;
+        let free = match self.next_free() {
+            Some(free) => free,
+            None if self.limit < self.ceiling => {
+                let held = self.limit;
+                self.grow(held.saturating_mul(2).min(self.ceiling));
+                held
+            }
+            None => return Err(SlotExhausted { limit: self.ceiling }),
+        };
         self.assignments.insert(app_id.clone(), free);
         self.cursor = i64::from(free) + 1;
         Ok(describe_slot(free, app_id.clone()))
@@ -234,6 +260,32 @@ mod tests {
     }
 
     #[test]
+    fn a_full_ring_widens_itself_up_to_the_most_the_host_can_address() {
+        let mut allocator = full(2).reaching(5);
+        assert_eq!(allocator.allocate(&app(2)).unwrap().slot, 2);
+        assert_eq!(allocator.limit(), 4);
+        assert_eq!(allocator.allocate(&app(3)).unwrap().slot, 3);
+        assert_eq!(allocator.allocate(&app(4)).unwrap().slot, 4);
+        assert_eq!(allocator.limit(), 5);
+        assert_eq!(
+            allocator.allocate(&app(5)).unwrap_err(),
+            SlotExhausted { limit: 5 }
+        );
+    }
+
+    #[test]
+    fn a_slot_a_widened_ring_handed_out_is_kept_across_a_restart() {
+        let mut restarted = SlotAllocator::addressing(2).reaching(8);
+        restarted.restore(BTreeMap::from([(app(1), 6), (app(2), 8)]), 7);
+        assert_eq!(restarted.lookup(&app(1)).unwrap().slot, 6);
+        assert!(
+            restarted.lookup(&app(2)).is_none(),
+            "past what the host can address"
+        );
+        assert_eq!(restarted.limit(), 7);
+    }
+
+    #[test]
     fn the_ring_wraps_at_how_many_apps_the_host_is_laid_out_for() {
         let mut allocator = full(63);
         allocator.release(&app(5));
@@ -257,6 +309,7 @@ mod tests {
                 assignments: BTreeMap::new(),
                 cursor,
                 limit: MAX_APPS,
+                ceiling: MAX_APPS,
             };
             let slot = allocator.allocate(&app(1)).unwrap().slot;
             assert!((FIRST_SLOT..MAX_APPS).contains(&slot));
@@ -343,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_with_no_room_left_says_how_many_apps_it_is_laid_out_for_and_where_to_raise_it() {
+    fn a_host_with_no_room_left_says_how_many_apps_it_can_address_and_where_to_raise_it() {
         let said = SlotExhausted { limit: 63 }.message();
         assert!(said.contains("all 63 apps"), "{said}");
         assert!(said.contains("max_apps"), "{said}");

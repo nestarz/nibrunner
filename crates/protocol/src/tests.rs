@@ -1176,6 +1176,7 @@ mod schema {
                 "the last document named a volume this host does not hold",
             )),
             proxy: Some(ReportedProxy { cache_bytes: 4096 }),
+            slots: Some(ReportedSlots { used: 1, total: 1000, most: 5567 }),
         };
         serde_json::to_value(state).unwrap()
     }

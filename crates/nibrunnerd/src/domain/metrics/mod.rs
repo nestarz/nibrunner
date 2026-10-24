@@ -549,6 +549,7 @@ pub(crate) mod tests {
             accepted_revision: None,
             message: None,
             proxy: None,
+            slots: None,
         }
     }
 

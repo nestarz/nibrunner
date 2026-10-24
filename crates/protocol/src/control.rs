@@ -1052,6 +1052,22 @@ pub struct HostReportedState {
     /// What the proxy holds. Absent when `[proxy.http.cache]` is not configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ReportedProxy>,
+    /// The app slots: a booted, sleeping or stopped app holds one. Absent from a host that
+    /// predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<ReportedSlots>,
+}
+
+/// How many apps hold a slot, how many the ring has, and the most it widens itself to as apps
+/// arrive: `most` is what the host can address, the one limit on how many apps it holds besides
+/// memory and CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedSlots {
+    pub used: u32,
+    pub total: u32,
+    pub most: u32,
 }
 
 /// The proxy's own state, beside the instances it serves.

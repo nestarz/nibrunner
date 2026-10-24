@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use protocol::{
     AppId, DeploymentId, HostCapacity, HostId, HostReportedState, HostState, HostVersions,
-    ReportedCheckpoint, ReportedCronJob, ReportedExport, ReportedInstance, ReportedProxy, ReportedVolume,
-    Revision, Sha256Digest, StateMessage, Timestamp,
+    ReportedCheckpoint, ReportedCronJob, ReportedExport, ReportedInstance, ReportedProxy, ReportedSlots,
+    ReportedVolume, Revision, Sha256Digest, StateMessage, Timestamp,
 };
 
 use crate::domain::report::InstanceRecord;
@@ -49,6 +49,7 @@ pub struct ReportInputs<'a> {
     pub accepted_revision: Option<Revision>,
     pub message: Option<StateMessage>,
     pub proxy: Option<ReportedProxy>,
+    pub slots: ReportedSlots,
 }
 
 pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
@@ -80,6 +81,7 @@ pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
         accepted_revision: inputs.accepted_revision,
         message: inputs.message,
         proxy: inputs.proxy,
+        slots: Some(inputs.slots),
     }
 }
 
@@ -130,6 +132,11 @@ mod tests {
             accepted_revision: None,
             message: None,
             proxy: None,
+            slots: ReportedSlots {
+                used: 0,
+                total: 1,
+                most: 1,
+            },
         })
     }
 

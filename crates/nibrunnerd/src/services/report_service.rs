@@ -153,6 +153,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_report_says_how_many_slots_are_held_on_a_ring_widened_past_max_apps() {
+        let host = test_host().await;
+        let past = host.config.max_apps + 1;
+        for n in 0..past {
+            host.slot_for(&protocol::AppId::parse(format!("app-{n}")).unwrap())
+                .await
+                .unwrap();
+        }
+        let slots = reporter(&host).build().await.slots.unwrap();
+        assert_eq!(slots.used, past);
+        assert!(slots.total >= past, "{slots:?}");
+        assert_eq!(slots.most, host.config.widest_ring());
+        assert!(slots.most > host.config.max_apps);
+    }
+
+    #[tokio::test]
     async fn a_host_that_has_not_converged_yet_reports_itself_as_registering() {
         let host = test_host().await;
         assert_eq!(reporter(&host).build().await.state, HostState::Registering);

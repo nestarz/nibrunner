@@ -82,6 +82,17 @@
     "reportedAt": {
       "$ref": "#/$defs/Timestamp"
     },
+    "slots": {
+      "description": "The app slots: a booted, sleeping or stopped app holds one. Absent from a host that\npredates it.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReportedSlots"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "state": {
       "$ref": "#/$defs/HostState"
     },
@@ -813,6 +824,32 @@
         "exit",
         "reason",
         "backoffMs"
+      ]
+    },
+    "ReportedSlots": {
+      "description": "How many apps hold a slot, how many the ring has, and the most it widens itself to as apps\narrive: `most` is what the host can address, the one limit on how many apps it holds besides\nmemory and CPU.",
+      "type": "object",
+      "properties": {
+        "most": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "used": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "used",
+        "total",
+        "most"
       ]
     },
     "ReportedVolume": {
