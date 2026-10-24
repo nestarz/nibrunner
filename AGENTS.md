@@ -72,8 +72,9 @@ Rust workspace (`crates/*`) with the docs site under `docs/`.
   test holds the page to emitting every series in it.
 - Tests are named as the sentence they prove: `a_booted_vm_is_not_a_running_app`, not `test_boot`.
 - Cron policy belongs to the host's `[cron]`: the job limit for each app and the IANA time
-  zone, parsed with `chrono-tz`. Both settings are required, without defaults. Jobs are registered
-  through `crontab`; desired state does not carry cron configuration.
+  zone, parsed with `chrono-tz`. Both settings are required, without defaults. An instance's
+  `cron` in desired state is its deployment's whole table, taken up on every accepted document and
+  never stored; without it, jobs are registered through `crontab`, which is refused beside it.
 - Cron runs may overlap. Editing a crontab reschedules future runs; stopping or replacing its
   deployment cancels and drains active runs before the guest stops. Registry notifications and
   the next due time drive scheduling, without polling or catching up missed runs.

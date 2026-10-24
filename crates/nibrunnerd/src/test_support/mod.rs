@@ -61,6 +61,29 @@ pub fn deployment_id() -> DeploymentId {
     DeploymentId::parse("dep-1").unwrap()
 }
 
+/// The run at 00:01 of the job a guest registered as `* * * * * <command>`.
+pub fn cron_run(command: &str) -> crate::domain::cron::scheduler::ScheduledRun {
+    let table = CronTable {
+        app_id: app_id(),
+        deployment_id: deployment_id(),
+        jobs: vec![CronJobDefinition {
+            schedule: CronSchedule::parse("* * * * *").unwrap(),
+            command: CronCommand::parse(command).unwrap(),
+            environment: Some(TenantEnvironment::default()),
+        }]
+        .into(),
+        crontab: None,
+    };
+    crate::domain::cron::scheduler::ScheduledRun {
+        app_id: app_id(),
+        deployment_id: deployment_id(),
+        job: crate::domain::cron::jobs::CronJobs::registered(&table)
+            .jobs
+            .remove(0),
+        scheduled_at: "2026-01-01T00:01:00Z".parse().unwrap(),
+    }
+}
+
 pub fn host_id() -> HostId {
     HostId::parse("host-1").unwrap()
 }
@@ -158,6 +181,7 @@ pub fn desired_instance(edit: impl FnOnce(&mut DesiredInstance)) -> DesiredInsta
         config: app_config(|_| {}),
         hostnames: vec![],
         labels: protocol::InstanceLabels::default(),
+        cron: None,
     };
     edit(&mut value);
     value

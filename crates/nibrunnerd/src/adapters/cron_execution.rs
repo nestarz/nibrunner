@@ -194,9 +194,8 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
-    use crate::domain::cron::scheduler::JobKey;
     use crate::ports::{TenantLogBody, TenantLogEvent};
-    use crate::test_support::{app_id, deployment_id};
+    use crate::test_support::cron_run;
 
     #[derive(Default)]
     struct Output(Mutex<Vec<TenantLogEvent>>);
@@ -208,19 +207,7 @@ mod tests {
     }
 
     fn run() -> ScheduledRun {
-        ScheduledRun {
-            key: JobKey {
-                app_id: app_id(),
-                deployment_id: deployment_id(),
-                index: 0,
-            },
-            job: protocol::CronJobDefinition {
-                schedule: protocol::CronSchedule::parse("* * * * *").unwrap(),
-                command: protocol::CronCommand::parse("echo secret").unwrap(),
-                environment: None,
-            },
-            scheduled_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-        }
+        cron_run("echo secret")
     }
 
     async fn guest(

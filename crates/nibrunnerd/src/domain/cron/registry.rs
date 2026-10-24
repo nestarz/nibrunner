@@ -3,13 +3,17 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use protocol::{AppId, CronJobDefinitions, CronTable, Crontab, DeploymentId, ReportedCronJob};
+use protocol::{
+    AppId, CronJobDefinitions, CronTable, Crontab, DeploymentId, DesiredCronJob, DesiredInstance,
+    ReportedCronJob,
+};
 use tokio::sync::{watch, Mutex};
 
 use crate::domain::store::StoreError;
 use crate::repositories::cron_repository::CronRepository;
 
 use super::crontab::{parse_crontab, InvalidCrontab};
+use super::jobs::CronJobs;
 use super::schedule::ParsedSchedule;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,11 +28,19 @@ pub enum CronRegistryError {
     Restore,
     #[error("the cron registry contains more than one table for an app")]
     Duplicate,
+    #[error("this deployment's jobs are declared by its document")]
+    Declared,
+    #[error("{0} declares more cron jobs than [cron] max_jobs_per_app")]
+    TooManyDeclared(AppId),
 }
+
+/// The jobs each instance's document declares, under the deployment it declares them for. The
+/// document is taken up again on every start, so these are never stored.
+type Declarations = BTreeMap<AppId, (DeploymentId, Vec<DesiredCronJob>)>;
 
 pub struct CronRegistry {
     repository: Arc<dyn CronRepository>,
-    mutation: Mutex<()>,
+    mutation: Mutex<Declarations>,
     max_jobs_per_app: usize,
     time_zone: Tz,
     revision: watch::Sender<u64>,
@@ -38,7 +50,7 @@ impl CronRegistry {
     pub fn new(repository: Arc<dyn CronRepository>, max_jobs_per_app: usize, time_zone: Tz) -> Self {
         Self {
             repository,
-            mutation: Mutex::new(()),
+            mutation: Mutex::new(Declarations::new()),
             max_jobs_per_app,
             time_zone,
             revision: watch::channel(0).0,
@@ -51,9 +63,13 @@ impl CronRegistry {
 
     async fn persist(&self, tables: Vec<CronTable>) -> Result<(), CronRegistryError> {
         self.repository.replace_all(&tables).await?;
+        self.changed();
+        Ok(())
+    }
+
+    fn changed(&self) {
         self.revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
-        Ok(())
     }
 
     async fn read(&self) -> Result<BTreeMap<AppId, CronTable>, CronRegistryError> {
@@ -72,20 +88,59 @@ impl CronRegistry {
         Ok(self.read().await?.into_values().collect())
     }
 
-    /// Every app's registered jobs, under the deployment that registered them.
+    /// Each current deployment's jobs: the ones its document declares, else its guest's crontab.
+    pub async fn jobs(&self) -> Result<Vec<CronJobs>, CronRegistryError> {
+        let declarations = self.mutation.lock().await;
+        Ok(self
+            .read()
+            .await?
+            .into_values()
+            .map(|table| match declarations.get(&table.app_id) {
+                Some((deployment_id, jobs)) if *deployment_id == table.deployment_id => {
+                    CronJobs::declared(&table.app_id, deployment_id, jobs)
+                }
+                _ => CronJobs::registered(&table),
+            })
+            .collect())
+    }
+
+    /// Every app's jobs, under the deployment they belong to.
     pub async fn reported(
         &self,
         now: DateTime<Utc>,
     ) -> Result<BTreeMap<AppId, (DeploymentId, Vec<ReportedCronJob>)>, CronRegistryError> {
         Ok(self
-            .tables()
+            .jobs()
             .await?
             .into_iter()
-            .map(|table| {
-                let jobs = super::jobs::reported_jobs(&table, now, self.time_zone);
-                (table.app_id, (table.deployment_id, jobs))
+            .map(|jobs| {
+                let reported = super::jobs::reported_jobs(&jobs, now, self.time_zone);
+                (jobs.app_id, (jobs.deployment_id, reported))
             })
             .collect())
+    }
+
+    /// Takes up what every instance of the document declares, replacing what it declared before.
+    pub async fn declare(&self, instances: &[DesiredInstance]) -> Result<(), CronRegistryError> {
+        let mut declarations = self.mutation.lock().await;
+        let mut declared = Declarations::new();
+        for instance in instances {
+            let Some(jobs) = &instance.cron else {
+                continue;
+            };
+            if jobs.len() > self.max_jobs_per_app {
+                return Err(CronRegistryError::TooManyDeclared(instance.app_id.clone()));
+            }
+            declared.insert(
+                instance.app_id.clone(),
+                (instance.deployment_id.clone(), jobs.clone()),
+            );
+        }
+        if *declarations != declared {
+            *declarations = declared;
+            self.changed();
+        }
+        Ok(())
     }
 
     pub async fn validate_restored(&self, after: DateTime<Utc>) -> Result<(), CronRegistryError> {
@@ -157,7 +212,13 @@ impl CronRegistry {
         text: &str,
         after: DateTime<Utc>,
     ) -> Result<(), CronRegistryError> {
-        let _mutation = self.mutation.lock().await;
+        let declarations = self.mutation.lock().await;
+        if declarations
+            .get(app_id)
+            .is_some_and(|(declared, _)| declared == deployment_id)
+        {
+            return Err(CronRegistryError::Declared);
+        }
         let mut tables = self.read().await?;
         if !tables
             .get(app_id)
@@ -185,17 +246,38 @@ impl CronRegistry {
         app_id: &AppId,
         deployment_id: &DeploymentId,
     ) -> Result<Crontab, CronRegistryError> {
-        let _mutation = self.mutation.lock().await;
+        let declarations = self.mutation.lock().await;
         let tables = self.read().await?;
         let table = tables
             .get(app_id)
             .filter(|table| table.deployment_id == *deployment_id)
             .ok_or(CronRegistryError::DeploymentMismatch)?;
+        if let Some((_, jobs)) = declarations
+            .get(app_id)
+            .filter(|(declared, _)| declared == deployment_id)
+        {
+            return Crontab::parse(listed(jobs)).map_err(|_| CronRegistryError::Declared);
+        }
         Ok(table
             .crontab
             .clone()
             .unwrap_or_else(|| Crontab::parse("").expect("empty text fits the crontab limit")))
     }
+}
+
+/// A document's scheduled jobs as `crontab -l` prints them, each under its name.
+fn listed(jobs: &[DesiredCronJob]) -> String {
+    jobs.iter()
+        .filter_map(|job| {
+            let schedule = job.schedule.as_ref()?;
+            Some(format!(
+                "# {}\n{} {}\n",
+                job.name,
+                schedule.as_str(),
+                job.command.expose()
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -403,6 +485,127 @@ mod tests {
             .await
             .is_err());
         assert!(!changes.has_changed().unwrap());
+    }
+
+    fn declaring(deployment: &str, jobs: serde_json::Value) -> DesiredInstance {
+        crate::test_support::desired_instance(|instance| {
+            instance.deployment_id = self::deployment(deployment);
+            instance.cron = Some(serde_json::from_value(jobs).unwrap());
+        })
+    }
+
+    fn retry(schedule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": "retry", "schedule": schedule, "command": "echo tick; exit ${CRON_EXIT:-0}",
+            "timeoutS": 300, "backoffMs": [10000]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_documents_jobs_are_the_deployments_table_without_a_guest_crontab() {
+        let registry = registry().await;
+        registry
+            .declare(&[declaring("dep-1", serde_json::json!([retry("*/5 * * * *")]))])
+            .await
+            .unwrap();
+        let jobs = registry.jobs().await.unwrap().remove(0);
+        assert_eq!(jobs.origin, super::super::jobs::CronOrigin::Document);
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].id, "retry");
+        let reported = registry.reported(after()).await.unwrap();
+        assert_eq!(reported[&app()].1[0].job_id, "retry");
+    }
+
+    #[tokio::test]
+    async fn a_guest_crontab_is_refused_under_a_document_and_listing_prints_its_jobs() {
+        let registry = registry().await;
+        registry
+            .declare(&[declaring("dep-1", serde_json::json!([retry("*/5 * * * *")]))])
+            .await
+            .unwrap();
+        for text in ["@daily echo mine", ""] {
+            let refused = registry
+                .replace(&app(), &deployment("dep-1"), text, after())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                refused.to_string(),
+                "this deployment's jobs are declared by its document"
+            );
+        }
+        assert_eq!(
+            registry
+                .list(&app(), &deployment("dep-1"))
+                .await
+                .unwrap()
+                .expose(),
+            "# retry\n*/5 * * * * echo tick; exit ${CRON_EXIT:-0}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_declaration_under_one_deployment_replaces_its_table_in_place() {
+        let registry = registry().await;
+        registry
+            .replace(&app(), &deployment("dep-1"), "@daily echo mine", after())
+            .await
+            .unwrap();
+        let mut changes = registry.watch();
+        changes.borrow_and_update();
+        registry
+            .declare(&[declaring("dep-1", serde_json::json!([retry("*/5 * * * *")]))])
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        registry
+            .declare(&[declaring("dep-1", serde_json::json!([retry("*/5 * * * *")]))])
+            .await
+            .unwrap();
+        assert!(!changes.has_changed().unwrap());
+        registry
+            .declare(&[declaring("dep-1", serde_json::json!([retry("@hourly")]))])
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        let jobs = registry.jobs().await.unwrap().remove(0);
+        assert_eq!(
+            jobs.jobs[0].when,
+            super::super::jobs::CronWhen::Schedule(protocol::CronSchedule::parse("@hourly").unwrap())
+        );
+        registry
+            .declare(&[crate::test_support::desired_instance(|_| {})])
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry.jobs().await.unwrap()[0].origin,
+            super::super::jobs::CronOrigin::Crontab(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_declaration_for_a_deployment_the_registry_does_not_hold_is_not_scheduled() {
+        let registry = registry().await;
+        registry
+            .declare(&[declaring("dep-2", serde_json::json!([retry("*/5 * * * *")]))])
+            .await
+            .unwrap();
+        let jobs = registry.jobs().await.unwrap().remove(0);
+        assert_eq!(jobs.deployment_id, deployment("dep-1"));
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_document_declaring_more_jobs_than_the_host_allows_is_refused() {
+        let registry = CronRegistry::new(Arc::new(SqliteCron::new(in_memory().await)), 1, chrono_tz::UTC);
+        let mut second = retry("@hourly");
+        second["name"] = serde_json::json!("other");
+        assert!(matches!(
+            registry
+                .declare(&[declaring("dep-1", serde_json::json!([retry("@daily"), second]))])
+                .await,
+            Err(CronRegistryError::TooManyDeclared(_))
+        ));
     }
 
     #[tokio::test]

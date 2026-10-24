@@ -131,7 +131,7 @@
       "description": "a five-field cron expression or an alias such as @daily, as the crontab line gave it",
       "type": "string",
       "maxLength": 256,
-      "minLength": 1
+      "pattern": "^[^\\r\\n\\u0000]*[^\\r\\n\\u0000 \\t][^\\r\\n\\u0000]*$"
     },
     "CutoverFallback": {
       "description": "Why a deployment that asked to be cut over to was started only once the old one was stopped.",

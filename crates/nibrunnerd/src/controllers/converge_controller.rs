@@ -134,6 +134,7 @@ impl ConvergeController {
                 .map(|instance| (instance.app_id.clone(), instance.deployment_id.clone()))
                 .collect::<Vec<_>>();
             self.host.cron.synchronize(&deployments).await?;
+            self.host.cron.declare(&desired.instances).await?;
             let changes = cache.changes_in(desired);
             cache.accept(desired.clone()).then_some(changes)
         };
@@ -242,6 +243,28 @@ mod tests {
         assert_eq!(tables[0].deployment_id, newer);
         assert!(tables[0].jobs.is_empty());
         assert!(host.cron.list(&app_id(), &deployment_id()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn every_accepted_document_seeds_the_jobs_it_declares_even_when_it_asks_nothing_new() {
+        let host = test_host().await;
+        let desired = desired_state(|state| {
+            state.instances = vec![desired_instance(|instance| {
+                instance.cron = Some(
+                    serde_json::from_value(serde_json::json!([{
+                        "name": "tick", "schedule": "* * * * *", "command": "echo tick",
+                        "timeoutS": 300, "backoffMs": []
+                    }]))
+                    .unwrap(),
+                )
+            })]
+        });
+        let controller = controller(&host, MockReconcileService::new());
+        assert!(controller.accept(&desired).await.unwrap().is_some());
+        host.cron.declare(&[]).await.unwrap();
+        assert!(controller.accept(&desired).await.unwrap().is_none());
+        let jobs = host.cron.jobs().await.unwrap().remove(0);
+        assert_eq!(jobs.jobs[0].id, "tick");
     }
 
     #[tokio::test]

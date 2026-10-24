@@ -1,9 +1,10 @@
 ---
 title: Cron jobs
-description: Schedule commands with crontab.
+description: Schedule commands from the desired document or with crontab.
 ---
 
-Use `crontab` inside the app to schedule commands for its current deployment.
+Declare an instance's jobs in `desired.json`, or install them with `crontab` inside the app. A
+deployment whose document declares jobs runs those alone.
 
 ## Configure the host
 
@@ -17,8 +18,43 @@ time_zone = "Europe/Zurich"
 
 Both settings are required and have no defaults.
 
-- `max_jobs_per_app` limits the jobs an app can install.
+- `max_jobs_per_app` limits the jobs an app can install or declare.
 - `time_zone` sets the IANA time zone for all apps.
+
+## Declare jobs in the document
+
+Give the instance a [`cron`](/docs/reference/desired) list:
+
+```json
+"cron": [
+  {
+    "name": "retry",
+    "schedule": "*/5 * * * *",
+    "command": "./server cron retry",
+    "timeoutS": 300,
+    "backoffMs": [10000, 60000]
+  }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | The job's ID in logs and in `reported.json`. Unique in the instance. |
+| `schedule` | When it runs, in the [schedule syntax](#schedule-syntax). |
+| `at` | Instead of `schedule`: one run, due as soon as the host sees it at or after this instant. |
+| `command` | One line for the shell. |
+| `timeoutS` | Seconds a run may last. |
+| `backoffMs` | Delays before each retry of a failed run: at most 5, each at most an hour. |
+
+- The list is the deployment's whole table. Changing it under the same `deploymentId` restarts
+  nothing.
+- A job is its name and its schedule. A job that keeps both keeps its next run when the rest of
+  the list changes, or when the list is emptied and declared again.
+- An `at` entry runs once. A host that restarts sees it again as new.
+- `crontab FILE`, `crontab -` and `crontab -r` fail with
+  `crontab: this deployment's jobs are declared by its document`. `crontab -l` prints the
+  scheduled jobs, each under a `# name` line.
+- An instance without `cron` keeps its guest's crontab.
 
 ## Install a crontab
 
@@ -73,11 +109,11 @@ app's environment.
 Standard output and standard error go to the app's [logs](/docs/guides/logs-and-metrics).
 Each line includes a job ID and a run ID.
 
-`reported.json` lists each instance's registered jobs as `instances[].cron`, in crontab order:
-`jobId` (the job ID its log lines carry), `schedule`, `commandDigest` (the SHA-256 of the command
-in hex, never the command itself) and `nextRun`. Only the deployment that installed the crontab
-lists it.
+`reported.json` lists each instance's scheduled jobs as `instances[].cron`, in table order:
+`jobId` (the job ID its log lines carry: a declared job's `name`), `schedule`, `commandDigest`
+(the SHA-256 of the command in hex, never the command itself) and `nextRun`. `at` entries are not
+listed. Only the deployment that declared or installed the jobs lists them.
 
 Stopping an app cancels running commands and pauses scheduling. Replacing or removing a
 deployment also removes its crontab. The host waits for cancelled runs before stopping the guest.
-New deployments must install their own crontabs.
+New deployments must declare or install their own jobs.

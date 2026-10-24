@@ -19,7 +19,7 @@ pub struct CronRunOutput {
 impl CronRunOutput {
     pub fn new(run: ScheduledRun) -> Self {
         let source_id = uuid::Uuid::new_v4().to_string();
-        let job_id = super::jobs::cron_job_id(&run.key, &run.job);
+        let job_id = run.job.id.clone();
         let run_id = uuid::Uuid::new_v4().to_string();
         Self {
             run,
@@ -34,8 +34,8 @@ impl CronRunOutput {
 
     fn event(&mut self, stream: TenantLogStream, text: String) -> TenantLogEvent {
         let event = TenantLogEvent {
-            app_id: self.run.key.app_id.clone(),
-            deployment_id: self.run.key.deployment_id.clone(),
+            app_id: self.run.app_id.clone(),
+            deployment_id: self.run.deployment_id.clone(),
             source_id: self.source_id.clone(),
             sequence: self.sequence,
             observed_at: Timestamp::from_epoch_ms(crate::clock::now_ms()),
@@ -92,24 +92,11 @@ impl CronRunOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::super::scheduler::JobKey;
     use super::*;
-    use crate::test_support::{app_id, deployment_id};
+    use crate::test_support::cron_run;
 
     fn output() -> CronRunOutput {
-        CronRunOutput::new(ScheduledRun {
-            key: JobKey {
-                app_id: app_id(),
-                deployment_id: deployment_id(),
-                index: 2,
-            },
-            job: protocol::CronJobDefinition {
-                schedule: protocol::CronSchedule::parse("* * * * *").unwrap(),
-                command: protocol::CronCommand::parse("echo secret").unwrap(),
-                environment: None,
-            },
-            scheduled_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-        })
+        CronRunOutput::new(cron_run("echo secret"))
     }
 
     fn text(event: &TenantLogEvent) -> &str {

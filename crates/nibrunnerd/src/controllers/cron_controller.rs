@@ -2,29 +2,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use protocol::{CronTable, DesiredInstanceState, InstanceState};
+use protocol::{DesiredInstanceState, InstanceState};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinSet;
 
 use crate::adapters::cron_execution::GuestCronExecution;
 use crate::controllers::Controller;
+use crate::domain::cron::jobs::{CronJobs, CronOrigin};
 use crate::domain::cron::registry::{CronRegistry, CronRegistryError};
 use crate::domain::cron::runs::CronRunLease;
-use crate::domain::cron::schedule::InvalidCronSchedule;
 use crate::domain::cron::scheduler::{CronScheduler, ScheduledRun};
 use crate::domain::filesystem::reader::guest_vsock_path;
 use crate::host::Host;
 use crate::state::CronActivity;
 
 const CRON_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-#[derive(Debug, thiserror::Error)]
-enum CronSynchronizationError {
-    #[error(transparent)]
-    Registry(#[from] CronRegistryError),
-    #[error(transparent)]
-    Schedule(#[from] InvalidCronSchedule),
-}
 
 #[derive(Default)]
 struct Scheduling {
@@ -63,8 +55,8 @@ impl CronController {
         }
     }
 
-    async fn try_cron_once(&self, now: DateTime<Utc>) -> Result<(), CronSynchronizationError> {
-        let tables = self.registry.tables().await?;
+    async fn try_cron_once(&self, now: DateTime<Utc>) -> Result<(), CronRegistryError> {
+        let tables = self.registry.jobs().await?;
         let desired = self.host.cache.lock().await.latest().cloned();
         let tables: Vec<_> = tables
             .into_iter()
@@ -85,16 +77,17 @@ impl CronController {
             }
         }
         let time_zone = self.host.config.cron.time_zone;
-        scheduling.scheduler.synchronize(&tables, now, time_zone)?;
+        scheduling.scheduler.synchronize(&tables, now, time_zone);
         for run in scheduling.scheduler.due(now, time_zone) {
             let Some(table) = tables
                 .iter()
-                .find(|table| table.app_id == run.key.app_id && table.deployment_id == run.key.deployment_id)
-                .cloned()
+                .find(|table| table.app_id == run.app_id && table.deployment_id == run.deployment_id)
             else {
                 continue;
             };
-            let Some(lease) = self.host.cron_runs.start(&run.key.app_id, &run.key.deployment_id) else {
+            // A crontab's edit cancels what its old text had made due; a document's does not.
+            let expected = (table.origin != CronOrigin::Document).then(|| table.clone());
+            let Some(lease) = self.host.cron_runs.start(&run.app_id, &run.deployment_id) else {
                 continue;
             };
             let host = self.host.clone();
@@ -102,7 +95,7 @@ impl CronController {
             let completed = self.completed.clone();
             scheduling.tasks.spawn(async move {
                 let _completed = RunCompleted(completed);
-                Self::execute_owned(host, registry, run, lease, Some(table)).await;
+                Self::execute_owned(host, registry, run, lease, expected).await;
             });
         }
         Ok(())
@@ -111,19 +104,19 @@ impl CronController {
     async fn current(host: &Host, run: &ScheduledRun) -> bool {
         host.cache.lock().await.latest().is_some_and(|desired| {
             desired.instances.iter().any(|instance| {
-                instance.app_id == run.key.app_id
-                    && instance.deployment_id == run.key.deployment_id
+                instance.app_id == run.app_id
+                    && instance.deployment_id == run.deployment_id
                     && instance.desired_state != DesiredInstanceState::Stopped
             })
         })
     }
 
-    async fn registered(registry: &CronRegistry, run: &ScheduledRun, expected: Option<&CronTable>) -> bool {
-        registry.tables().await.is_ok_and(|tables| {
+    async fn registered(registry: &CronRegistry, run: &ScheduledRun, expected: Option<&CronJobs>) -> bool {
+        registry.jobs().await.is_ok_and(|tables| {
             tables.iter().any(|table| {
-                table.app_id == run.key.app_id
-                    && table.deployment_id == run.key.deployment_id
-                    && table.jobs.iter().nth(run.key.index) == Some(&run.job)
+                table.app_id == run.app_id
+                    && table.deployment_id == run.deployment_id
+                    && table.jobs.contains(&run.job)
                     && expected.is_none_or(|expected| table == expected)
             })
         })
@@ -133,18 +126,18 @@ impl CronController {
         host: &Host,
         registry: &CronRegistry,
         run: &ScheduledRun,
-        expected: Option<&CronTable>,
+        expected: Option<&CronJobs>,
     ) -> Option<CronActivity> {
         let (activity, needs_wake) = {
-            let _transition = host.state.transition(&run.key.app_id).await;
+            let _transition = host.state.transition(&run.app_id).await;
             if !Self::current(host, run).await
                 || !Self::registered(registry, run, expected).await
                 || !host.state.snapshot().await.isolated
             {
                 return None;
             }
-            let record = host.state.record(&run.key.app_id).await?;
-            if record.deployment_id != run.key.deployment_id
+            let record = host.state.record(&run.app_id).await?;
+            if record.deployment_id != run.deployment_id
                 || (record.stop_requested
                     && !matches!(record.state, InstanceState::Idle | InstanceState::Frozen))
                 || !record.desired_running
@@ -160,23 +153,23 @@ impl CronController {
                 return None;
             }
             (
-                host.state.cron_activity(&run.key.app_id),
+                host.state.cron_activity(&run.app_id),
                 matches!(record.state, InstanceState::Idle | InstanceState::Frozen),
             )
         };
         if needs_wake {
-            if let Err(refusal) = host.waker.wake(&run.key.app_id).await {
-                tracing::warn!(app_id = %run.key.app_id, refusal = ?refusal, "cron could not wake its app");
+            if let Err(refusal) = host.waker.wake(&run.app_id).await {
+                tracing::warn!(app_id = %run.app_id, refusal = ?refusal, "cron could not wake its app");
                 return None;
             }
         }
         {
-            let _transition = host.state.transition(&run.key.app_id).await;
+            let _transition = host.state.transition(&run.app_id).await;
             if !Self::current(host, run).await || !host.state.snapshot().await.isolated {
                 return None;
             }
-            if !host.state.record(&run.key.app_id).await.is_some_and(|record| {
-                record.deployment_id == run.key.deployment_id
+            if !host.state.record(&run.app_id).await.is_some_and(|record| {
+                record.deployment_id == run.deployment_id
                     && record.started_at.is_some()
                     && !record.stop_requested
                     && record.desired_running
@@ -196,7 +189,7 @@ impl CronController {
         registry: Arc<CronRegistry>,
         run: ScheduledRun,
         mut lease: CronRunLease,
-        expected: Option<CronTable>,
+        expected: Option<CronJobs>,
     ) {
         let activity = tokio::select! {
             biased;
@@ -205,25 +198,23 @@ impl CronController {
         };
         if let Some(activity) = activity {
             if let Err(error) = GuestCronExecution::run(
-                &guest_vsock_path(&host, &run.key.app_id),
+                &guest_vsock_path(&host, &run.app_id),
                 run.clone(),
                 host.logs.as_ref(),
                 lease.cancelled(),
             )
             .await
             {
-                tracing::warn!(app_id = %run.key.app_id, deployment_id = %run.key.deployment_id, job_index = run.key.index, %error, "cron execution did not complete");
+                tracing::warn!(app_id = %run.app_id, deployment_id = %run.deployment_id, job_id = %run.job.id, %error, "cron execution did not complete");
             }
-            host.state
-                .mark_active(&run.key.app_id, crate::clock::now_ms())
-                .await;
+            host.state.mark_active(&run.app_id, crate::clock::now_ms()).await;
             drop(activity);
         }
     }
 
     #[cfg(test)]
     async fn dispatch(host: Arc<Host>, registry: Arc<CronRegistry>, run: ScheduledRun) {
-        let Some(lease) = host.cron_runs.start(&run.key.app_id, &run.key.deployment_id) else {
+        let Some(lease) = host.cron_runs.start(&run.app_id, &run.deployment_id) else {
             return;
         };
         Self::execute_owned(host, registry, run, lease, None).await;
@@ -279,7 +270,6 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
-    use crate::domain::cron::scheduler::JobKey;
     use crate::domain::store::StoreError;
     use crate::ports::{WakeRefusal, Waker};
     use crate::repositories::cron_repository::MockCronRepository;
@@ -320,19 +310,7 @@ mod tests {
     }
 
     fn run() -> ScheduledRun {
-        ScheduledRun {
-            key: JobKey {
-                app_id: app_id(),
-                deployment_id: deployment_id(),
-                index: 0,
-            },
-            job: protocol::CronJobDefinition {
-                schedule: protocol::CronSchedule::parse("* * * * *").unwrap(),
-                command: protocol::CronCommand::parse("echo ok").unwrap(),
-                environment: Some(protocol::TenantEnvironment::default()),
-            },
-            scheduled_at: at("2026-01-01T00:01:00Z"),
-        }
+        cron_run("echo ok")
     }
 
     #[tokio::test]
@@ -642,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn a_comment_edit_after_the_timer_fired_prevents_the_old_table_from_launching() {
         let host = named_host().await;
-        let table = host.cron.tables().await.unwrap().remove(0);
+        let table = host.cron.jobs().await.unwrap().remove(0);
         host.cron
             .replace(
                 &app_id(),
@@ -725,7 +703,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_synchronization_waits_for_the_retry_delay_even_with_an_old_due_timer() {
         let host = named_host().await;
-        let tables = host.cron.tables().await.unwrap();
+        let jobs = host.cron.jobs().await.unwrap();
         let reads = Arc::new(AtomicUsize::new(0));
         let observed = reads.clone();
         let read = Arc::new(Notify::new());
@@ -738,13 +716,11 @@ mod tests {
         });
         let registry = Arc::new(CronRegistry::new(Arc::new(repository), 10, chrono_tz::UTC));
         let controller = CronController::new(host.arc().clone(), registry);
-        controller
-            .scheduling
-            .lock()
-            .await
-            .scheduler
-            .synchronize(&tables, Utc::now() - chrono::Duration::minutes(2), chrono_tz::UTC)
-            .unwrap();
+        controller.scheduling.lock().await.scheduler.synchronize(
+            &jobs,
+            Utc::now() - chrono::Duration::minutes(2),
+            chrono_tz::UTC,
+        );
         let running = tokio::spawn({
             let controller = controller.clone();
             async move { controller.run().await }

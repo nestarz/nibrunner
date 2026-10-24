@@ -290,6 +290,7 @@ impl RunningHost {
                     kind: AppHostnameKind::Platform,
                 }],
                 labels: protocol::InstanceLabels::default(),
+                cron: None,
             },
             app_id,
             volume_id,

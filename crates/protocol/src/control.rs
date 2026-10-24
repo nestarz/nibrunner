@@ -478,7 +478,7 @@ pub struct DesiredInstance {
     pub app_id: AppId,
     /// A running instance is replaced when this changes, and only then: a new layer or config
     /// under the same `deploymentId` is not picked up. `activation`, `expiry`, `limits`,
-    /// `labels`, `hostnames` and `desiredState` are taken up in place.
+    /// `labels`, `hostnames`, `cron` and `desiredState` are taken up in place.
     pub deployment_id: DeploymentId,
     /// One of this document's `volumes`, stacked writable over the layers. Absent when `scratch`
     /// is named instead; one of the two always is.
@@ -520,6 +520,11 @@ pub struct DesiredInstance {
     /// deployment.
     #[serde(default, skip_serializing_if = "InstanceLabels::is_empty")]
     pub labels: InstanceLabels,
+    /// The deployment's cron jobs, each named once. Present, they are the whole of its table:
+    /// a change replaces it in place and its guest's `crontab` is refused. Absent, the guest
+    /// installs its own with `crontab`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<Vec<crate::DesiredCronJob>>,
 }
 
 impl DesiredInstance {
@@ -570,6 +575,8 @@ struct DesiredInstanceFields {
     hostnames: Vec<AppHostname>,
     #[serde(default)]
     labels: InstanceLabels,
+    #[serde(default)]
+    cron: Option<Vec<crate::DesiredCronJob>>,
 }
 
 impl TryFrom<DesiredInstanceFields> for DesiredInstance {
@@ -630,6 +637,13 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
                 "an instance names at most {MAX_LAYERS} layers, because a microVM has that many drives to give them"
             )));
         }
+        let mut names = std::collections::BTreeSet::new();
+        if let Some(job) = fields.cron.iter().flatten().find(|job| !names.insert(&job.name)) {
+            return Err(InvalidValue::new_public(&format!(
+                "the cron job {} is named twice, and a name is one job",
+                job.name
+            )));
+        }
         Ok(Self {
             app_id: fields.app_id,
             deployment_id: fields.deployment_id,
@@ -644,6 +658,7 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
             config: fields.config,
             hostnames: fields.hostnames,
             labels: fields.labels,
+            cron: fields.cron,
         })
     }
 }

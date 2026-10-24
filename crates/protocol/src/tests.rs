@@ -40,6 +40,35 @@ fn a_cron_job_may_omit_environment_overrides() {
     assert_eq!(serde_json::to_value(job).unwrap(), value);
 }
 
+fn cron_job_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "retry",
+        "schedule": "*/5 * * * *",
+        "command": "./server cron retry",
+        "timeoutS": 300,
+        "backoffMs": [10000, 60000]
+    })
+}
+
+#[test]
+fn a_declared_cron_job_round_trips_and_an_instance_without_one_names_none() {
+    let job: DesiredCronJob = serde_json::from_value(cron_job_json()).unwrap();
+    assert_eq!(job.name.as_str(), "retry");
+    assert_eq!(serde_json::to_value(&job).unwrap(), cron_job_json());
+    assert!(!format!("{job:?}").contains("./server"));
+    let instance: DesiredInstance = serde_json::from_value(instance_json()).unwrap();
+    assert_eq!(instance.cron, None);
+    assert!(serde_json::to_value(&instance).unwrap().get("cron").is_none());
+    let mut declared = instance_json();
+    declared["cron"] = serde_json::json!([]);
+    let instance: DesiredInstance = serde_json::from_value(declared.clone()).unwrap();
+    assert_eq!(instance.cron, Some(vec![]));
+    assert_eq!(
+        serde_json::to_value(&instance).unwrap()["cron"],
+        serde_json::json!([])
+    );
+}
+
 #[test]
 fn cron_wire_validation_leaves_expression_syntax_to_the_scheduler() {
     assert!(CronSchedule::parse("@reboot").is_ok());
@@ -1590,6 +1619,79 @@ mod schema {
             serde_json::json!({ "URL": "${NIBRUN_NOPE}" }),
         );
         assert!(serde_json::from_value::<HostDesiredState>(document.clone()).is_err());
+        assert!(validator.is_valid(&document));
+    }
+
+    #[test]
+    fn the_desired_state_schema_holds_cron_jobs_to_the_parsers_rules() {
+        let validator = validator(crate::schema::desired_state());
+        let declared =
+            |job: serde_json::Value| with(desired_json(), "/instances/0/cron", serde_json::json!([job]));
+        for document in [
+            declared(cron_job_json()),
+            declared(with(
+                without(cron_job_json(), "/schedule"),
+                "/at",
+                serde_json::json!("2026-10-24T16:15:00Z"),
+            )),
+            declared(with(
+                cron_job_json(),
+                "/backoffMs",
+                serde_json::json!(vec![1000; MAX_CRON_RETRIES]),
+            )),
+        ] {
+            serde_json::from_value::<HostDesiredState>(document.clone()).unwrap();
+            let errors: Vec<String> = validator.iter_errors(&document).map(|e| e.to_string()).collect();
+            assert!(errors.is_empty(), "{errors:#?}");
+        }
+        for document in [
+            declared(without(cron_job_json(), "/schedule")),
+            declared(with(
+                cron_job_json(),
+                "/at",
+                serde_json::json!("2026-10-24T16:15:00Z"),
+            )),
+            declared(with(cron_job_json(), "/name", serde_json::json!("Retry"))),
+            declared(with(cron_job_json(), "/name", serde_json::json!("-retry"))),
+            declared(with(
+                cron_job_json(),
+                "/command",
+                serde_json::json!("echo a\necho b"),
+            )),
+            declared(with(cron_job_json(), "/timeoutS", serde_json::json!(0))),
+            declared(with(
+                cron_job_json(),
+                "/backoffMs",
+                serde_json::json!(vec![1000; MAX_CRON_RETRIES + 1]),
+            )),
+            declared(with(
+                cron_job_json(),
+                "/backoffMs",
+                serde_json::json!([MAX_CRON_RETRY_DELAY_MS + 1]),
+            )),
+            declared(without(cron_job_json(), "/timeoutS")),
+        ] {
+            assert!(
+                serde_json::from_value::<HostDesiredState>(document.clone()).is_err(),
+                "the parser took {document}"
+            );
+            assert!(!validator.is_valid(&document), "the schema took {document}");
+        }
+    }
+
+    #[test]
+    fn the_desired_state_schema_cannot_see_a_cron_job_named_twice() {
+        let validator = validator(crate::schema::desired_state());
+        let document = with(
+            desired_json(),
+            "/instances/0/cron",
+            serde_json::json!([
+                cron_job_json(),
+                with(cron_job_json(), "/schedule", serde_json::json!("@daily"))
+            ]),
+        );
+        let refused = serde_json::from_value::<HostDesiredState>(document.clone()).unwrap_err();
+        assert!(refused.to_string().contains("retry is named twice"), "{refused}");
         assert!(validator.is_valid(&document));
     }
 
