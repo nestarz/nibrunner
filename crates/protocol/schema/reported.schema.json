@@ -184,7 +184,7 @@
           ]
         },
         {
-          "description": "`deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the\ndeployment reported keeps serving, or stays asleep to be woken on request, and the named\none is not tried again.",
+          "description": "`deploymentId` never became healthy within `cutoverTimeoutMs`, or its tenant restarted\nbefore it was cut over to, and was stopped; the deployment reported keeps serving, or stays\nasleep to be woken on request, and the named one is not tried again.",
           "type": "object",
           "properties": {
             "deploymentId": {
@@ -193,6 +193,12 @@
             "kind": {
               "type": "string",
               "const": "abandoned"
+            },
+            "tenantRestarts": {
+              "description": "How often its tenant restarted while it was staged: above 0, it was crash-looping.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
             }
           },
           "required": [
@@ -621,6 +627,10 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "restartsSpent": {
+          "description": "Set while the instance is failed because its tenant spent every restart its\n`restartPolicy` gave it without staying up: it is crash-looping, not asleep or stopped.",
+          "type": "boolean"
         },
         "startedAt": {
           "anyOf": [

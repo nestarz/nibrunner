@@ -14,6 +14,9 @@ pub struct HealthTracker {
     pub ever_healthy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_healthy_at: Option<Timestamp>,
+    /// When the probes first found the tenant well, which a cut-over waits to have held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_healthy_at: Option<Timestamp>,
     /// How the latest of the failures in a row went; nothing once a probe finds the tenant well.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<ProbeFailure>,
@@ -38,11 +41,16 @@ pub fn apply_probe(
         };
     }
     let consecutive_successes = tracker.consecutive_successes + 1;
+    let ever_healthy = tracker.ever_healthy || consecutive_successes >= healthy_threshold;
     HealthTracker {
         consecutive_successes,
         consecutive_failures: 0,
-        ever_healthy: tracker.ever_healthy || consecutive_successes >= healthy_threshold,
+        ever_healthy,
         last_healthy_at: Some(at.clone()),
+        first_healthy_at: tracker
+            .first_healthy_at
+            .clone()
+            .or_else(|| ever_healthy.then(|| at.clone())),
         last_failure: None,
     }
 }

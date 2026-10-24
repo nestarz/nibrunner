@@ -28,6 +28,11 @@ pub fn to_reported_instance(record: &InstanceRecord, last_active_at_ms: Option<i
         cutover: record.cutover_outcome.clone(),
         labels: record.labels.clone(),
         cron: Vec::new(),
+        restarts_spent: record.state == protocol::InstanceState::Failed
+            && record
+                .last_restart
+                .as_ref()
+                .is_some_and(|last| last.restart.attempt >= last.restart.budget),
     }
 }
 
@@ -89,7 +94,7 @@ pub fn build_reported_state(inputs: ReportInputs<'_>) -> HostReportedState {
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use protocol::AppId;
+    use protocol::{AppId, InstanceState};
 
     fn assembled(
         records: &[InstanceRecord],
@@ -179,6 +184,37 @@ mod tests {
         }
         let exited = to_reported_instance(&instance_record(|record| record.last_exit_code = Some(0)), None);
         assert_eq!(serde_json::to_value(&exited).unwrap()["lastExitCode"], 0);
+    }
+
+    #[test]
+    fn a_tenant_that_spent_its_restarts_is_reported_as_such_and_not_as_merely_down() {
+        let restarted = |attempt, state| {
+            to_reported_instance(
+                &instance_record(|record| {
+                    record.state = state;
+                    record.last_restart = Some(protocol::ReportedRestart {
+                        at: observed_at(),
+                        restart: protocol::TenantRestart {
+                            attempt,
+                            budget: 5,
+                            exit: protocol::TenantExit::Code(1),
+                            reason: protocol::StateMessage::new("the tenant exited"),
+                            backoff_ms: 500,
+                        },
+                    });
+                }),
+                None,
+            )
+        };
+        let spent = restarted(5, InstanceState::Failed);
+        assert!(spent.restarts_spent);
+        assert_eq!(serde_json::to_value(&spent).unwrap()["restartsSpent"], true);
+        assert!(!restarted(4, InstanceState::Failed).restarts_spent);
+        assert!(!restarted(5, InstanceState::Running).restarts_spent);
+        assert!(serde_json::to_value(restarted(4, InstanceState::Failed))
+            .unwrap()
+            .get("restartsSpent")
+            .is_none());
     }
 
     #[test]

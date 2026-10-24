@@ -254,6 +254,7 @@ pub fn reported_instance(edit: impl FnOnce(&mut ReportedInstance)) -> ReportedIn
         cutover: None,
         labels: protocol::InstanceLabels::default(),
         cron: Vec::new(),
+        restarts_spent: false,
     };
     edit(&mut value);
     value

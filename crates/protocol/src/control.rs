@@ -892,6 +892,10 @@ pub struct ReportedInstance {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StateMessage>,
+    /// Set while the instance is failed because its tenant spent every restart its
+    /// `restartPolicy` gave it without staying up: it is crash-looping, not asleep or stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restarts_spent: bool,
     /// The cron jobs this deployment registered, in its crontab's order. Empty for a deployment
     /// that registered none, or one that is not the deployment the registry holds for the app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -905,16 +909,25 @@ pub struct ReportedInstance {
     pub cutover: Option<CutoverOutcome>,
 }
 
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum CutoverOutcome {
     /// The old deployment was stopped before the one reported started.
     Fallback { reason: CutoverFallback },
-    /// `deploymentId` never became healthy within `cutoverTimeoutMs` and was stopped; the
-    /// deployment reported keeps serving, or stays asleep to be woken on request, and the named
-    /// one is not tried again.
-    Abandoned { deployment_id: DeploymentId },
+    /// `deploymentId` never became healthy within `cutoverTimeoutMs`, or its tenant restarted
+    /// before it was cut over to, and was stopped; the deployment reported keeps serving, or stays
+    /// asleep to be woken on request, and the named one is not tried again.
+    Abandoned {
+        deployment_id: DeploymentId,
+        /// How often its tenant restarted while it was staged: above 0, it was crash-looping.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        tenant_restarts: u32,
+    },
 }
 
 /// Why a deployment that asked to be cut over to was started only once the old one was stopped.

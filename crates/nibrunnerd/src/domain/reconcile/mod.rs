@@ -33,6 +33,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
     app_ids.extend(snapshot.records.keys().cloned());
     let app_ids: Vec<_> = app_ids.into_iter().collect();
     let statuses = host.vms.statuses(&app_ids).await;
+    let now_ms = crate::clock::now_ms();
 
     ObservedState {
         instances: app_ids
@@ -73,7 +74,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
                             deployment_id: cutover.deployment_id.clone(),
                             deadline_ms: cutover.deadline_ms,
                             abandoned: cutover.abandoned,
-                            staging: staged.map(cutover::progress),
+                            staging: staged.map(|staged| cutover::progress(staged, now_ms)),
                         })
                     }),
                 }
@@ -82,7 +83,7 @@ pub async fn observe(host: &Host, desired: &HostDesiredState) -> ObservedState {
         volumes: volumes::observe_volumes(host, &volumes::volume_owners(desired, &snapshot.records)).await,
         checkpoints: checkpoints::observe_checkpoints(host, desired).await,
         exports: exports::observe_exports(host).await,
-        now_ms: crate::clock::now_ms(),
+        now_ms,
     }
 }
 

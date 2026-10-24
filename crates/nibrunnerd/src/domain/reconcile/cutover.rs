@@ -19,11 +19,30 @@ pub(crate) fn staging_id(app_id: &AppId) -> Option<AppId> {
     AppId::parse(format!("{app_id}{STAGING_SUFFIX}")).ok()
 }
 
-pub(super) fn progress(staged: &InstanceRecord) -> StagingProgress {
+/// How long a new deployment has to stay well before it is cut over to. A tenant that listens and
+/// then crashes does so within its first seconds, and its guest says so at once; ten seconds is two
+/// of the five-second probes a control plane's default check runs, and short beside the minute or
+/// more a cut-over is given.
+pub(crate) const SETTLE_MS: i64 = 10_000;
+
+/// A new deployment is well once it has been running for [`SETTLE_MS`] since it first was, with
+/// its tenant never restarted: one that restarted even once is crash-looping, however well it
+/// answered between the crashes.
+pub(super) fn progress(staged: &InstanceRecord, now_ms: i64) -> StagingProgress {
+    if staged.restart_count > 0 {
+        return StagingProgress::Failed;
+    }
+    let settled = staged
+        .health
+        .first_healthy_at
+        .as_ref()
+        .or(staged.started_at.as_ref())
+        .is_some_and(|since| now_ms - since.epoch_ms() >= SETTLE_MS);
     match staged.state {
         InstanceState::Pending => StagingProgress::Waiting,
         InstanceState::Starting => StagingProgress::Starting,
-        InstanceState::Running => StagingProgress::Healthy,
+        InstanceState::Running if settled => StagingProgress::Healthy,
+        InstanceState::Running => StagingProgress::Starting,
         _ => StagingProgress::Failed,
     }
 }
@@ -222,17 +241,20 @@ async fn abandon(host: &Host, desired: &DesiredInstance) {
         return;
     };
     let _staging = host.state.transition(&staging).await;
-    let why = host
-        .state
-        .record(&staging)
-        .await
-        .and_then(|record| record.message)
-        .map(|message| format!(" ({})", message.as_str()))
-        .unwrap_or_default();
+    let staged = host.state.record(&staging).await;
+    let tenant_restarts = staged.as_ref().map_or(0, |record| record.restart_count);
+    let why = if tenant_restarts > 0 {
+        format!(" (its tenant restarted {tenant_restarts} times while staged)")
+    } else {
+        staged
+            .and_then(|record| record.message)
+            .map(|message| format!(" ({})", message.as_str()))
+            .unwrap_or_default()
+    };
     retire(host, &staging, "cutover-abandoned").await;
     let serving = host.state.record(owner).await.map(|record| record.deployment_id);
     let note = StateMessage::new(format!(
-        "cutover_abandoned: deployment {} did not become healthy within its cutoverTimeoutMs{why}, so it was stopped and deployment {} keeps serving",
+        "cutover_abandoned: deployment {} did not become healthy and stay so within its cutoverTimeoutMs{why}, so it was stopped and deployment {} keeps serving",
         desired.deployment_id,
         serving.map_or_else(|| "the old one".to_string(), |id| id.to_string()),
     ));
@@ -245,6 +267,7 @@ async fn abandon(host: &Host, desired: &DesiredInstance) {
             record.cutover_note = Some(note);
             record.cutover_outcome = Some(protocol::CutoverOutcome::Abandoned {
                 deployment_id: desired.deployment_id.clone(),
+                tenant_restarts,
             });
         })
         .await;
@@ -488,7 +511,8 @@ mod tests {
         assert_eq!(
             to_reported_instance(&owner, None).cutover,
             Some(protocol::CutoverOutcome::Abandoned {
-                deployment_id: new_deployment()
+                deployment_id: new_deployment(),
+                tenant_restarts: 0,
             })
         );
         let said = to_reported_instance(&owner, None).message.unwrap();
@@ -681,8 +705,18 @@ mod tests {
         assert!(!host.vms.calls().contains(&VmCall::Exchange));
 
         host.state
-            .update_record(&staging(), |record| record.state = InstanceState::Running)
+            .update_record(&staging(), |record| {
+                record.state = InstanceState::Running;
+                record.health.first_healthy_at = Some(protocol::Timestamp::now());
+            })
             .await;
+        super::super::reconcile(host.arc(), &document(new_deployment()), Trigger::Tick).await;
+        assert!(
+            !host.vms.calls().contains(&VmCall::Exchange),
+            "well, but not for long enough yet"
+        );
+
+        settled(&host).await;
         super::super::reconcile(host.arc(), &document(new_deployment()), Trigger::Tick).await;
 
         let owner = host.state.record(&app_id()).await.unwrap();
@@ -697,6 +731,103 @@ mod tests {
             VmCall::Discard,
             VmCall::DeleteTap
         ]));
+    }
+
+    /// The staged deployment, well since longer ago than a cut-over waits.
+    async fn settled(host: &TestHost) {
+        host.state
+            .update_record(&staging(), |record| {
+                record.state = InstanceState::Running;
+                record.health.first_healthy_at =
+                    Some(protocol::Timestamp::from_epoch_ms(now_ms() - SETTLE_MS - 1));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_listened_and_then_crashed_is_never_cut_over_to() {
+        use crate::domain::metrics::passes::Trigger;
+        let _serial = ONE_HOST_AT_A_TIME.lock().await;
+        let host = test_host().await;
+        let hostname = app_hostname().hostname;
+        super::super::reconcile(host.arc(), &document(deployment_id()), Trigger::Change).await;
+        host.vms.set_status(crate::adapters::vm::VmStatus {
+            frozen: false,
+            loaded: true,
+            active: true,
+            failed: false,
+            started_this_boot: true,
+            exit: None,
+        });
+        host.state
+            .update_record(&app_id(), |record| record.state = InstanceState::Running)
+            .await;
+        let old_port = host.router.routes().await.port_for(hostname.as_str()).unwrap();
+        super::super::reconcile(host.arc(), &document(new_deployment()), Trigger::Change).await;
+        settled(&host).await;
+        host.state
+            .update_record(&staging(), |record| record.restart_count = 5)
+            .await;
+
+        super::super::reconcile(host.arc(), &document(new_deployment()), Trigger::Tick).await;
+
+        assert!(!host.vms.calls().contains(&VmCall::Exchange));
+        let owner = host.state.record(&app_id()).await.unwrap();
+        assert_eq!(owner.deployment_id, deployment_id());
+        assert_eq!(
+            host.router.routes().await.port_for(hostname.as_str()),
+            Some(old_port),
+            "the old deployment keeps serving"
+        );
+        assert!(host.state.record(&staging()).await.is_none());
+        let reported = to_reported_instance(&owner, None);
+        assert_eq!(
+            reported.cutover,
+            Some(protocol::CutoverOutcome::Abandoned {
+                deployment_id: new_deployment(),
+                tenant_restarts: 5,
+            })
+        );
+        assert!(reported
+            .message
+            .unwrap()
+            .as_str()
+            .contains("its tenant restarted 5 times while staged"),);
+    }
+
+    #[test]
+    fn a_staged_deployment_is_well_once_it_has_stayed_so_for_the_settle_window_without_a_restart() {
+        let now = 1_800_000_000_000;
+        let staged = |state, healthy_ago_ms: i64, restarts| {
+            instance_record(|record| {
+                record.state = state;
+                record.restart_count = restarts;
+                record.health.first_healthy_at =
+                    Some(protocol::Timestamp::from_epoch_ms(now - healthy_ago_ms));
+            })
+        };
+        for (record, expected) in [
+            (
+                staged(InstanceState::Running, SETTLE_MS, 0),
+                StagingProgress::Healthy,
+            ),
+            (
+                staged(InstanceState::Running, SETTLE_MS - 1, 0),
+                StagingProgress::Starting,
+            ),
+            (
+                staged(InstanceState::Running, SETTLE_MS, 1),
+                StagingProgress::Failed,
+            ),
+            (staged(InstanceState::Starting, 0, 1), StagingProgress::Failed),
+            (staged(InstanceState::Starting, 0, 0), StagingProgress::Starting),
+            (
+                staged(InstanceState::Unhealthy, SETTLE_MS, 0),
+                StagingProgress::Failed,
+            ),
+        ] {
+            assert_eq!(progress(&record, now), expected, "{:?}", record.state);
+        }
     }
 
     fn on_request_document(deployment: DeploymentId) -> protocol::HostDesiredState {
@@ -751,7 +882,8 @@ mod tests {
         assert_eq!(
             to_reported_instance(&owner, None).cutover,
             Some(protocol::CutoverOutcome::Abandoned {
-                deployment_id: new_deployment()
+                deployment_id: new_deployment(),
+                tenant_restarts: 0,
             })
         );
         assert_eq!(

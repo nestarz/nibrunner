@@ -614,6 +614,7 @@ fn a_report_omits_what_it_does_not_know() {
         cutover: None,
         labels: InstanceLabels::default(),
         cron: Vec::new(),
+        restarts_spent: false,
     };
     let written = serde_json::to_value(&instance).unwrap();
     assert_eq!(written["lastExitCode"], 0);
@@ -1153,6 +1154,7 @@ mod schema {
                     command_digest: Sha256Digest::parse("d".repeat(64)).unwrap(),
                     next_run: Some(now.clone()),
                 }],
+                restarts_spent: false,
             }],
             checkpoints: vec![ReportedCheckpoint {
                 checkpoint_id: CheckpointId::parse("ckpt-1").unwrap(),
@@ -2112,10 +2114,19 @@ fn a_cutover_outcome_is_reported_by_kind() {
     );
     assert_eq!(
         serde_json::to_value(CutoverOutcome::Abandoned {
-            deployment_id: DeploymentId::parse("dep-2").unwrap()
+            deployment_id: DeploymentId::parse("dep-2").unwrap(),
+            tenant_restarts: 0,
         })
         .unwrap(),
         serde_json::json!({ "kind": "abandoned", "deploymentId": "dep-2" })
+    );
+    assert_eq!(
+        serde_json::to_value(CutoverOutcome::Abandoned {
+            deployment_id: DeploymentId::parse("dep-2").unwrap(),
+            tenant_restarts: 5,
+        })
+        .unwrap(),
+        serde_json::json!({ "kind": "abandoned", "deploymentId": "dep-2", "tenantRestarts": 5 })
     );
 }
 

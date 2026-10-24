@@ -61,6 +61,9 @@ With `maxRestarts: 0` the program is run once. When it ends, by any exit code or
 instance is reported `exited` with `lastExitCode` set to the program's status (the code, or 128
 plus the signal), and it is not started again until a new `deploymentId`. It is reported `failed`
 only when the guest went down without saying how the program ended.
+
+An instance whose program used every restart of its budget without staying up is reported
+`failed` with `restartsSpent: true`: it is crash-looping, not asleep or stopped.
 ## New deployments
 
 By default a new `deploymentId` stops the running instance before the new one boots, so the app
@@ -76,13 +79,20 @@ deployment first:
 
 | What happens | Reported `message` |
 | --- | --- |
-| The new deployment passes its health check: its hostnames move to it, then the old one is stopped | none |
-| It is not healthy within `cutoverTimeoutMs`: it is stopped and the old deployment keeps serving | `cutover_abandoned: ...` |
+| The new deployment passes its health check and stays healthy for 10 seconds without its program restarting: its hostnames move to it, then the old one is stopped | none |
+| It is not healthy and settled within `cutoverTimeoutMs`, or its program restarts before the cut-over: it is stopped and the old deployment keeps serving | `cutover_abandoned: ...` |
 | The instance writes to a volume: the old one is stopped first | `cutover_fallback: ...` |
 | The host has no room for both within `cutoverTimeoutMs`: the old one is stopped first | `cutover_fallback: ...` |
 
 The instance's `cutover` says the same as a value: `{ "kind": "fallback", "reason": "volume" }`
-(or `no-room`, `no-staging-name`), or `{ "kind": "abandoned", "deploymentId": "..." }`.
+(or `no-room`, `no-staging-name`), or `{ "kind": "abandoned", "deploymentId": "..." }`, with
+`tenantRestarts` when its program restarted while it was staged.
+
+<Callout title="Why it waits">
+  A program that listens and then crashes passes a check of its port once. Ten seconds is two
+  probes at the usual five-second interval, so a crash in its first seconds is seen before the
+  old deployment is stopped. A restart after the cut-over does not roll it back.
+</Callout>
 
 The same holds for an `on-request` instance that is asleep: the new deployment boots beside its
 snapshot, a request meanwhile wakes the old deployment, and at the cut-over the old snapshot is
