@@ -1693,6 +1693,30 @@ mod schema {
     }
 
     #[test]
+    fn a_single_run_shares_its_jobs_name_once_per_instant() {
+        let at = |instant: &str| {
+            with(
+                without(cron_job_json(), "/schedule"),
+                "/at",
+                serde_json::json!(instant),
+            )
+        };
+        let declaring = |jobs: serde_json::Value| with(desired_json(), "/instances/0/cron", jobs);
+        let taken = declaring(serde_json::json!([
+            cron_job_json(),
+            at("2026-10-24T16:15:00Z"),
+            at("2026-10-24T17:00:00Z")
+        ]));
+        let document: HostDesiredState = serde_json::from_value(taken).unwrap();
+        assert_eq!(document.instances[0].cron.as_ref().unwrap().len(), 3);
+        let twice = declaring(serde_json::json!([
+            at("2026-10-24T16:15:00Z"),
+            at("2026-10-24T16:15:00Z")
+        ]));
+        assert!(serde_json::from_value::<HostDesiredState>(twice).is_err());
+    }
+
+    #[test]
     fn the_desired_state_schema_cannot_see_a_cron_job_named_twice() {
         let validator = validator(crate::schema::desired_state());
         let document = with(

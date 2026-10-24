@@ -39,7 +39,7 @@ Give the instance a [`cron`](/docs/reference/desired) list:
 
 | Field | Meaning |
 | --- | --- |
-| `name` | The job's ID in logs and in `reported.json`. Unique in the instance. |
+| `name` | The job's ID in logs and in `reported.json`. One `schedule` per name; an `at` entry takes the name of the job it runs, once per instant. |
 | `schedule` | When it runs, in the [schedule syntax](#schedule-syntax). |
 | `at` | Instead of `schedule`: one run, due as soon as the host sees it at or after this instant. |
 | `command` | One line for the shell. |

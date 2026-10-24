@@ -520,7 +520,8 @@ pub struct DesiredInstance {
     /// deployment.
     #[serde(default, skip_serializing_if = "InstanceLabels::is_empty")]
     pub labels: InstanceLabels,
-    /// The deployment's cron jobs, each named once. Present, they are the whole of its table:
+    /// The deployment's cron jobs: one schedule per name, and any single runs, each under the name
+    /// of the job it runs and at an instant of its own. Present, they are the whole of its table:
     /// a change replaces it in place and its guest's `crontab` is refused. Absent, the guest
     /// installs its own with `crontab`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,10 +638,17 @@ impl TryFrom<DesiredInstanceFields> for DesiredInstance {
                 "an instance names at most {MAX_LAYERS} layers, because a microVM has that many drives to give them"
             )));
         }
-        let mut names = std::collections::BTreeSet::new();
-        if let Some(job) = fields.cron.iter().flatten().find(|job| !names.insert(&job.name)) {
+        // A single run is its job's, so it shares the job's name; two schedules under one name, or
+        // two runs of a name at one instant, would be one key for two.
+        let mut jobs = std::collections::BTreeSet::new();
+        if let Some(job) = fields
+            .cron
+            .iter()
+            .flatten()
+            .find(|job| !jobs.insert((&job.name, &job.at)))
+        {
             return Err(InvalidValue::new_public(&format!(
-                "the cron job {} is named twice, and a name is one job",
+                "the cron job {} is named twice, and a name is one schedule and one run per instant",
                 job.name
             )));
         }

@@ -299,6 +299,27 @@ mod tests {
     }
 
     #[test]
+    fn a_single_run_under_its_jobs_name_is_a_job_of_its_own() {
+        let mut scheduler = CronScheduler::default();
+        let jobs = declared(serde_json::json!([every_minute("tick"), {
+            "name": "tick", "at": "2026-01-01T00:00:30Z", "command": "echo tick", "timeoutS": 30, "backoffMs": []
+        }]));
+        scheduler.synchronize(
+            std::slice::from_ref(&jobs),
+            at("2026-01-01T00:00:00Z"),
+            chrono_tz::UTC,
+        );
+        let manual = scheduler.due(at("2026-01-01T00:00:30Z"), chrono_tz::UTC);
+        assert_eq!(manual.len(), 1);
+        assert!(matches!(manual[0].job.when, CronWhen::At(_)));
+        scheduler.synchronize(&[jobs], at("2026-01-01T00:00:40Z"), chrono_tz::UTC);
+        let scheduled = scheduler.due(at("2026-01-01T00:01:00Z"), chrono_tz::UTC);
+        assert_eq!(scheduled.len(), 1);
+        assert!(matches!(scheduled[0].job.when, CronWhen::Schedule(_)));
+        assert_eq!(scheduled[0].job.id, manual[0].job.id);
+    }
+
+    #[test]
     fn a_schedule_with_no_occurrence_is_never_due_and_leaves_the_others_scheduled() {
         let mut scheduler = CronScheduler::default();
         let mut never = every_minute("never");

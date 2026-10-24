@@ -428,7 +428,7 @@
           "$ref": "#/$defs/AppConfig"
         },
         "cron": {
-          "description": "The deployment's cron jobs, each named once. Present, they are the whole of its table:\na change replaces it in place and its guest's `crontab` is refused. Absent, the guest\ninstalls its own with `crontab`.",
+          "description": "The deployment's cron jobs: one schedule per name, and any single runs, each under the name\nof the job it runs and at an instant of its own. Present, they are the whole of its table:\na change replaces it in place and its guest's `crontab` is refused. Absent, the guest\ninstalls its own with `crontab`.",
           "type": [
             "array",
             "null"
