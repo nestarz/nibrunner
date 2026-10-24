@@ -43,8 +43,8 @@ Give the instance a [`cron`](/docs/reference/desired) list:
 | `schedule` | When it runs, in the [schedule syntax](#schedule-syntax). |
 | `at` | Instead of `schedule`: one run, due as soon as the host sees it at or after this instant. |
 | `command` | One line for the shell. |
-| `timeoutS` | Seconds a run may last. |
-| `backoffMs` | Delays before each retry of a failed run: at most 5, each at most an hour. |
+| `timeoutS` | Seconds an attempt may last. |
+| `backoffMs` | Delays before each [retry](#runs) of a failed attempt: at most 5, each at most an hour. |
 
 - The list is the deployment's whole table. Changing it under the same `deploymentId` restarts
   nothing.
@@ -102,12 +102,56 @@ directory, and environment, using `/bin/sh` or `SHELL` if set. Crontab assignmen
 app's environment.
 
 - Running commands keep the guest awake.
-- Runs of the same job can overlap.
+- A job runs once at a time. A job due while it still runs is skipped; other jobs run beside it.
 - The host does not replay jobs missed while the daemon was stopped.
 - Editing or removing a crontab changes future runs. Running commands continue.
 
-Standard output and standard error go to the app's [logs](/docs/guides/logs-and-metrics).
-Each line includes a job ID and a run ID.
+Standard output and standard error go to the app's [logs](/docs/guides/logs-and-metrics),
+between two lines the host writes:
+
+```text
+cron retry started (scheduled 2026-10-24T16:15:00Z, attempt 1)
+cron retry completed exit 0 after 344 ms
+```
+
+Each line carries the job ID, the run ID (`<instant>/<attempt>`), and the attempt's trace and
+span. Each attempt is a trace: the command gets `TRACEPARENT`, so the spans and records the app
+exports join it.
+
+## Runs
+
+A run of a declared job is one or more attempts.
+
+| Outcome | Exit | Reason | Retried |
+| --- | --- | --- | --- |
+| The command exited 0 | `0` | | No |
+| It exited with another code, or was killed by a signal (128 plus the signal) | the code | | Yes |
+| It outlasted `timeoutS`: its process group is killed | `124` | `timeout` | Yes |
+| Its deployment was stopped or replaced | | `cancelled: deployment replaced` | No |
+| The guest refused to start it | | `rejected: busy`, `rejected: spawn` or `rejected: malformed` | No |
+| The job was still running when this run was due | | `skipped: previous run still running` | No |
+
+A retry waits for the next delay of `backoffMs`, under a new attempt number and a new trace. It
+is dropped when the job is due again first or is running.
+
+When the [telemetry sink](/docs/guides/logs-and-metrics#ship-logs-and-metrics-to-a-bucket) is
+configured and the instance carries `labels.app` and `labels.timeline`, each attempt has a record
+at `cron/<app>/<timeline>/<job>/<instant>/<attempt>`, with `/` and `%` in the timeline escaped as
+`%2F` and `%25`. `<instant>` is the scheduled minute, or a declared run's `at`, as
+`2026-10-24T16:15:00Z`.
+
+1. The host creates the record before the attempt starts, and only if it is not there yet:
+   `host`, `rev`, `deployment`, `trace`, `started`, and `manual` for an `at` run.
+2. It overwrites it once when the attempt ends, adding `ended`, `exit`, `duration_ms`, `status`
+   (`completed` or `failed`) and `reason`.
+
+<Callout title="One attempt across hosts">
+  A host that finds the record already there does not run the attempt and writes no line:
+  another host, or this one before a restart, took it. `nibrunner_cron_attempts_taken_total`
+  counts these. Two hosts given the same table run each attempt once.
+</Callout>
+
+Without the sink, declared jobs run without records.
 
 `reported.json` lists each instance's scheduled jobs as `instances[].cron`, in table order:
 `jobId` (the job ID its log lines carry: a declared job's `name`), `schedule`, `commandDigest`

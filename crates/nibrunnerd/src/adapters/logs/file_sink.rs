@@ -157,6 +157,7 @@ impl FileLogSink {
                 text,
                 job_id,
                 run_id,
+                ..
             } => (
                 *stream,
                 Cow::Owned(format!("cronJobId={job_id} cronRunId={run_id} {text}")),
@@ -296,6 +297,8 @@ mod tests {
                     text: "cron output".into(),
                     job_id: "cron-job".into(),
                     run_id: "run-1".into(),
+                    trace: "019a1b2c3d4e0123456789abcdef0123".into(),
+                    span: "0123456789abcdef".into(),
                 },
                 0,
             ),
@@ -350,6 +353,8 @@ mod tests {
                     text: "tick".into(),
                     job_id: "job".into(),
                     run_id: "run".into(),
+                    trace: "019a1b2c3d4e0123456789abcdef0123".into(),
+                    span: "0123456789abcdef".into(),
                 },
                 3,
             ),

@@ -195,7 +195,8 @@ pub struct LogLine {
     pub(crate) encoding: Option<Encoding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<Severity>,
-    /// The trace and span the guest's runtime put on the record; never guessed.
+    /// The trace and span the guest's runtime put on the record, or the cron attempt that printed
+    /// the line; never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,10 +453,12 @@ struct Unit {
     app: String,
     rev: String,
     context: String,
+    timeline: Option<String>,
 }
 
 impl Unit {
-    /// The labels' `app`, `rev` and `context`; none without an `app`, which is not shipped.
+    /// The labels' `app`, `rev`, `context` and `timeline`; none without an `app`, which is not
+    /// shipped.
     fn of(labels: &InstanceLabels) -> Option<Self> {
         let label = |k: &str| {
             labels
@@ -467,6 +470,7 @@ impl Unit {
             app: label("app")?,
             rev: label("rev").unwrap_or_default(),
             context: label("context").unwrap_or_default(),
+            timeline: label("timeline"),
         })
     }
 }
@@ -593,6 +597,23 @@ impl Shipping {
     }
 }
 
+/// Where a declared cron job of one deployment records its attempts: under its instance's `app`
+/// and `timeline` labels, beside its logs.
+pub struct CronScope<'a> {
+    bucket: &'a Bucket,
+    pub host: String,
+    pub app: String,
+    pub timeline: String,
+    pub rev: String,
+}
+
+impl CronScope<'_> {
+    /// Whether it was written: `create` refuses a record already there.
+    pub async fn put(&self, key: &str, body: Vec<u8>, create: bool) -> Result<bool, TelemetryError> {
+        self.bucket.put(key, body, create).await
+    }
+}
+
 pub struct ObjectSink {
     logs: Option<(Bucket, SealKey)>,
     metrics: Option<Bucket>,
@@ -660,23 +681,25 @@ impl ObjectSink {
 
     pub fn output(&self, event: &TenantLogEvent) {
         let unit = self.lock().unit(&event.app_id, Some(&event.deployment_id));
-        let (stream, msg, job, run) = match &event.body {
+        let (stream, msg, cron) = match &event.body {
             TenantLogBody::CronData {
                 stream,
                 text,
                 job_id,
                 run_id,
+                trace,
+                span,
             } => (
                 *stream,
                 text.clone(),
-                Some(job_id.to_string()),
-                Some(run_id.to_string()),
+                Some([job_id, run_id, trace, span].map(String::clone)),
             ),
             body => {
                 let (stream, text) = super::file_sink::FileLogSink::text(body);
-                (stream, text.into_owned(), None, None)
+                (stream, text.into_owned(), None)
             }
         };
+        let [job, run, trace, span] = cron.map_or([None, None, None, None], |ids| ids.map(Some));
         let k = match stream {
             TenantLogStream::Stdout => LogKind::Stdout,
             TenantLogStream::Stderr => LogKind::Stderr,
@@ -687,6 +710,8 @@ impl ObjectSink {
                 msg: Some(msg),
                 job,
                 run,
+                trace,
+                span,
                 ..l
             }
         });
@@ -725,6 +750,25 @@ impl ObjectSink {
             Unit::of(&record.labels),
             vec![TraceLine::Span(Box::new(span))],
         );
+    }
+
+    pub fn cron_scope(&self, app_id: &AppId, deployment_id: &DeploymentId) -> Option<CronScope<'_>> {
+        let (bucket, _) = self.logs.as_ref()?;
+        let state = self.lock();
+        let unit = state.unit(app_id, Some(deployment_id))?;
+        Some(CronScope {
+            bucket,
+            host: state.host.clone(),
+            app: unit.app,
+            timeline: unit.timeline?,
+            rev: unit.rev,
+        })
+    }
+
+    /// The root span of a cron attempt, labelled as the deployment that ran it.
+    pub fn cron_attempt(&self, app_id: &AppId, deployment_id: &DeploymentId, span: SpanLine) {
+        let unit = self.lock().unit(app_id, Some(deployment_id));
+        self.traced(app_id, unit, vec![TraceLine::Span(Box::new(span))]);
     }
 
     /// What a guest exported over OTLP, labelled as the deployment that sent it.
@@ -1199,7 +1243,9 @@ pub(crate) mod tests {
                 stream: TenantLogStream::Stdout,
                 text: "tick".into(),
                 job_id: "nightly".into(),
-                run_id: "r-1".into(),
+                run_id: "2026-10-16T12:05:00Z/1".into(),
+                trace: "019a1b2c3d4e0123456789abcdef0123".into(),
+                span: "0123456789abcdef".into(),
             },
             ..event(NOW * 1000, "")
         };
@@ -1217,9 +1263,17 @@ pub(crate) mod tests {
             (
                 chunk[0].msg.as_deref(),
                 chunk[0].job.as_deref(),
-                chunk[0].run.as_deref()
+                chunk[0].run.as_deref(),
+                chunk[0].trace.as_deref(),
+                chunk[0].span.as_deref(),
             ),
-            (Some("tick"), Some("nightly"), Some("r-1"))
+            (
+                Some("tick"),
+                Some("nightly"),
+                Some("2026-10-16T12:05:00Z/1"),
+                Some("019a1b2c3d4e0123456789abcdef0123"),
+                Some("0123456789abcdef")
+            )
         );
     }
 

@@ -7,8 +7,7 @@ use protocol::TenantLogStream;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::domain::cron::execution::CronRunOutput;
-use crate::domain::cron::scheduler::ScheduledRun;
+use crate::domain::cron::execution::{CronOutcome, CronRunOutput};
 use crate::ports::LogSink;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,31 +31,54 @@ pub enum CronExecutionError {
     TooLarge,
     #[error("the cron run was cancelled because its deployment is no longer running")]
     Cancelled,
+    #[error("the cron run was cancelled because it outlasted its timeout")]
+    TimedOut,
+}
+
+/// How an attempt that went this way ended.
+pub fn outcome(result: &Result<CronExitStatus, CronExecutionError>) -> CronOutcome {
+    match result {
+        Ok(CronExitStatus { code, signal: 0 }) => {
+            CronOutcome::Exited(i32::try_from(*code).unwrap_or(i32::MAX))
+        }
+        Ok(CronExitStatus { signal, .. }) => CronOutcome::Exited(128 + i32::try_from(*signal).unwrap_or(0)),
+        Err(CronExecutionError::TimedOut) => CronOutcome::TimedOut,
+        Err(CronExecutionError::Cancelled) => CronOutcome::Cancelled,
+        Err(CronExecutionError::Rejected(wire::Rejection::Busy)) => CronOutcome::Rejected("busy"),
+        Err(CronExecutionError::Rejected(wire::Rejection::SpawnFailed)) => CronOutcome::Rejected("spawn"),
+        Err(CronExecutionError::Rejected(wire::Rejection::Malformed) | CronExecutionError::TooLarge) => {
+            CronOutcome::Rejected("malformed")
+        }
+        Err(CronExecutionError::Disconnected | CronExecutionError::Malformed) => CronOutcome::Disconnected,
+    }
 }
 
 pub struct GuestCronExecution;
 
 impl GuestCronExecution {
+    /// Runs `output`'s attempt in the guest at `path` until it exits or `cancellation` says why
+    /// it is cut short. The process is handed the attempt's trace as `TRACEPARENT`.
     pub async fn run(
         path: &Path,
-        run: ScheduledRun,
+        output: &mut CronRunOutput,
         sink: &dyn LogSink,
-        cancellation: impl Future<Output = ()> + Send,
+        cancellation: impl Future<Output = CronExecutionError> + Send,
     ) -> Result<CronExitStatus, CronExecutionError> {
+        let job = &output.run().job;
         let request = ExecutionRequest {
-            command: run.job.command.expose().to_owned(),
-            environment: run.job.environment.as_ref().map_or_else(Vec::new, |environment| {
-                environment
-                    .iter()
-                    .map(|(name, value)| format!("{name}={}", value.expose()))
-                    .collect()
-            }),
+            command: job.command.expose().to_owned(),
+            environment: job
+                .environment
+                .iter()
+                .flat_map(|environment| environment.iter())
+                .map(|(name, value)| format!("{name}={}", value.expose()))
+                .chain([format!("TRACEPARENT={}", output.trace().traceparent())])
+                .collect(),
         };
         let request = wire::encode_request(&request).map_err(|_| CronExecutionError::TooLarge)?;
-        let mut output = CronRunOutput::new(run);
         let outcome = tokio::select! {
-            result = Self::execute(path, &request, &mut output, sink) => result,
-            () = cancellation => Err(CronExecutionError::Cancelled),
+            result = Self::execute(path, &request, output, sink) => result,
+            error = cancellation => Err(error),
         };
         sink.publish(output.close()).await;
         outcome
@@ -194,6 +216,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+    use crate::domain::cron::execution::AttemptTrace;
     use crate::ports::{TenantLogBody, TenantLogEvent};
     use crate::test_support::cron_run;
 
@@ -206,8 +229,15 @@ mod tests {
         }
     }
 
-    fn run() -> ScheduledRun {
-        cron_run("echo secret")
+    fn output() -> CronRunOutput {
+        CronRunOutput::new(
+            cron_run("echo secret"),
+            1,
+            AttemptTrace {
+                trace: "019a1b2c3d4e0123456789abcdef0123".into(),
+                span: "0123456789abcdef".into(),
+            },
+        )
     }
 
     async fn guest(
@@ -232,9 +262,11 @@ mod tests {
             let header = wire::decode_request_header(&header).unwrap();
             let mut body = vec![0; header.body_length];
             stream.read_exact(&mut body).await.unwrap();
+            let request = wire::decode_request(header, &body).unwrap();
+            assert_eq!(request.command, "echo secret");
             assert_eq!(
-                wire::decode_request(header, &body).unwrap().command,
-                "echo secret"
+                request.environment,
+                ["TRACEPARENT=00-019a1b2c3d4e0123456789abcdef0123-0123456789abcdef-01"]
             );
             let mut acknowledgements = Vec::new();
             for reply in replies {
@@ -265,7 +297,7 @@ mod tests {
         ])
         .await;
         let sink = Output::default();
-        let status = GuestCronExecution::run(&path, run(), &sink, std::future::pending())
+        let status = GuestCronExecution::run(&path, &mut output(), &sink, std::future::pending())
             .await
             .unwrap();
         assert_eq!(status, CronExitStatus { code: 7, signal: 0 });
@@ -304,8 +336,9 @@ mod tests {
             assert!(stream.read_u8().await.is_err());
         });
         let sink = Arc::new(Output::default());
-        let outcome = GuestCronExecution::run(&path, run(), sink.as_ref(), async {
+        let outcome = GuestCronExecution::run(&path, &mut output(), sink.as_ref(), async {
             let _ = cancel.await;
+            CronExecutionError::Cancelled
         })
         .await;
         assert!(matches!(outcome, Err(CronExecutionError::Cancelled)));
@@ -316,7 +349,7 @@ mod tests {
     async fn a_guest_that_exits_without_started_is_refused() {
         let (_directory, path, guest) = guest(vec![ExecutionFrame::Exit { code: 0, signal: 0 }]).await;
         assert!(matches!(
-            GuestCronExecution::run(&path, run(), &Output::default(), std::future::pending()).await,
+            GuestCronExecution::run(&path, &mut output(), &Output::default(), std::future::pending()).await,
             Err(CronExecutionError::Malformed)
         ));
         guest.await.unwrap();

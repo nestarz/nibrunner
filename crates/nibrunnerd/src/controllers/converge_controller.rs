@@ -191,7 +191,7 @@ mod tests {
     async fn a_replacement_releases_the_desired_cache_while_draining_old_cron_runs() {
         let host = test_host().await;
         host.cron_runs.synchronize(&[(app_id(), deployment_id())]).await;
-        let mut run = host.cron_runs.start(&app_id(), &deployment_id()).unwrap();
+        let mut run = host.cron_runs.start(&app_id(), &deployment_id(), "tick").unwrap();
         let desired = desired_state(|state| {
             state.instances = vec![desired_instance(|instance| {
                 instance.deployment_id = protocol::DeploymentId::parse("dep-2").unwrap()
@@ -209,7 +209,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(host.cache.try_lock().unwrap().latest(), Some(&desired));
-        assert!(host.cron_runs.start(&app_id(), &deployment_id()).is_none());
+        assert!(host.cron_runs.start(&app_id(), &deployment_id(), "tick").is_err());
         drop(run);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
             .await

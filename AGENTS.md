@@ -75,7 +75,10 @@ Rust workspace (`crates/*`) with the docs site under `docs/`.
   zone, parsed with `chrono-tz`. Both settings are required, without defaults. An instance's
   `cron` in desired state is its deployment's whole table, taken up on every accepted document and
   never stored; without it, jobs are registered through `crontab`, which is refused beside it.
-- Cron runs may overlap. Editing a crontab reschedules future runs; stopping or replacing its
+- A cron job runs once at a time; one due while it runs is skipped. Each attempt is a trace,
+  logged between a start and an end line, and a declared job's attempt is fenced by the
+  conditional create of its record through the sink, then retried under `backoffMs` and cut at
+  `timeoutS`. Editing a crontab reschedules future runs; stopping or replacing its
   deployment cancels and drains active runs before the guest stops. Registry notifications and
   the next due time drive scheduling, without polling or catching up missed runs.
 - OCI registry pulls use `oci-client` over HTTPS with anonymous registry authentication. Desired

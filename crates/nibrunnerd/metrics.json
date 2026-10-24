@@ -420,6 +420,12 @@
     "name": "nibrunner_desired_state_unreadable_total"
   },
   {
+    "help": "Declared cron attempts not run here because their record was already there: another host, or this one before a restart, had taken them.",
+    "kind": "counter",
+    "labels": [],
+    "name": "nibrunner_cron_attempts_taken_total"
+  },
+  {
     "help": "When reported.json was last written, as seconds since the epoch. 0 until it has been.",
     "kind": "gauge",
     "labels": [],

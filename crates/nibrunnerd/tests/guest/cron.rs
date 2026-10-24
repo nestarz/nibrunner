@@ -4,11 +4,15 @@ use chrono::Utc;
 use guest_contract::cron_execution::{self as wire, ExecutionFrame, ExecutionRequest};
 use nibrunnerd::adapters::cron_execution::{CronExitStatus, GuestCronExecution};
 use nibrunnerd::controllers::cron_controller::CronController;
-use nibrunnerd::domain::cron::scheduler::{JobKey, ScheduledRun};
+use nibrunnerd::domain::cron::execution::{AttemptTrace, CronRunOutput};
+use nibrunnerd::domain::cron::jobs::CronJobs;
+use nibrunnerd::domain::cron::scheduler::ScheduledRun;
 use nibrunnerd::domain::filesystem::reader::guest_vsock_path;
 use nibrunnerd::ports::{LogSink, TenantLogBody, TenantLogEvent};
 use nibrunnerd::test_support::machine::{RunningHost, Tenant};
-use protocol::{CronCommand, CronJobDefinition, CronSchedule, DesiredInstanceState, InstanceState};
+use protocol::{
+    CronCommand, CronJobDefinition, CronSchedule, CronTable, DesiredInstanceState, InstanceState,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -106,24 +110,32 @@ impl GuestRun {
 }
 
 async fn command(host: &RunningHost, app: &Tenant, command: &str, output: &Output) -> CronExitStatus {
-    let run = ScheduledRun {
-        key: JobKey {
-            app_id: app.app_id.clone(),
-            deployment_id: app.instance.deployment_id.clone(),
-            index: 0,
-        },
-        job: CronJobDefinition {
+    let table = CronTable {
+        app_id: app.app_id.clone(),
+        deployment_id: app.instance.deployment_id.clone(),
+        jobs: vec![CronJobDefinition {
             schedule: CronSchedule::parse("@daily").unwrap(),
             command: CronCommand::parse(command).unwrap(),
             environment: None,
-        },
+        }]
+        .into(),
+        crontab: None,
+    };
+    let run = ScheduledRun {
+        app_id: app.app_id.clone(),
+        deployment_id: app.instance.deployment_id.clone(),
+        job: CronJobs::registered(&table).jobs.remove(0),
         scheduled_at: Utc::now(),
+    };
+    let trace = AttemptTrace {
+        trace: "019a1b2c3d4e0123456789abcdef0123".into(),
+        span: "0123456789abcdef".into(),
     };
     tokio::time::timeout(
         std::time::Duration::from_secs(15),
         GuestCronExecution::run(
             &guest_vsock_path(&host.host, &app.app_id),
-            run,
+            &mut CronRunOutput::new(run, 1, trace),
             output,
             std::future::pending(),
         ),
@@ -410,8 +422,8 @@ async fn a_due_registered_job_wakes_and_pins_its_guest_until_desired_stop_drains
     assert!(host
         .host
         .cron_runs
-        .start(&app.app_id, &app.instance.deployment_id)
-        .is_none());
+        .start(&app.app_id, &app.instance.deployment_id, "registered")
+        .is_err());
     controller
         .cron_once("2032-01-01T00:00:00Z".parse().unwrap())
         .await;

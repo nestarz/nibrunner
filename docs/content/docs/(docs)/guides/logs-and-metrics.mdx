@@ -193,14 +193,15 @@ a warning once when usage reaches 80%, and once more when it drops back below.
 A host can also send each app's output, its traces and an hourly rollup of its counters to an
 object store, in the objects a control plane reads. Only an instance whose `desired.json` entry carries `labels.app` is shipped; its
 `labels.rev` and `labels.context` and its `appId` (as `unit`) go on every line and counter, and a
-cron run's output carries its `job` and `run` ids. A log record a guest exported is a line of `k`
+cron attempt's lines carry its `job` and `run` ids and its `trace` and `span`. A log record a guest exported is a line of `k`
 `otel`, with its `severity`, and its `trace` and `span` when the runtime gave them.
 
 Each request is a root span under `traces/`: `trace`, `span`, `parent: null`, `kind: "server"`,
 `name`, `t` and `end`, `method`, `path`, the HTTP `status`, `deployment`, `rx` and `tx`, `wake`
 and `wake_us` when it waited for a wake, `cache` and `encoding` on a host with
 [`[proxy.http.cache]` or `[proxy.http.encode]`](/docs/guides/response-cache), and `parent_trace`
-when the caller sent a `traceparent`. A guest's spans follow with their `parent`, `kind`, `name`,
+when the caller sent a `traceparent`. Each [cron attempt](/docs/guides/cron-jobs#runs) is a root
+span too, `kind: "internal"`, named `cron <job>`. A guest's spans follow with their `parent`, `kind`, `name`,
 `status` (`unset`, `ok` or `error`) and `status_msg`, and their allow-listed `attrs`.
 
 ```toml
@@ -220,6 +221,7 @@ sink = "s3://my-bucket/fleets/my-fleet"
 | `logs/<app>/live-<hostId>.jsonl.gz` | every 5 s that the app printed: its last 2 minutes, at most 256 KiB |
 | `logs/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | every 5 minutes that it printed, and when `desired.json` stops naming it; named after its first line, never overwritten |
 | `traces/<app>/live-<hostId>.jsonl.gz`, `traces/<app>/<yyyymmddhh>/<mmss>-<hostId>.jsonl.gz` | the same, for its spans |
+| `cron/<app>/<timeline>/<job>/<instant>/<attempt>` | for each attempt of a job `desired.json` declares, on an instance labelled with a `timeline`: created when it starts, overwritten once when it ends |
 | `metrics/<hostId>/<yyyymmddhh>.json`, `metrics/<hostId>/<yyyymmdd>.json` | every 5 minutes that a counter moved: requests by status class and latency bucket, CPU seconds, peak memory, network bytes, wakes and sleeps, cache outcomes and bytes compressed, per unit: the hour's or day's total, and beside it a slot for each minute of the hour (`minutes`) or hour of the day (`hours`) that counted something |
 
 Log and trace objects are gzipped JSON lines sealed with XChaCha20-Poly1305 under the 32 raw bytes in

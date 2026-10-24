@@ -9,7 +9,16 @@ use crate::adapters::logs::object_sink::{
 use crate::adapters::otlp::trace::{SpanId, TraceBook, TraceId};
 use crate::domain::metrics::rollup::micros_rfc3339;
 
-const ATTRIBUTE_PREFIXES: [&str; 6] = ["http.", "url.", "db.", "rpc.", "exception.", "server."];
+const ATTRIBUTE_PREFIXES: [&str; 8] = [
+    "http.",
+    "url.",
+    "db.",
+    "rpc.",
+    "exception.",
+    "server.",
+    "cron.",
+    "process.exit_code",
+];
 /// Headers an SDK was told to capture: cookies and credentials, never kept.
 const HEADER_PREFIXES: [&str; 2] = ["http.request.header.", "http.response.header."];
 pub(crate) const ATTRIBUTES_KEPT: usize = 32;

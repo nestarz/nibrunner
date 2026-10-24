@@ -456,11 +456,14 @@ pub enum TenantLogBody {
         stream: protocol::TenantLogStream,
         text: String,
     },
+    /// A line of a cron attempt, or one the host wrote of it, under the attempt's trace.
     CronData {
         stream: protocol::TenantLogStream,
         text: String,
         job_id: String,
         run_id: String,
+        trace: String,
+        span: String,
     },
     Gap {
         dropped_bytes: u64,

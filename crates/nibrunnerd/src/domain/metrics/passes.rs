@@ -68,6 +68,7 @@ pub struct PassMetrics {
     refresh: Histogram,
     last_reconcile_at_ms: AtomicI64,
     desired_unreadable: AtomicU64,
+    cron_taken: AtomicU64,
     report_written_at_ms: AtomicI64,
 }
 
@@ -82,6 +83,7 @@ impl Default for PassMetrics {
             refresh: Histogram::over(&BUCKET_BOUNDS_SECONDS),
             last_reconcile_at_ms: AtomicI64::new(0),
             desired_unreadable: AtomicU64::new(0),
+            cron_taken: AtomicU64::new(0),
             report_written_at_ms: AtomicI64::new(0),
         }
     }
@@ -103,6 +105,10 @@ impl PassMetrics {
 
     pub fn desired_state_unreadable(&self) {
         self.desired_unreadable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cron_attempt_taken(&self) {
+        self.cron_taken.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn report_written(&self, at_ms: i64) {
@@ -204,6 +210,13 @@ static DESIRED_STATE_UNREADABLE_TOTAL: Metric = Metric {
     labels: &[],
 };
 
+static CRON_ATTEMPTS_TAKEN_TOTAL: Metric = Metric {
+    name: "nibrunner_cron_attempts_taken_total",
+    help: "Declared cron attempts not run here because their record was already there: another host, or this one before a restart, had taken them.",
+    kind: Kind::Counter,
+    labels: &[],
+};
+
 static REPORT_WRITTEN_TIMESTAMP_SECONDS: Metric = Metric {
     name: "nibrunner_report_written_timestamp_seconds",
     help: "When reported.json was last written, as seconds since the epoch. 0 until it has been.",
@@ -223,6 +236,7 @@ pub(super) static DECLARED: &[&Metric] = &[
     &RECONCILE_LAST_PASS_TIMESTAMP_SECONDS,
     &REFRESH_SECONDS,
     &DESIRED_STATE_UNREADABLE_TOTAL,
+    &CRON_ATTEMPTS_TAKEN_TOTAL,
     &REPORT_WRITTEN_TIMESTAMP_SECONDS,
 ];
 
@@ -300,6 +314,13 @@ pub(super) fn render(
         &DESIRED_STATE_UNREADABLE_TOTAL,
         &[],
         metrics.desired_unreadable.load(Ordering::Relaxed),
+    );
+
+    page.declare(&CRON_ATTEMPTS_TAKEN_TOTAL);
+    page.value(
+        &CRON_ATTEMPTS_TAKEN_TOTAL,
+        &[],
+        metrics.cron_taken.load(Ordering::Relaxed),
     );
 
     page.declare(&REPORT_WRITTEN_TIMESTAMP_SECONDS);
