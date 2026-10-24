@@ -36,6 +36,10 @@ const HEADER_OVERHEAD: usize = 32;
 // A `Vary` on anything but the coding gives one key more than one stored answer; past a few, a
 // resource that varies on everything is one nobody shares anyway.
 const MOST_VARIANTS: usize = 4;
+// How long a key that answered something unstorable passes conditionals on to the app; the next
+// conditional after it fetches the whole answer again, to learn whether it has become storable.
+const PASS_FOR: Duration = Duration::from_secs(120);
+const MOST_PASSES: u64 = 10_000;
 
 /// Where the app is, for the cache: asking it, and handing its answer through the encoder.
 pub(crate) trait Origin: Send + Sync + 'static {
@@ -167,8 +171,9 @@ fn options() -> CacheOptions {
     }
 }
 
-/// Whether the cache is the place for this request at all. One with a body, a range, or an
-/// upgrade goes to the app as it came.
+/// Whether the cache is the place for this request at all. One with a body, a range, an upgrade,
+/// or a precondition only the app can judge (`If-Match`, `If-Unmodified-Since`) goes to the app as
+/// it came.
 pub(crate) fn answerable<B>(request: &Request<B>) -> bool {
     let headers = request.headers();
     let has_body = headers.contains_key(TRANSFER_ENCODING)
@@ -178,6 +183,8 @@ pub(crate) fn answerable<B>(request: &Request<B>) -> bool {
     matches!(*request.method(), Method::GET | Method::HEAD)
         && !headers.contains_key(RANGE)
         && !headers.contains_key(UPGRADE)
+        && !headers.contains_key(IF_MATCH)
+        && !headers.contains_key(IF_UNMODIFIED_SINCE)
         && !has_body
 }
 
@@ -189,18 +196,49 @@ pub(crate) fn invalidating(method: &Method) -> bool {
     )
 }
 
-const CONDITIONALS: [HeaderName; 5] = [
-    IF_NONE_MATCH,
-    IF_MODIFIED_SINCE,
-    IF_MATCH,
-    IF_UNMODIFIED_SINCE,
-    IF_RANGE,
-];
+const CONDITIONALS: [HeaderName; 3] = [IF_NONE_MATCH, IF_MODIFIED_SINCE, IF_RANGE];
+
+/// The entity-tags an `If-None-Match` lists across all its lines (RFC 9110 §8.8.3), each without
+/// its weakness and `*` as itself, or none when a line does not parse.
+fn entity_tags(lines: hyper::header::GetAll<'_, HeaderValue>) -> Vec<String> {
+    let mut tags = Vec::new();
+    for line in lines {
+        let Some(mut rest) = line.to_str().ok() else {
+            return Vec::new();
+        };
+        loop {
+            rest = rest.trim_start_matches([',', ' ', '\t']);
+            if rest.is_empty() {
+                break;
+            }
+            let tag = rest.strip_prefix("W/").unwrap_or(rest);
+            let length = match tag.as_bytes().first() {
+                Some(b'*') if tag.len() == rest.len() => 1,
+                Some(b'"') => match tag[1..].find('"') {
+                    Some(end) => end + 2,
+                    None => return Vec::new(),
+                },
+                _ => return Vec::new(),
+            };
+            let (taken, after) = tag.split_at(length);
+            tags.push(taken.to_string());
+            rest = after;
+        }
+    }
+    tags
+}
+
+fn without_weakness(etag: &str) -> &str {
+    let etag = etag.trim();
+    etag.strip_prefix("W/").unwrap_or(etag)
+}
 
 /// What the visitor already holds, which the cache answers with a 304 when it is still current.
 #[derive(Debug, Clone, Default)]
 struct Held {
-    if_none_match: Option<String>,
+    /// Present whenever the visitor sent the field, so that one that does not parse still keeps
+    /// `If-Modified-Since` from being read (RFC 9110 §13.1.3), and matches nothing.
+    if_none_match: Option<Vec<String>>,
     if_modified_since: Option<SystemTime>,
 }
 
@@ -208,9 +246,8 @@ impl Held {
     fn of(headers: &HeaderMap) -> Self {
         Self {
             if_none_match: headers
-                .get(IF_NONE_MATCH)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string),
+                .contains_key(IF_NONE_MATCH)
+                .then(|| entity_tags(headers.get_all(IF_NONE_MATCH))),
             if_modified_since: headers
                 .get(IF_MODIFIED_SINCE)
                 .and_then(|value| value.to_str().ok())
@@ -224,14 +261,14 @@ impl Held {
         if status != StatusCode::OK {
             return false;
         }
-        let weak = |etag: &str| etag.trim().trim_start_matches("W/").to_string();
         if let Some(listed) = &self.if_none_match {
-            let Some(etag) = headers.get(ETAG).and_then(|value| value.to_str().ok()) else {
-                return false;
-            };
+            let etag = headers
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(without_weakness);
             return listed
-                .split(',')
-                .any(|held| held.trim() == "*" || weak(held) == weak(etag));
+                .iter()
+                .any(|held| held == "*" || Some(held.as_str()) == etag);
         }
         match (
             self.if_modified_since,
@@ -326,7 +363,7 @@ impl Asked {
         }
     }
 
-    fn forwarded(&self) -> Request<ProxyBody> {
+    fn forwarded(&self, with_conditionals: bool) -> Request<ProxyBody> {
         let mut parts = Request::builder()
             .method(self.visitor.method.clone())
             .uri(self.visitor.uri.clone())
@@ -336,8 +373,51 @@ impl Asked {
             .into_parts()
             .0;
         parts.headers = self.visitor.headers.clone();
+        if !with_conditionals {
+            for conditional in &CONDITIONALS {
+                parts.headers.remove(conditional);
+            }
+        }
         Request::from_parts(parts, empty())
     }
+
+    /// The app's `response`, or a 304 in its place when the visitor already holds it and the cache
+    /// is keeping it: its body then still runs to the end, to be stored, with nobody waiting.
+    fn as_held(&self, response: Response<ProxyBody>) -> Response<ProxyBody> {
+        if response.extensions().get::<Kept>().is_none()
+            || !self.held.is_current(response.status(), response.headers())
+        {
+            return response;
+        }
+        let (parts, body) = response.into_parts();
+        tokio::spawn(async move {
+            let _ = body.collect().await;
+        });
+        let mut not_modified = not_modified(&parts.headers);
+        not_modified.extensions_mut().insert(Kept);
+        not_modified
+    }
+}
+
+/// The 304 that stands for an answer with `headers` (RFC 9110 §15.4.5).
+fn not_modified(headers: &HeaderMap) -> Response<ProxyBody> {
+    let mut not_modified = Response::new(empty());
+    *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+    for name in [
+        CACHE_CONTROL,
+        CONTENT_LOCATION,
+        DATE,
+        ETAG,
+        EXPIRES,
+        VARY,
+        AGE,
+        LAST_MODIFIED,
+    ] {
+        for value in headers.get_all(&name) {
+            not_modified.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    not_modified
 }
 
 fn empty() -> ProxyBody {
@@ -370,6 +450,13 @@ impl Provenance {
             },
         }
     }
+}
+
+/// When a fill was asked of the app: the time its age counts from, and the purges taken by then.
+#[derive(Debug, Clone, Copy)]
+struct Asking {
+    at: SystemTime,
+    purges: u64,
 }
 
 /// One stored answer: the policy the crate reads it by, the headers it is served with, the body
@@ -425,23 +512,7 @@ impl Stored {
     fn serve(&self, asked: &Asked, now: SystemTime, decode: bool) -> Response<ProxyBody> {
         let mut headers = self.headers_as_served(now);
         if asked.held.is_current(self.status, &headers) {
-            let mut not_modified = Response::new(empty());
-            *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
-            for name in [
-                CACHE_CONTROL,
-                CONTENT_LOCATION,
-                DATE,
-                ETAG,
-                EXPIRES,
-                VARY,
-                AGE,
-                LAST_MODIFIED,
-            ] {
-                if let Some(value) = headers.get(&name) {
-                    not_modified.headers_mut().insert(name, value.clone());
-                }
-            }
-            return not_modified;
+            return not_modified(&headers);
         }
         let body = match (asked.head, decode) {
             (true, _) => empty(),
@@ -490,14 +561,19 @@ type Generation = u64;
 type KeysOfTag = HashMap<Key, Generation>;
 
 #[derive(Default)]
-struct TagIndex(HashMap<Arc<str>, HashMap<Box<str>, KeysOfTag>>);
+struct TagIndex {
+    owners: HashMap<Arc<str>, HashMap<Box<str>, KeysOfTag>>,
+    /// Every purge taken, of any owner: a fill asked of the app before one is not kept after it,
+    /// since what it carries may be what the purge was for.
+    purges: u64,
+}
 
 impl TagIndex {
     fn add(&mut self, key: &Key, variants: &Variants) {
         if variants.tags.is_empty() {
             return;
         }
-        let owned = self.0.entry(variants.tenant.owner.clone()).or_default();
+        let owned = self.owners.entry(variants.tenant.owner.clone()).or_default();
         for tag in &variants.tags {
             owned
                 .entry(tag.clone())
@@ -507,7 +583,7 @@ impl TagIndex {
     }
 
     fn forget(&mut self, key: &Key, variants: &Variants) {
-        let Some(owned) = self.0.get_mut(&variants.tenant.owner) else {
+        let Some(owned) = self.owners.get_mut(&variants.tenant.owner) else {
             return;
         };
         for tag in &variants.tags {
@@ -521,14 +597,15 @@ impl TagIndex {
             }
         }
         if owned.is_empty() {
-            self.0.remove(&variants.tenant.owner);
+            self.owners.remove(&variants.tenant.owner);
         }
     }
 
     /// Every key `owner` stored under any of `tags`, each with the newest generation that put it
-    /// there, taken out of the index.
+    /// there, taken out of the index, and the purge counted.
     fn take(&mut self, owner: &str, tags: &[String]) -> HashMap<Key, Generation> {
-        let Some(owned) = self.0.get_mut(owner) else {
+        self.purges += 1;
+        let Some(owned) = self.owners.get_mut(owner) else {
             return HashMap::new();
         };
         let mut taken: HashMap<Key, Generation> = HashMap::new();
@@ -537,7 +614,7 @@ impl TagIndex {
             *newest = (*newest).max(generation);
         }
         if owned.is_empty() {
-            self.0.remove(owner);
+            self.owners.remove(owner);
         }
         taken
     }
@@ -633,6 +710,9 @@ pub(crate) struct Answered {
 
 pub(crate) struct ResponseCache {
     entries: moka::future::Cache<Key, Arc<Variants>>,
+    /// Keys whose last answer was not storable, until when: a visitor's conditional on one goes to
+    /// the app as it came, for the app's own 304, instead of fetching a whole body nobody keeps.
+    passes: moka::future::Cache<Key, SystemTime>,
     tags: Arc<Mutex<TagIndex>>,
     generations: AtomicU64,
     max_entry_bytes: usize,
@@ -668,6 +748,10 @@ impl ResponseCache {
                     locked(&forgetting).forget(&key, &variants);
                 })
                 .build(),
+            passes: moka::future::Cache::builder()
+                .max_capacity(MOST_PASSES)
+                .time_to_live(PASS_FOR)
+                .build(),
             tags,
             generations: AtomicU64::new(0),
             max_entry_bytes: usize::try_from(settings.max_entry_kib.get())
@@ -685,6 +769,24 @@ impl ResponseCache {
     async fn weighed(&self) {
         self.entries.run_pending_tasks().await;
         self.metrics.proxy.cache_weighs(self.entries.weighted_size());
+    }
+
+    fn asking(&self) -> Asking {
+        Asking {
+            at: (self.clock)(),
+            purges: locked(&self.tags).purges,
+        }
+    }
+
+    async fn passing(&self, key: &Key) -> bool {
+        self.passes
+            .get(key)
+            .await
+            .is_some_and(|until| until > (self.clock)())
+    }
+
+    async fn pass(&self, key: Key) {
+        self.passes.insert(key, (self.clock)() + PASS_FOR).await;
     }
 
     /// A request the cache may answer: a stored answer when there is one it may give, the app's
@@ -754,14 +856,20 @@ impl ResponseCache {
         }
     }
 
-    /// Flow 2: asked of the app, and kept once its body has gone to the visitor whole.
+    /// Flow 2: asked of the app, and kept once its body has gone to the visitor whole. A GET is
+    /// asked without the visitor's conditionals, so that the app's 304 to one visitor does not
+    /// keep the answer from every other, unless the key has just answered something unstorable.
     async fn miss(self: &Arc<Self>, asked: Asked, origin: Arc<dyn Origin>) -> Answered {
-        let requested_at = (self.clock)();
-        let response = origin.ask(asked.forwarded()).await;
+        let asking = self.asking();
+        let with_conditionals = asked.head || self.passing(&asked.key).await;
+        let response = origin.ask(asked.forwarded(with_conditionals)).await;
         let response = if asked.head {
             response
         } else {
-            self.keeping(&asked, origin.recode(response, asked.key.encoding), requested_at)
+            let kept = self
+                .keeping(&asked, origin.recode(response, asked.key.encoding), asking)
+                .await;
+            asked.as_held(kept)
         };
         Answered {
             response,
@@ -816,7 +924,7 @@ impl ResponseCache {
                 response: refreshed.serve(&asked, (self.clock)(), false),
                 outcome: CacheOutcome::Revalidated,
             },
-            Revalidated::Replaced(response) => miss(response),
+            Revalidated::Replaced(response) => miss(asked.as_held(response)),
             Revalidated::Unmatched => self.miss(asked, origin_again).await,
             Revalidated::Failed(response) => {
                 let now = (self.clock)();
@@ -842,7 +950,7 @@ impl ResponseCache {
         if let Some(etag) = &stored.provenance.origin_etag {
             revalidation.headers.insert(IF_NONE_MATCH, etag.clone());
         }
-        let requested_at = (self.clock)();
+        let asking = self.asking();
         let response = origin
             .ask(Request::from_parts(revalidation.clone(), empty()))
             .await;
@@ -851,9 +959,7 @@ impl ResponseCache {
         }
         if response.status() == StatusCode::NOT_MODIFIED {
             if let AfterResponse::NotModified(_, mut refreshed) =
-                stored
-                    .policy
-                    .after_response(&revalidation, &response, requested_at)
+                stored.policy.after_response(&revalidation, &response, asking.at)
             {
                 // The policy's own refresh is of the fields it reads, which for a response with
                 // `CDN-Cache-Control` are not the ones the browser is given.
@@ -871,7 +977,7 @@ impl ResponseCache {
                     refreshed,
                     stored.body.clone(),
                     stored.provenance.clone(),
-                    requested_at,
+                    asking.at,
                     now,
                 ) {
                     let refreshed = Arc::new(refreshed);
@@ -881,6 +987,7 @@ impl ResponseCache {
                         &asked.canonical,
                         refreshed.clone(),
                         now,
+                        asking.purges,
                     )
                     .await;
                     return Revalidated::Refreshed(refreshed);
@@ -888,7 +995,10 @@ impl ResponseCache {
             }
             return Revalidated::Unmatched;
         }
-        Revalidated::Replaced(self.keeping(asked, origin.recode(response, asked.key.encoding), requested_at))
+        Revalidated::Replaced(
+            self.keeping(asked, origin.recode(response, asked.key.encoding), asking)
+                .await,
+        )
     }
 
     /// Flow 6: a `POST`, `PUT`, `PATCH` or `DELETE` that succeeded makes what is stored for its
@@ -947,6 +1057,7 @@ impl ResponseCache {
         let windows = Windows::of(&response.headers);
         let fresh_until = now + policy.time_to_live(now);
         let storable = policy.is_storable()
+            && response.status != StatusCode::NOT_MODIFIED
             && explicit_lifetime(&response.headers)
             && !response.headers.contains_key(SET_COOKIE)
             && !response.headers.contains_key(CONTENT_RANGE)
@@ -990,6 +1101,7 @@ impl ResponseCache {
         canonical: &request::Parts,
         stored: Arc<Stored>,
         now: SystemTime,
+        purges: u64,
     ) {
         let others = self
             .entries
@@ -1027,15 +1139,22 @@ impl ResponseCache {
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
         });
         // Indexed under the key's own lock, so a purge that finds it in the index waits for it to
-        // be there to remove.
+        // be there to remove; and only when no purge was taken since it was asked of the app,
+        // under the index's lock, so a purge either finds it there or it is never put.
         let index = self.tags.clone();
         self.entries
             .entry(key.clone())
             .and_compute_with(|_| {
-                locked(&index).add(&key, &variants);
-                std::future::ready(Op::Put(variants))
+                let mut index = locked(&index);
+                std::future::ready(if index.purges == purges {
+                    index.add(&key, &variants);
+                    Op::Put(variants)
+                } else {
+                    Op::Nop
+                })
             })
             .await;
+        self.passes.invalidate(&key).await;
         self.weighed().await;
     }
 
@@ -1065,29 +1184,32 @@ impl ResponseCache {
 
     /// `response` on its way to the visitor, its body copied aside as it passes and stored once it
     /// has passed whole, if the app made it storable and it fits.
-    fn keeping(
+    async fn keeping(
         self: &Arc<Self>,
         asked: &Asked,
         response: Response<ProxyBody>,
-        requested_at: SystemTime,
+        asking: Asking,
     ) -> Response<ProxyBody> {
-        // A body the app compressed in a coding other than the one negotiated is passed on as it
-        // is and never decoded to be stored; one sent as identity is what this key's visitors get.
-        if !matches!(Encoding::of(response.headers()), Some(sent) if sent == asked.key.encoding || sent == Encoding::Identity)
-        {
+        // The app's 304 answers a conditional this cache passed on, and says nothing of the key.
+        if response.status() == StatusCode::NOT_MODIFIED {
             return response;
         }
+        // A body the app compressed in a coding other than the one negotiated is passed on as it
+        // is and never decoded to be stored; one sent as identity is what this key's visitors get.
+        let coded_for_the_key = matches!(Encoding::of(response.headers()), Some(sent) if sent == asked.key.encoding || sent == Encoding::Identity);
         let probe = CachePolicy::new_options(
             &asked.canonical,
             &governed(response.status(), response.headers()),
-            requested_at,
+            asking.at,
             options(),
         );
-        if !probe.is_storable()
+        if !coded_for_the_key
+            || !probe.is_storable()
             || !explicit_lifetime(response.headers())
             || response.headers().contains_key(SET_COOKIE)
             || tags_of(response.headers()).is_none()
         {
+            self.pass(asked.key.clone()).await;
             return response;
         }
         let (mut parts, body) = response.into_parts();
@@ -1099,19 +1221,26 @@ impl ResponseCache {
         let key = asked.key.clone();
         let tenant = asked.tenant.clone();
         let canonical = asked.canonical.clone();
-        let kept = Tee::new(body, self.max_entry_bytes, move |body: Bytes| {
+        let kept = Tee::new(body, self.max_entry_bytes, move |body: Option<Bytes>| {
             tokio::spawn(async move {
-                let mut response = Response::new(());
-                *response.status_mut() = status;
-                *response.headers_mut() = headers;
-                response
-                    .headers_mut()
-                    .insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
                 let now = (cache.clock)();
-                let (response, ()) = response.into_parts();
-                if let Some(stored) = cache.stored(&canonical, response, body, provenance, requested_at, now)
-                {
-                    cache.keep(key, &tenant, &canonical, Arc::new(stored), now).await;
+                let stored = body.and_then(|body| {
+                    let mut response = Response::new(());
+                    *response.status_mut() = status;
+                    *response.headers_mut() = headers;
+                    response
+                        .headers_mut()
+                        .insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+                    let (response, ()) = response.into_parts();
+                    cache.stored(&canonical, response, body, provenance, asking.at, now)
+                });
+                match stored {
+                    Some(stored) => {
+                        cache
+                            .keep(key, &tenant, &canonical, Arc::new(stored), now, asking.purges)
+                            .await;
+                    }
+                    None => cache.pass(key).await,
                 }
             });
         });
@@ -1166,16 +1295,16 @@ fn matched_by(canonical: &request::Parts, response: &HeaderMap) -> request::Part
 
 /// A body passed on as it flows, with a copy kept up to `limit` bytes and handed to `done` once
 /// the last of it has passed. A body that fails, carries trailers, or outgrows the limit is
-/// passed on and not kept.
+/// passed on and not kept, and `done` is told so at once.
 struct Tee {
     body: ProxyBody,
     kept: Option<BytesMut>,
     limit: usize,
-    done: Option<Box<dyn FnOnce(Bytes) + Send + Sync>>,
+    done: Option<Box<dyn FnOnce(Option<Bytes>) + Send + Sync>>,
 }
 
 impl Tee {
-    fn new(body: ProxyBody, limit: usize, done: impl FnOnce(Bytes) + Send + Sync + 'static) -> Self {
+    fn new(body: ProxyBody, limit: usize, done: impl FnOnce(Option<Bytes>) + Send + Sync + 'static) -> Self {
         let mut tee = Self {
             body,
             kept: Some(BytesMut::new()),
@@ -1190,9 +1319,14 @@ impl Tee {
     }
 
     fn finish(&mut self) {
-        if let (Some(kept), Some(done)) = (self.kept.take(), self.done.take()) {
-            done(kept.freeze());
+        if let Some(done) = self.done.take() {
+            done(self.kept.take().map(BytesMut::freeze));
         }
+    }
+
+    fn give_up(&mut self) {
+        self.kept = None;
+        self.finish();
     }
 }
 
@@ -1211,9 +1345,9 @@ impl Body for Tee {
                 (Some(data), Some(kept)) if kept.len() + data.len() <= tee.limit => {
                     kept.extend_from_slice(data);
                 }
-                _ => tee.kept = None,
+                _ => tee.give_up(),
             },
-            Poll::Ready(Some(Err(_))) => tee.kept = None,
+            Poll::Ready(Some(Err(_))) => tee.give_up(),
             Poll::Ready(None) => tee.finish(),
             Poll::Pending => {}
         }
@@ -2036,7 +2170,7 @@ mod tests {
     async fn a_body_that_says_it_has_ended_before_it_is_polled_is_still_kept() {
         let kept = Arc::new(Mutex::new(None));
         let into = kept.clone();
-        let _tee = Tee::new(empty(), 16, move |body| *into.lock().unwrap() = Some(body));
+        let _tee = Tee::new(empty(), 16, move |body| *into.lock().unwrap() = body);
         assert_eq!(*kept.lock().unwrap(), Some(Bytes::new()));
     }
 
@@ -2343,7 +2477,7 @@ mod tests {
 
         cache.entries.invalidate_all();
         settled(&cache).await;
-        assert!(locked(&cache.tags).0.is_empty(), "evicted with its entry");
+        assert!(locked(&cache.tags).owners.is_empty(), "evicted with its entry");
         assert_eq!(cache.purge("app-1", &["t:second".to_string()]).await, 0);
     }
 
@@ -2409,5 +2543,312 @@ mod tests {
         ] {
             assert_eq!(reported(&mut answer(&[], Bytes::new()), outcome), status);
         }
+    }
+
+    fn holding(etag: &'static str) -> Asked {
+        asked_with(
+            Method::GET,
+            "/",
+            "dep-1",
+            &[("accept-encoding", "br"), ("if-none-match", etag)],
+        )
+    }
+
+    fn not_modified_unless_asked_for(
+        cache_control: &'static str,
+    ) -> impl Fn(&request::Parts) -> Response<ProxyBody> + Send + Sync {
+        move |parts| {
+            if parts.headers.contains_key(IF_NONE_MATCH) {
+                let mut not_modified = answer(&[("etag", "\"v1\"")], Bytes::new());
+                *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+                return not_modified;
+            }
+            html(cache_control)(parts)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_visitor_holding_the_answer_on_a_miss_is_answered_304_and_the_answer_is_still_kept() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(not_modified_unless_asked_for("public, max-age=60"));
+        let (not_modified, outcome, body) = sent(&cache, holding("W/\"v1\""), &app).await;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(outcome, CacheOutcome::Miss);
+        assert!(body.is_empty());
+        assert!(not_modified.extensions().get::<Kept>().is_some());
+        assert_eq!(not_modified.headers()[ETAG], "W/\"v1\"");
+        assert!(
+            !app.last_heard().headers.contains_key(IF_NONE_MATCH),
+            "the app was asked for the whole answer"
+        );
+        let (hit, outcome, body) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(
+            (hit.status(), outcome, app.woken()),
+            (StatusCode::OK, CacheOutcome::Hit, 1)
+        );
+        assert_eq!(inflated(body, Encoding::Br).await, page());
+    }
+
+    #[tokio::test]
+    async fn a_key_that_answered_something_unstorable_passes_conditionals_on_for_a_while() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(not_modified_unless_asked_for("no-cache"));
+        let (first, _, _) = sent(&cache, holding("W/\"v1\""), &app).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(!app.last_heard().headers.contains_key(IF_NONE_MATCH));
+
+        let (passed, outcome, _) = sent(&cache, holding("W/\"v1\""), &app).await;
+        assert_eq!(
+            (passed.status(), outcome),
+            (StatusCode::NOT_MODIFIED, CacheOutcome::Miss)
+        );
+        assert_eq!(app.last_heard().headers[IF_NONE_MATCH], "W/\"v1\"");
+        assert_eq!(
+            sent(&cache, asked("br"), &app).await.1,
+            CacheOutcome::Miss,
+            "the app's 304 is never stored"
+        );
+
+        hands.forward(PASS_FOR + Duration::from_secs(1));
+        sent(&cache, holding("W/\"v1\""), &app).await;
+        assert!(
+            !app.last_heard().headers.contains_key(IF_NONE_MATCH),
+            "asked whole again, to learn whether it has become storable"
+        );
+        assert_eq!(app.woken(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_outgrows_the_limit_is_given_up_at_once() {
+        let given_up = Arc::new(Mutex::new(None));
+        let into = given_up.clone();
+        let mut tee = Tee::new(whole(Bytes::from_static(b"sixteen bytes!!!")), 4, move |body| {
+            *into.lock().unwrap() = Some(body);
+        });
+        tee.frame().await.unwrap().unwrap();
+        assert_eq!(*given_up.lock().unwrap(), Some(None));
+    }
+
+    #[test]
+    fn if_none_match_is_read_from_every_line_and_wins_over_if_modified_since_even_unparsed() {
+        let etag_and_date = |etag: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ETAG, HeaderValue::from_str(etag).unwrap());
+            headers.insert(
+                LAST_MODIFIED,
+                HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+            );
+            headers
+        };
+        let held = |lines: &[&[u8]]| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                IF_MODIFIED_SINCE,
+                HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+            );
+            for line in lines {
+                headers.append(IF_NONE_MATCH, HeaderValue::from_bytes(line).unwrap());
+            }
+            Held::of(&headers)
+        };
+        let ok = StatusCode::OK;
+        let v1 = etag_and_date("\"v1\"");
+        assert!(held(&[b"\"v0\"", b"W/\"v1\""]).is_current(ok, &v1));
+        assert!(held(&[b"\"a,b\""]).is_current(ok, &etag_and_date("W/\"a,b\"")));
+        assert!(!held(&[b"\"a\", \"b\""]).is_current(ok, &etag_and_date("\"a,b\"")));
+        assert!(held(&[b"*"]).is_current(ok, &HeaderMap::new()));
+        assert!(!held(&[b"*"]).is_current(StatusCode::NOT_FOUND, &v1));
+        for unparsed in [&b"\"v0\""[..], b"v1", b"\"v1", b"W/*", b"\xff"] {
+            assert!(
+                !held(&[unparsed]).is_current(ok, &v1),
+                "{}",
+                String::from_utf8_lossy(unparsed)
+            );
+        }
+        assert!(held(&[]).is_current(ok, &v1), "the date alone");
+    }
+
+    #[test]
+    fn a_precondition_only_the_app_can_judge_goes_to_it() {
+        let with = |name: &str, value: &str| Request::get("/").header(name, value).body(()).unwrap();
+        assert!(answerable(&with("if-none-match", "\"v1\"")));
+        assert!(answerable(&with(
+            "if-modified-since",
+            "Wed, 21 Oct 2026 07:28:00 GMT"
+        )));
+        assert!(!answerable(&with("if-match", "\"v1\"")));
+        assert!(!answerable(&with(
+            "if-unmodified-since",
+            "Wed, 21 Oct 2026 07:28:00 GMT"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_stale_answer_is_answered_304_to_a_visitor_holding_it() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(html("public, max-age=60, stale-while-revalidate=30"));
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(70));
+        let (not_modified, outcome, _) = sent(&cache, holding("W/\"v1\""), &app).await;
+        assert_eq!(
+            (not_modified.status(), outcome),
+            (StatusCode::NOT_MODIFIED, CacheOutcome::Stale)
+        );
+        assert_eq!(not_modified.headers()[AGE], "70");
+
+        let failing = App::answering(|_| {
+            let mut failed = answer(&[], Bytes::new());
+            *failed.status_mut() = StatusCode::BAD_GATEWAY;
+            failed
+        });
+        let covered = cache_of(&hands, 8, 1024);
+        sent(
+            &covered,
+            asked("br"),
+            &App::answering(html("public, max-age=60, stale-if-error=600")),
+        )
+        .await;
+        hands.forward(Duration::from_secs(70));
+        let (not_modified, outcome, _) = sent(&covered, holding("W/\"v1\""), &failing).await;
+        assert_eq!(
+            (not_modified.status(), outcome),
+            (StatusCode::NOT_MODIFIED, CacheOutcome::Stale)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_and_a_visitor_served_a_decoded_body_are_answered_304_too() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(html("public, max-age=60"));
+        sent(&cache, asked("gzip"), &app).await;
+        let head = asked_with(
+            Method::HEAD,
+            "/",
+            "dep-1",
+            &[("accept-encoding", "gzip"), ("if-none-match", "W/\"v1\"")],
+        );
+        let identity = asked_with(
+            Method::GET,
+            "/",
+            "dep-1",
+            &[("accept-encoding", "identity"), ("if-none-match", "W/\"v1\"")],
+        );
+        for asked in [head, identity] {
+            let (not_modified, outcome, _) = sent(&cache, asked, &app).await;
+            assert_eq!(
+                (not_modified.status(), outcome),
+                (StatusCode::NOT_MODIFIED, CacheOutcome::Hit)
+            );
+            assert_eq!(not_modified.headers()[ETAG], "W/\"v1\"");
+        }
+        assert_eq!(app.woken(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_304_carries_every_line_of_the_fields_it_repeats() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|_| {
+            answer(
+                &[
+                    ("content-type", "image/png"),
+                    ("cache-control", "public"),
+                    ("cache-control", "max-age=60"),
+                    ("vary", "accept-language"),
+                    ("vary", "x-theme"),
+                    ("etag", "\"v1\""),
+                ],
+                page(),
+            )
+        });
+        sent(&cache, asked("br"), &app).await;
+        let (not_modified, _, _) = sent(&cache, holding("\"v1\""), &app).await;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        let lines = |name| {
+            not_modified
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines(CACHE_CONTROL), ["public", "max-age=60"]);
+        assert_eq!(lines(VARY), ["accept-language", "x-theme"]);
+    }
+
+    #[tokio::test]
+    async fn a_fill_asked_of_the_app_before_a_purge_is_not_kept_after_it() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = tagged_by_path();
+        let production = || tenant_labelled("shop-prod", "dep-1", Some("shop"));
+        let answered = cache.answer(asked_by(production(), "/a"), app.clone()).await;
+        assert_eq!(
+            cache.purge("shop", &["t:a".to_string()]).await,
+            0,
+            "not stored yet"
+        );
+        answered.response.into_body().collect().await.unwrap();
+        settled(&cache).await;
+        assert_eq!(
+            sent(&cache, asked_by(production(), "/a"), &app).await.1,
+            CacheOutcome::Miss
+        );
+        assert_eq!(
+            sent(&cache, asked_by(production(), "/a"), &app).await.1,
+            CacheOutcome::Hit
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_by_a_304_that_crossed_a_purge_is_not_kept() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let purging = cache.clone();
+        let app = App::answering(move |parts| {
+            if parts.headers.contains_key(IF_NONE_MATCH) {
+                locked(&purging.tags).purges += 1;
+            }
+            not_modified_unless_asked_for("public, max-age=60")(parts)
+        });
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(61));
+        let (served, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(
+            (served.status(), outcome),
+            (StatusCode::OK, CacheOutcome::Revalidated)
+        );
+        assert_eq!(
+            sent(&cache, asked("br"), &app).await.1,
+            CacheOutcome::Revalidated,
+            "still stale: the refresh was not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_304_that_sets_a_cookie_refreshes_nothing() {
+        let hands = Hands::at_noon();
+        let cache = cache_of(&hands, 8, 1024);
+        let app = App::answering(|parts| {
+            if parts.headers.contains_key(IF_NONE_MATCH) {
+                let mut not_modified =
+                    answer(&[("etag", "\"v1\""), ("set-cookie", "theme=dark")], Bytes::new());
+                *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+                return not_modified;
+            }
+            html("public, max-age=60")(parts)
+        });
+        sent(&cache, asked("br"), &app).await;
+        hands.forward(Duration::from_secs(61));
+        let (whole, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!((whole.status(), outcome), (StatusCode::OK, CacheOutcome::Miss));
+        assert_eq!(app.woken(), 3, "asked again for the whole answer");
+        let (hit, outcome, _) = sent(&cache, asked("br"), &app).await;
+        assert_eq!(outcome, CacheOutcome::Hit);
+        assert!(!hit.headers().contains_key(SET_COOKIE));
     }
 }

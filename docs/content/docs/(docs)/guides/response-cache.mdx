@@ -64,7 +64,28 @@ reload does not wake a sleeping app.
 | neither | revalidated with `If-None-Match` or `If-Modified-Since` before it is served; a `304` refreshes it |
 
 `no-cache`, `must-revalidate`, `proxy-revalidate` and `s-maxage` forbid serving a stale entry at
-all. A visitor holding the stored `ETag` or `Last-Modified` is answered `304` from the cache.
+all.
+
+## Conditional requests
+
+A visitor that sends `If-None-Match` or `If-Modified-Since` and still holds what the cache would
+serve is answered `304 Not Modified` from the cache, without a body, whether the entry is fresh or
+served stale. `If-None-Match` is compared weakly across all its lines, and `*` matches any stored
+`200`; when it is present, `If-Modified-Since` is not read, even if `If-None-Match` does not
+parse. The `304` carries the stored `Cache-Control`, `Content-Location`, `Date`, `ETag`,
+`Expires`, `Vary` and `Last-Modified`, with `Age`.
+
+On a miss, a `GET` is asked of the app without the visitor's conditionals, so the whole answer can
+be stored; the visitor is still answered `304` when it holds it. A path whose last answer could not
+be stored passes the visitor's conditionals to the app for two minutes, so that the app answers its
+own `304` rather than a body nobody keeps. A `304` from the app is never stored. A request with
+`If-Match` or `If-Unmodified-Since` goes to the app as it came.
+
+The cache never makes up an `ETag`: an app that wants `304`s sends its own, and the cache answers
+with it.
+
+An answer the app was asked for before a purge by cache tag is not stored once the purge is
+taken, so a purge never loses a race to the answer it was meant to remove.
 
 ## Compression
 
